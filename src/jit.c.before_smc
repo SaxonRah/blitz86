@@ -1580,39 +1580,12 @@ B86_HOT static void invalidate(J *j, uint32_t lo, uint32_t hi)
     uint32_t p0 = (lo >> PG_SHIFT), p1 = (hi - 1) >> PG_SHIFT;
     if (p0) p0--;
     for (uint32_t p = p0; p <= p1 && p < NPG; ++p) {
-        /* Each guarded range owns its own encoded bucket link.  Unlink
-         * dead blocks in O(1) while walking.  Preserve extra ranges and
-         * other pages' independent links.  Blocks are not recycled. */
-        uint32_t *link = &j->pg_head[p];
-        uint32_t depth = 0, removed = 0;
-        while (*link) {
-            uint32_t v = *link;
+        for (uint32_t v = j->pg_head[p]; v; ) {
             uint32_t idx = (v & 0x0FFFFFFFu) - 1, r = v >> 28;
             Block *b = &j->blk[idx];
-            uint32_t *next = r ? &b->next_pgx[r - 1] : &b->next_pg;
-            ++depth;
-            ++j->st.smc_bucket_visits;
-            if (b->dead) {
-                ++j->st.smc_dead_skips;
-                ++removed;
-                *link = *next;
-                continue;
-            }
-            uint32_t blo = r ? b->xlo[r - 1] : b->glo;
-            uint32_t bhi = r ? b->xhi[r - 1] : b->ghi;
-            if (blo < hi && lo < bhi) {
-                kill_block(j, idx);
-                ++removed;
-                *link = *next;
-                continue;
-            }
-            link = next;
-        }
-        if (depth > j->st.smc_bucket_max_depth)
-            j->st.smc_bucket_max_depth = depth;
-        if (removed) {
-            ++j->st.smc_bucket_compactions;
-            j->st.smc_bucket_unlinks += removed;
+            v = r ? b->next_pgx[r - 1] : b->next_pg;
+            uint32_t blo = r ? b->xlo[r - 1] : b->glo, bhi = r ? b->xhi[r - 1] : b->ghi;
+            if (!b->dead && blo < hi && lo < bhi) kill_block(j, idx);
         }
     }
 }

@@ -135,11 +135,6 @@ typedef struct B86JitStats {
     /* runtime C round trips from translated code */
     uint64_t rt_step, rt_cond, rt_flags, rt_light, rt_smc, rt_rep;
     uint64_t translate_misses;  /* cache misses while translating (needs -DB86_MISSES=fn) */
-    uint64_t smc_bucket_visits;       /* total page-chain entries visited */
-    uint64_t smc_dead_skips;          /* dead entries discovered and unlinked */
-    uint64_t smc_bucket_max_depth;    /* longest page traversal */
-    uint64_t smc_bucket_compactions;  /* traversals that unlinked entries */
-    uint64_t smc_bucket_unlinks;      /* dead and newly invalidated entries */
 } B86JitStats;
 
 /* Code buffer must be executable (and, on Pico, in SRAM). */
