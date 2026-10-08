@@ -416,11 +416,6 @@ void be_store(Emit *e, int w16, int v, int addr, int check, uint16_t next_ip)
        the LAST byte as well: its address may cross a 64-byte line.
        Both checks use host-physical addresses, not CS/SS equality. */
     if (w16) {
-        /* Only a word beginning at byte 63 crosses a 64-byte code line.
-           Test the HOST-PHYSICAL address, not SS/CS segment identity. */
-        dp_imm(e, DP_AND, 0, LR, hr(addr), 63);
-        dp_imm(e, DP_SUB, 1, PC, LR, 63);
-        uint8_t *same_line = emit_bcc(e, AC_NE, NULL);
         addw(e, LR, hr(addr), 1, 0);
         shift_imm(e, 0, LR, LR, 1, 6);
         put32(e, 0xF810u | R_CM, (uint32_t)LR << 12 | LR);
@@ -432,7 +427,6 @@ void be_store(Emit *e, int w16, int v, int addr, int check, uint16_t next_ip)
         e->slow[e->nslow].retire = e->retire;
         e->slow[e->nslow].noexit = (uint8_t)(check == 2);
         e->nslow++;
-        be_bind(e, same_line, e->p);
     }
 }
 

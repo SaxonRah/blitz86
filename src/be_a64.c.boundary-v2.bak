@@ -417,12 +417,6 @@ void be_store(Emit *e, int w16, int v, int addr, int check, uint16_t next_ip)
        catches a word store crossing a 64-byte translated-code boundary,
        including aliases between different guest segments. */
     if (w16) {
-        /* Cross-line word stores alone require a second physical-line test.
-           ubfm obtains low six bits; CMP #63 preserves correct aliasing. */
-        put(e, ubfm(I0, hr(addr), 0, 5));
-        put(e, 0x7100001Fu | 63u << 10 | I0 << 5); /* CMP w16,#63 */
-        uint8_t *same_line = e->p;
-        put(e, 0x54000001u);                       /* B.NE same_line */
         put(e, 0x91000400u | (uint32_t)hr(addr) << 5 | I0); /* ADD x16,xaddr,#1 */
         put(e, 0xD3400000u | 6u << 16 | 63u << 10 | I0 << 5 | I0); /* LSR x16,#6 */
         put(e, ldrb_reg(I0, R_CM, I0));
@@ -434,7 +428,6 @@ void be_store(Emit *e, int w16, int v, int addr, int check, uint16_t next_ip)
         e->slow[e->nslow].retire = e->retire;
         e->slow[e->nslow].noexit = (uint8_t)(check == 2);
         e->nslow++;
-        be_bind(e, same_line, e->p);
     }
 }
 
