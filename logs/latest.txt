@@ -1,0 +1,58 @@
+[22:20:16] blitz86 native Windows runner / action=all
+[22:20:16] C:\blitz86_v2\src\interp.c: FOUND
+[22:20:16] C:\blitz86_v2\src\jit.c: FOUND
+[22:20:16] C:\blitz86_v2\src\be_t2.c: FOUND
+[22:20:16] C:\blitz86_v2\src\be_a64.c: FOUND
+[22:20:16] C:\blitz86_v2\tests\sst_interp.c: FOUND
+[22:20:16] C:\blitz86_v2\include\b86.h: FOUND
+[22:20:16] C:\blitz86_v2\tools\windows\CMakeLists.txt: FOUND
+[22:20:16] C:\microDOS\md.bat: FOUND
+[22:20:16] cl.exe: C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.38.33130\bin\Hostx86\x86\cl.exe
+[22:20:16] py.exe: C:\Windows\py.exe
+[22:20:16] python.exe: C:\Users\Jupiter\AppData\Local\Programs\Python\Python311\python.exe
+[22:20:16] arm-none-eabi-gcc: not on PATH
+[22:20:16] aarch64-none-elf-gcc: not on PATH
+[22:20:16] picotool.exe: not on PATH
+[22:20:16] Windows host build: CMake Visual Studio 17 2022 -A x64 (no vcvars/cmd quoting)
+[22:20:16] cmake.exe: C:\Program Files\CMake\bin\cmake.exe
+[22:20:16] No UF2 present. blitz86 core requires firmware integration before flashing.
+[22:20:16] BEGIN CMake configure VS2022 x64
+-- Selecting Windows SDK version 10.0.26100.0 to target Windows 10.0.19045.
+-- The C compiler identification is MSVC 19.38.33145.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/14.38.33130/bin/Hostx64/x64/cl.exe - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Configuring done (2.7s)
+-- Generating done (0.0s)
+-- Build files have been written to: C:/blitz86_v2/build-win
+[22:20:19] PASS CMake configure VS2022 x64
+[22:20:19] BEGIN MSVC x64 interpreter build
+MSBuild version 17.14.40+3e7442088 for .NET Framework
+
+  1>Checking Build System
+  Building Custom Rule C:/blitz86_v2/tools/windows/CMakeLists.txt
+  interp.c
+  sst_interp.c
+  Generating Code...
+C:\blitz86_v2\tests\sst_interp.c(42,35): warning C4996: 'getenv': This function or variable may be unsafe. Consider using _dupenv_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details. [C:\blitz86_v2\build-win\sst_interp.vcxproj]
+  sst_interp.vcxproj -> C:\blitz86_v2\build-win\Release\sst_interp.exe
+[22:20:20] PASS MSVC x64 interpreter build
+[22:20:20] SKIP thumb2: arm-none-eabi-gcc not installed; no Linux needed
+[22:20:21] SKIP a64: aarch64-none-elf-gcc not installed; no Linux needed
+[22:20:21] ARM compilation checks only. No UF2 or Pi bare-metal image was produced.
+[22:20:21] BEGIN CMake configure VS2022 x64
+-- Selecting Windows SDK version 10.0.26100.0 to target Windows 10.0.19045.
+-- Configuring done (0.0s)
+-- Generating done (0.1s)
+-- Build files have been written to: C:/blitz86_v2/build-win
+[22:20:21] PASS CMake configure VS2022 x64
+[22:20:21] BEGIN MSVC x64 interpreter build
+MSBuild version 17.14.40+3e7442088 for .NET Framework
+
+  1>Checking Build System
+  Building Custom Rule C:/blitz86_v2/tools/windows/CMakeLists.txt
+  sst_interp.vcxproj -> C:\blitz86_v2\build-win\Release\sst_interp.exe
+[22:20:21] PASS MSVC x64 interpreter build
+[22:20:21] WORKFLOW FAIL: Missing C:\blitz86_v2\sst\quick.bin. Run '.\b86.bat deps' once to download and convert 8086 vectors.

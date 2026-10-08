@@ -1,3 +1,4 @@
 build/
 sst/
 *.log
+/build-win
