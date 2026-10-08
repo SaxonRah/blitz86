@@ -1528,7 +1528,7 @@ static Block *translate_ex(J *j, uint32_t cs, uint16_t ip, const Insn *pre, int 
        the INVERTED branch, which exits to the loop's fall-through and
        otherwise falls into the next copy; only the last copy carries the
        interrupt poll and the back-edge. Semantics are unchanged. */
-    if (!j->single_step && !npre) {
+    if (!j->single_step && !j->max_insns && !npre) {
         int k = -1;
         for (int i = 0; i < n; ++i) {
             Insn *d = &v[i];
@@ -1537,11 +1537,7 @@ static Block *translate_ex(J *j, uint32_t cs, uint16_t ip, const Insn *pre, int 
         }
         if (k >= 0) {
             int body = k + 1, U = body <= 6 ? 4 : body <= 12 ? 2 : 1;
-                        /* A configured max_block is a hard cap on the expanded guest
-               instruction sequence, not a reason to disable unrolling.
-               The static Insn buffer also caps the total at 120. */
-            unsigned unroll_limit = maxn < 120u ? maxn : 120u;
-            while (U > 1 && (unsigned)(n + (U - 1) * body) > unroll_limit) U--;
+            while (U > 1 && n + (U - 1) * body > 120) U--;
             if (U > 1) {
                 static Insn w[128];
                 int m = 0;
