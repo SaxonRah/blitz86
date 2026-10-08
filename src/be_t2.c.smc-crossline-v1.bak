@@ -404,7 +404,7 @@ void be_store(Emit *e, int w16, int v, int addr, int check, uint16_t next_ip)
     shift_imm(e, 0, LR, hr(addr), 1, 6);                         /* lr = addr >> 6 */
     put32(e, 0xF810u | R_CM, (uint32_t)LR << 12 | LR);           /* LDRB lr, [r9, lr] */
     cmp_imm0(e, LR);
-    if (e->nslow >= 64 - (w16 ? 1 : 0)) { e->overflow = 1; return; }
+    if (e->nslow >= 64) { e->overflow = 1; return; }
     e->slow[e->nslow].site = emit_bcc(e, AC_NE, NULL);
     e->slow[e->nslow].resume = e->p;
     e->slow[e->nslow].next_ip = next_ip;
@@ -412,22 +412,6 @@ void be_store(Emit *e, int w16, int v, int addr, int check, uint16_t next_ip)
     e->slow[e->nslow].retire = e->retire;
     e->slow[e->nslow].noexit = (uint8_t)(check == 2);
     e->nslow++;
-    /* A checked word store spans two bytes. Check the code-map line of
-       the LAST byte as well: its address may cross a 64-byte line.
-       Both checks use host-physical addresses, not CS/SS equality. */
-    if (w16) {
-        addw(e, LR, hr(addr), 1, 0);
-        shift_imm(e, 0, LR, LR, 1, 6);
-        put32(e, 0xF810u | R_CM, (uint32_t)LR << 12 | LR);
-        cmp_imm0(e, LR);
-        e->slow[e->nslow].site = emit_bcc(e, AC_NE, NULL);
-        e->slow[e->nslow].resume = e->p;
-        e->slow[e->nslow].next_ip = next_ip;
-        e->slow[e->nslow].len = 2;
-        e->slow[e->nslow].retire = e->retire;
-        e->slow[e->nslow].noexit = (uint8_t)(check == 2);
-        e->nslow++;
-    }
 }
 
 void be_set_seg(Emit *e, int s, int v)
