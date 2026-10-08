@@ -35,6 +35,18 @@
 
 #define OFF(f) ((unsigned)offsetof(B86Cpu, f))
 
+/* Metadata allocator. The block table, block map, SMC buckets and RET
+   metadata are only touched by the dispatcher, so an embedder can place them
+   in slow memory (RP2350 PSRAM) and keep SRAM for the code buffer:
+   -DB86_CALLOC=my_calloc -DB86_FREE=my_free */
+#ifndef B86_CALLOC
+#define B86_CALLOC calloc
+#define B86_FREE free
+#else
+void *B86_CALLOC(size_t n, size_t size);
+void B86_FREE(void *p);
+#endif
+
 typedef struct Block {
     uint32_t key;
     uint32_t glo, ghi;          /* guarded linear range [glo, ghi)        */
@@ -72,6 +84,7 @@ typedef struct B86Jit {
     int no_chain;               /* testing: never patch chain exits */
     int hot_external;           /* fast/codemap supplied by the caller */
     int no_spec;                /* testing: no RET-specialized continuations */
+    uint8_t *shadow;            /* optional copy of translated guest bytes */
     struct RetMeta *rm;         /* RET sites carrying deferred flag records */
     uint32_t nrm;
     B86JitStats st;
@@ -1337,6 +1350,7 @@ static int lower(Tx *t, Insn *d)
         be_opi(e, AOP_ADD, B86_SP, B86_SP, spadd);
         uint8_t *site, *bne, *birq, *bhit;
         be_ret_cache(e, &site, &bne, &birq, &bhit);
+        e->no_count = 1;                                        /* ret_cache counted */
         uint8_t *miss = e->p;                                   /* miss -> lookup */
         be_stctx(e, V_T0, OFF(ip)); emit_deferred(t, t->cur - 1, d->live); be_ldctx(e, V_T0, OFF(ip));
         be_exit_ip_reg(e, V_T0);
@@ -1350,6 +1364,7 @@ static int lower(Tx *t, Insn *d)
         emit_deferred(t, t->cur - 1, d->live);                  /* record, then normal block */
         uint8_t *recb = be_jmp(e);
         be_bind(e, bne, fill); be_bind(e, bhit, fill); be_bind(e, recb, fill);
+        e->no_count = 0;
         RetMeta *m = &t->j->rm[t->j->nrm++];
         m->site = site; m->miss = miss; m->recp = recp; m->recb = recb; m->npre = 0;
         if (pa) { m->pre[m->npre] = t->v[P]; m->pre[m->npre].virt = 1; m->npre++; }
@@ -1528,7 +1543,7 @@ static Block *translate_ex(J *j, uint32_t cs, uint16_t ip, const Insn *pre, int 
        the INVERTED branch, which exits to the loop's fall-through and
        otherwise falls into the next copy; only the last copy carries the
        interrupt poll and the back-edge. Semantics are unchanged. */
-    if (!j->single_step && !npre) {
+    if (!j->single_step && !j->max_insns && !npre) {
         int k = -1;
         for (int i = 0; i < n; ++i) {
             Insn *d = &v[i];
@@ -1537,11 +1552,7 @@ static Block *translate_ex(J *j, uint32_t cs, uint16_t ip, const Insn *pre, int 
         }
         if (k >= 0) {
             int body = k + 1, U = body <= 6 ? 4 : body <= 12 ? 2 : 1;
-                        /* A configured max_block is a hard cap on the expanded guest
-               instruction sequence, not a reason to disable unrolling.
-               The static Insn buffer also caps the total at 120. */
-            unsigned unroll_limit = maxn < 120u ? maxn : 120u;
-            while (U > 1 && (unsigned)(n + (U - 1) * body) > unroll_limit) U--;
+            while (U > 1 && n + (U - 1) * body > 120) U--;
             if (U > 1) {
                 static Insn w[128];
                 int m = 0;
@@ -1670,6 +1681,7 @@ static Block *translate_ex(J *j, uint32_t cs, uint16_t ip, const Insn *pre, int 
         j->pg_head[pg] = (idx + 1) | ((uint32_t)r << 28);
         for (uint32_t l = lo >> B86_LINE_SHIFT; l <= (hi - 1) >> B86_LINE_SHIFT; ++l)
             if (j->codemap[l] != 255) j->codemap[l]++;
+        if (j->shadow) memcpy(j->shadow + lo, c->mem + lo, hi - lo);
     }
     j->st.blocks++;
     j->st.guest_insns += (uint64_t)(n - npre);
@@ -1688,6 +1700,7 @@ uint32_t b86h_step(B86Cpu *c, uint32_t ip_next, uint32_t blk)
     c->ip = ip_next & 0xFFFFu;
     int r = b86_step(c);
     if (r == B86_HALT) { c->irq |= 0x80000000u; return 1; }
+    if (c->irq) return 1;                 /* host asked to stop (e.g. from an INT hook) */
     if (c->seg[B86_CS] != cs0 || c->ip != (ip_next >> 16)) return 1;
     return j->blk[blk].dead;
 }
@@ -1757,12 +1770,13 @@ uint32_t b86h_cond(B86Cpu *c, uint32_t cc)
 
 void b86h_flags(B86Cpu *c) { b86_flags_materialize(c); }
 
-uint32_t b86h_smc(B86Cpu *c, uint8_t *host, uint32_t len, uint32_t blk)
+uint32_t b86h_smc(B86Cpu *c, uint8_t *host, uint32_t lenflags, uint32_t blk)
 {
     J *j = c->jit;
     uint32_t lin = (uint32_t)(host - c->mem);
     j->st.smc_hits++;
-    invalidate(j, lin, lin + len);
+    invalidate(j, lin, lin + (lenflags & 0xFFu));
+    if (lenflags & 0x100u) return 0;          /* invalidate but keep going (CALL push) */
     return j->blk[blk].dead;
 }
 
@@ -1787,23 +1801,27 @@ J *b86_jit_create(B86Cpu *c, void *code, size_t size)
    by the dispatcher and may live in slow memory (PSRAM). */
 J *b86_jit_create_ex(B86Cpu *c, void *code, size_t size, void *hot, size_t hot_size)
 {
-    J *j = calloc(1, sizeof *j);
+    /* the SMC line map is indexed by host address >> 6: guest memory must be
+       64-byte aligned or stores near line edges would be checked on the
+       wrong line */
+    if (((uintptr_t)c->mem & ((1u << B86_LINE_SHIFT) - 1u)) != 0) return NULL;
+    J *j = B86_CALLOC(1, sizeof *j);
     if (!j) return NULL;
     j->cpu = c;
     j->buf = code;
     j->buf_end = (uint8_t *)code + size;
-    j->blk = calloc(MAXB, sizeof *j->blk);
-    j->map = calloc(MAPN, sizeof *j->map);
-    j->pg_head = calloc(NPG, sizeof *j->pg_head);
-    j->rm = calloc(RMN, sizeof *j->rm);
+    j->blk = B86_CALLOC(MAXB, sizeof *j->blk);
+    j->map = B86_CALLOC(MAPN, sizeof *j->map);
+    j->pg_head = B86_CALLOC(NPG, sizeof *j->pg_head);
+    j->rm = B86_CALLOC(RMN, sizeof *j->rm);
     if (hot && hot_size >= b86_jit_hot_bytes()) {
         memset(hot, 0, b86_jit_hot_bytes());
         j->fast = (B86Fast *)hot;
         j->codemap = (uint8_t *)hot + B86_FASTN * sizeof(B86Fast);
         j->hot_external = 1;
     } else {
-        j->fast = calloc(B86_FASTN, sizeof *j->fast);
-        j->codemap = calloc(B86_LINES, 1);
+        j->fast = B86_CALLOC(B86_FASTN, sizeof *j->fast);
+        j->codemap = B86_CALLOC(B86_LINES, 1);
     }
     if (!j->blk || !j->map || !j->pg_head || !j->rm || !j->fast || !j->codemap) { b86_jit_destroy(j); return NULL; }
     c->jit = j;
@@ -1826,9 +1844,9 @@ void b86_jit_destroy(J *j)
 {
     if (!j) return;
     if (j->cpu) { j->cpu->jit = NULL; j->cpu->codemap = NULL; j->cpu->smc_hook = NULL; }
-    free(j->blk); free(j->map); free(j->pg_head); free(j->rm);
-    if (!j->hot_external) { free(j->fast); free(j->codemap); }
-    free(j);
+    B86_FREE(j->blk); B86_FREE(j->map); B86_FREE(j->pg_head); B86_FREE(j->rm);
+    if (!j->hot_external) { B86_FREE(j->fast); B86_FREE(j->codemap); }
+    B86_FREE(j);
 }
 
 const B86JitStats *b86_jit_stats(J *j) { return &j->st; }
@@ -1837,6 +1855,36 @@ void b86_jit_set_lookahead(J *j, int on) { j->no_lookahead = !on; }
 void b86_jit_set_no_fast(J *j, int on) { j->single_step = on; }
 void b86_jit_set_no_chain(J *j, int on) { j->no_chain = on; }
 void b86_jit_set_no_spec(J *j, int on) { j->no_spec = on; }
+void b86_jit_set_count_retired(J *j, int on) { j->e.count_ret = on; }
+void b86_jit_invalidate(J *j, uint32_t lin, uint32_t len) { if (len) invalidate(j, lin, lin + len); }
+
+void b86_jit_set_shadow(J *j, uint8_t *shadow) { j->shadow = shadow; }
+
+/* Someone else may have written [lin, lin+len). Compare only the 64-byte
+   lines that hold translated code against the shadow and invalidate exactly
+   the bytes that differ, so data stored next to code kills nothing. Without
+   a shadow this falls back to invalidating the whole range. */
+uint32_t b86_jit_sync_external(J *j, uint32_t lin, uint32_t len)
+{
+    uint32_t killed = 0;
+    if (!len) return 0;
+    if (!j->shadow) { invalidate(j, lin, lin + len); return 1; }
+    const uint8_t *mem = j->cpu->mem;
+    uint32_t l0 = lin >> B86_LINE_SHIFT, l1 = (lin + len - 1) >> B86_LINE_SHIFT;
+    for (uint32_t l = l0; l <= l1 && l < B86_LINES; ++l) {
+        if (!j->codemap[l]) continue;
+        uint32_t base = l << B86_LINE_SHIFT, n = 1u << B86_LINE_SHIFT;
+        if (base + n > B86_MEM_BYTES) n = B86_MEM_BYTES - base;
+        if (!memcmp(mem + base, j->shadow + base, n)) continue;
+        uint32_t a = 0, b = n;
+        while (mem[base + a] == j->shadow[base + a]) ++a;
+        while (mem[base + b - 1] == j->shadow[base + b - 1]) --b;
+        invalidate(j, base + a, base + b);
+        memcpy(j->shadow + base, mem + base, n);
+        ++killed;
+    }
+    return killed;
+}
 void b86_jit_set_count_exits(J *j, int on) { j->e.count_exits = on; }
 void b86_jit_set_single_step(J *j, int on)
 {
@@ -1854,6 +1902,7 @@ int b86_jit_run(B86Cpu *c, uint64_t max_dispatch)
     for (;;) {
         if (c->irq & 0x80000000u) { c->irq &= 0x7FFFFFFFu; return B86_HALT; }
         if (c->irq) return B86_EXIT;
+        if (c->seg[B86_CS] == c->trap_cs) return B86_TRAP;
         if (n >= max_dispatch) return B86_BUDGET;
         n++;
         uint32_t key = (c->seg[B86_CS] << 16) | (c->ip & 0xFFFFu);

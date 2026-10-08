@@ -1,5 +1,27 @@
 # Changes
 
+## 2026-10-08 (e) — DOS owner mode support + compact Thumb-2
+
+blitz86 now runs MS-DOS 2.0 inside microDOS (blitzBUS live backend):
+DOS2TEST 25/25 and MDSTRESS checksum 0xA298 on both backends under qemu,
+99.9% of instructions retired by blitz86 (the rest is microDOS's BIOS
+trampoline segment, by design).
+
+* `cpu->trap_cs`: b86_jit_run returns B86_TRAP before running code in that CS.
+* Exact retired-instruction counting (`b86_jit_set_count_retired`, cpu->icnt):
+  one add per block exit; fuzz checks it equals the interpreter on every
+  program.
+* `b86_jit_invalidate`, and `b86_jit_set_shadow` + `b86_jit_sync_external`:
+  byte-exact invalidation for memory written by someone else (microDOS
+  hooks / BIOS interpretation). Cut DOS-session retranslations 71,868 ->
+  15,442 before the code-size work below.
+* `B86_CALLOC`/`B86_FREE`: put dispatcher-only metadata in slow memory.
+* Guest memory must be 64-byte aligned; jit_create refuses otherwise.
+* INT hooks that change CS:IP or set cpu->irq end the block immediately.
+* Shared cold-path stubs (chain request, SMC slow path, interpreter call):
+  call site = `BL stub` + data words. DOS session Thumb-2 code 54.7 -> 39.0
+  bytes per guest insn; at 192 KiB / 2048 blocks flushes 14 -> 8.
+
 ## 2026-10-08 (d) — flag records across RET
 
 * RET cold paths write the callee's deferred flag record; the inline-cache

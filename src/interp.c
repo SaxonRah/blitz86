@@ -34,6 +34,7 @@ void b86_init(B86Cpu *c, uint8_t *mem)
     c->mem = mem;
     c->amask = 0x1FFFFFu;
     c->flags = 0xF002u;
+    c->trap_cs = 0xFFFFFFFFu;
     for (int s = 0; s < 4; ++s) b86_set_seg(c, s, 0);
 }
 

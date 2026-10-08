@@ -375,6 +375,7 @@ int main(int argc, char **argv)
         tmp = b;
         b86_jit_flush(j);
         b86_jit_set_no_chain(j, getenv("FUZZ_NOCHAIN") != NULL);
+        b86_jit_set_count_retired(j, 1);
         b86_jit_set_no_spec(j, getenv("FUZZ_NOSPEC") != NULL);
         if (getenv("FUZZ_NOFAST")) b86_jit_set_no_fast(j, 1);
         if (getenv("FUZZ_TRACE")) {
@@ -436,10 +437,12 @@ int main(int argc, char **argv)
             continue;
         }
         alarm_cpu = &tmp; alarm(getenv("FUZZ_ALARM") ? (unsigned)atoi(getenv("FUZZ_ALARM")) : 20u);
+        tmp.icnt = 0;
         int rb = b86_jit_run(&tmp, ~0ull);
         alarm(0); alarm_cpu = NULL;
         b = tmp;
         int ok = rb == B86_HALT;
+        if ((uint32_t)a.icount != b.icnt) { ok = 0; printf("seed %llu: retired count %u != %llu\n", (unsigned long long)seed, b.icnt, (unsigned long long)a.icount); }
         for (int i = 0; i < 8; ++i) if ((uint16_t)a.r[i] != (uint16_t)b.r[i]) ok = 0;
         for (int i = 0; i < 4; ++i) if (a.seg[i] != b.seg[i]) ok = 0;
         if ((uint16_t)a.ip != (uint16_t)b.ip) ok = 0;

@@ -107,6 +107,16 @@ static void enc_b(uint8_t *site, uint8_t *target)
     uint32_t h2 = 0x9000u | J1 << 13 | J2 << 11 | ((uint32_t)(off >> 1) & 0x7FF);
     site[0] = (uint8_t)h1; site[1] = (uint8_t)(h1 >> 8); site[2] = (uint8_t)h2; site[3] = (uint8_t)(h2 >> 8);
 }
+static void emit_bl(Emit *e, uint8_t *target)
+{
+    uint8_t *site = e->p;
+    if (e->p + 4 > e->end) { e->overflow = 1; return; }
+    enc_b(site, target);
+    site[3] = (uint8_t)(site[3] | 0x40);                     /* B.W -> BL: hw2 bit 14 */
+    e->p += 4;
+}
+static void put_word(Emit *e, uint32_t v) { put16(e, v & 0xFFFF); put16(e, v >> 16); }
+
 static void enc_bcc(uint8_t *site, uint8_t *target, uint32_t cond)
 {
     int32_t off = (int32_t)(target - (site + 4));
@@ -163,6 +173,14 @@ static void reload_segs(Emit *e)
     ldst(e, LDRW, R_DS, R_CTX, OFF(segp[B86_DS]));
     ldst(e, LDRW, R_SS, R_CTX, OFF(segp[B86_SS]));
 }
+void be_count(Emit *e, uint32_t n)
+{
+    if (!e->count_ret || e->no_count || n == 0) return;
+    ldst(e, LDRW, LR, R_CTX, OFF(icnt));
+    addw(e, LR, LR, n & 0xFFF, 0);
+    ldst(e, STRW, LR, R_CTX, OFF(icnt));
+}
+
 static void retire_mark(Emit *e, uint32_t n)
 {
     if (!e->count_exits) return;
@@ -211,6 +229,75 @@ void *be_emit_runtime(Emit *e)
     ldst(e, STRW, LR, R_CTX, OFF(patch));
     movw(e, LR, XR_RETFILL);
     emit_b(e, e->x_ipexit);
+
+    /* ---- shared cold paths: callers do `BL stub` followed by data words;
+       the stub reads them through lr and returns past them ---- */
+
+    /* chain request: [BL x_chreq][target ip]; the BL itself is the patch site */
+    e->x_chreq = e->p;
+    dp_imm(e, DP_SUB, 0, LR, LR, 1);                 /* lr = data address */
+    ldst(e, LDRW, R12, LR, 0);                       /* r12 = target ip */
+    dp_imm(e, DP_SUB, 0, LR, LR, 4);                 /* lr = BL site */
+    emit_b(e, e->x_chain);
+
+    /* SMC slow path: r12 = host address; [BL][w0 next|len<<16|noexit<<24][w1 blk|retire<<20] */
+    e->x_smc = e->p;
+    put32(e, 0xE92Du, 0x500Fu);                      /* PUSH {r0-r3, r12, lr} */
+    mov(e, 1, R12);
+    dp_imm(e, DP_SUB, 0, 3, LR, 1);
+    ldst(e, LDRW, 2, 3, 0);
+    ldst(e, LDRW, 3, 3, 4);
+    shift_imm(e, 0, 2, 2, 1, 16);                    /* len | noexit<<8 */
+    bitfield(e, 0xF3C0u, 3, 3, 0, 19);               /* blk */
+    mov(e, 0, R_CTX);
+    call_abs(e, (void *)b86h_smc);
+    cmp_imm0(e, 0);
+    put32(e, 0xE8BDu, 0x500Fu);                      /* POP {r0-r3, r12, lr} */
+    uint8_t *sx = emit_bcc(e, AC_NE, NULL);
+    dp_imm(e, DP_ADD, 0, LR, LR, 8);
+    put16(e, 0x4700u | LR << 3);                     /* BX lr */
+    be_bind(e, sx, e->p);
+    dp_imm(e, DP_SUB, 0, R12, LR, 1);                /* data */
+    ldst(e, LDRW, LR, R12, 4);
+    shift_imm(e, 0, LR, LR, 1, 20);                  /* retire */
+    ldst(e, STRW, LR, R_CTX, OFF(retired));
+    put16(e, 0xB401u);                               /* PUSH {r0} */
+    ldst(e, LDRW, 0, R_CTX, OFF(icnt));
+    dp_reg(e, DP_ADD, 0, 0, 0, LR, 0, 0);
+    ldst(e, STRW, 0, R_CTX, OFF(icnt));
+    put16(e, 0xBC01u);                               /* POP {r0} */
+    ldst(e, LDRH, R12, R12, 0);                      /* next ip */
+    movw(e, LR, XR_LOOKUP);
+    emit_b(e, e->x_ipexit);
+
+    /* interpreter call: [BL][w0 ip|next<<16][w1 blk][w2 retire][w3 fn] */
+    e->x_step = e->p;
+    put32(e, 0xE880u | R_CTX, 0x00FFu);              /* STM r8, {r0-r7} */
+    mov(e, 4, LR);
+    mov(e, 0, R_CTX);
+    dp_imm(e, DP_SUB, 0, R12, 4, 1);
+    ldst(e, LDRW, 1, R12, 0);
+    ldst(e, LDRW, 2, R12, 4);
+    ldst(e, LDRW, R12, R12, 12);
+    put16(e, 0x4780u | R12 << 3);                    /* BLX r12 */
+    mov(e, R12, 0);
+    mov(e, LR, 4);
+    put32(e, 0xE890u | R_CTX, 0x00FFu);              /* LDM r8, {r0-r7} */
+    reload_segs(e);
+    cmp_imm0(e, R12);
+    uint8_t *tx = emit_bcc(e, AC_NE, NULL);
+    dp_imm(e, DP_ADD, 0, LR, LR, 16);
+    put16(e, 0x4700u | LR << 3);                     /* BX lr */
+    be_bind(e, tx, e->p);
+    dp_imm(e, DP_SUB, 0, R12, LR, 1);
+    ldst(e, LDRW, LR, R12, 8);                       /* retire */
+    ldst(e, STRW, LR, R_CTX, OFF(retired));
+    put16(e, 0xB401u);
+    ldst(e, LDRW, 0, R_CTX, OFF(icnt));
+    dp_reg(e, DP_ADD, 0, 0, 0, LR, 0, 0);
+    ldst(e, STRW, 0, R_CTX, OFF(icnt));
+    put16(e, 0xBC01u);
+    emit_b(e, e->x_dynexit);
 
     e->x_lookup = e->p;                              /* r12 = ip */
     put32(e, 0xFA1Fu, 0xF080u | R12 << 8 | R12);     /* UXTH r12, r12 */
@@ -441,16 +528,22 @@ uint8_t *be_cbnz16(Emit *e, int r) { shift_imm(e, 1, LR, hr(r), 0, 16); return e
 void be_exit_chain(Emit *e, uint16_t target_ip, int poll)
 {
     uint8_t *irq = NULL;
+    be_count(e, e->retire);
     if (poll) {
         ldst(e, LDRW, R12, R_CTX, OFF(irq));
         cmp_imm0(e, R12);
         irq = emit_bcc(e, AC_NE, NULL);
     }
-    uint8_t *site = emit_b(e, NULL);                             /* patchable */
-    retire_mark(e, e->retire);
-    movw(e, R12, target_ip);
-    imm32(e, LR, (uint32_t)(uintptr_t)site);
-    emit_b(e, e->x_chain);
+    if (!e->count_exits) {                                       /* compact: BL + data */
+        emit_bl(e, e->x_chreq);                                  /* patch site */
+        put_word(e, target_ip);
+    } else {
+        uint8_t *site = emit_b(e, NULL);                         /* patchable */
+        retire_mark(e, e->retire);
+        movw(e, R12, target_ip);
+        imm32(e, LR, (uint32_t)(uintptr_t)site);
+        emit_b(e, e->x_chain);
+    }
     if (poll) {
         be_bind(e, irq, e->p);
         retire_mark(e, e->retire);
@@ -459,20 +552,22 @@ void be_exit_chain(Emit *e, uint16_t target_ip, int poll)
     }
 }
 
-void be_exit_ip_reg(Emit *e, int r) { retire_mark(e, e->retire); mov(e, R12, hr(r)); emit_b(e, e->x_lookup); }
+void be_exit_ip_reg(Emit *e, int r) { be_count(e, e->retire); retire_mark(e, e->retire); mov(e, R12, hr(r)); emit_b(e, e->x_lookup); }
 void be_exit_ip_imm(Emit *e, uint16_t ip, int reason)
 {
+    be_count(e, e->retire);
     retire_mark(e, e->retire);
     movw(e, R12, ip);
     movw(e, LR, (uint32_t)reason);
     emit_b(e, e->x_ipexit);
 }
-void be_exit_dyn(Emit *e) { retire_mark(e, e->retire); emit_b(e, e->x_dynexit); }
+void be_exit_dyn(Emit *e) { be_count(e, e->retire); retire_mark(e, e->retire); emit_b(e, e->x_dynexit); }
 
 /* +0 MOVW lr,#ip  +4 CMP r12,lr  +8 BNE miss  +12 LDR lr,[irq]  +16 CMP lr,#0
    +20 BNE irq  +24 B hit */
 void be_ret_cache(Emit *e, uint8_t **site, uint8_t **bne, uint8_t **birq, uint8_t **bhit)
 {
+    be_count(e, e->retire);
     *site = e->p;
     movw(e, LR, 0);
     put32(e, 0xEBB0u | R12, 0x0F00u | LR);                       /* CMP r12, lr */
@@ -527,18 +622,11 @@ void be_call_step(Emit *e, uint16_t ip, uint16_t next)
 void be_call_helper(Emit *e, void *fn, uint32_t arg)
 {
     retire_mark(e, e->retire);
-    put32(e, 0xE880u | R_CTX, 0x00FFu);                          /* STM r8, {r0-r7} */
-    mov(e, 0, R_CTX);
-    imm32(e, 1, arg);
-    imm32(e, 2, e->blk);
-    call_abs(e, fn);
-    mov(e, R12, 0);
-    put32(e, 0xE890u | R_CTX, 0x00FFu);                          /* LDM r8, {r0-r7} */
-    reload_segs(e);
-    cmp_imm0(e, R12);
-    uint8_t *s = emit_bcc(e, AC_EQ, NULL);
-    emit_b(e, e->x_dynexit);
-    be_bind(e, s, e->p);
+    emit_bl(e, e->x_step);
+    put_word(e, arg);
+    put_word(e, e->blk);
+    put_word(e, e->retire);
+    put_word(e, (uint32_t)(uintptr_t)fn);
 }
 
 void be_call_cond(Emit *e, int cc)
@@ -563,26 +651,10 @@ void be_finish_block(Emit *e)
 {
     for (int i = 0; i < e->nslow; ++i) {
         be_bind(e, e->slow[i].site, e->p);
-        put32(e, 0xE92Du, 0x500Fu);                              /* PUSH {r0-r3, r12, lr} */
-        mov(e, 1, R12);
-        mov(e, 0, R_CTX);
-        movw(e, 2, e->slow[i].len);
-        imm32(e, 3, e->blk);
-        call_abs(e, (void *)b86h_smc);
-        if (e->slow[i].noexit) {
-            put32(e, 0xE8BDu, 0x500Fu);
-            emit_b(e, e->slow[i].resume);
-            continue;
-        }
-        cmp_imm0(e, 0);
-        put32(e, 0xE8BDu, 0x500Fu);                              /* POP {r0-r3, r12, lr} */
-        uint8_t *ex = emit_bcc(e, AC_NE, NULL);
-        emit_b(e, e->slow[i].resume);
-        be_bind(e, ex, e->p);
-        retire_mark(e, e->slow[i].retire);
-        movw(e, R12, e->slow[i].next_ip);
-        movw(e, LR, XR_LOOKUP);
-        emit_b(e, e->x_ipexit);
+        emit_bl(e, e->x_smc);
+        put_word(e, (uint32_t)e->slow[i].next_ip | (uint32_t)e->slow[i].len << 16 | (uint32_t)e->slow[i].noexit << 24);
+        put_word(e, e->blk | e->slow[i].retire << 20);
+        emit_b(e, e->slow[i].resume);                     /* x_smc returns here */
     }
     e->nslow = 0;
 }

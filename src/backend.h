@@ -43,11 +43,13 @@ typedef struct Emit {
     B86Cpu *cpu;
     uint32_t blk;       /* index of block being translated */
     /* shared stubs (absolute positions inside the code buffer) */
-    uint8_t *x_epilogue, *x_lookup, *x_miss, *x_chain, *x_dynexit, *x_ipexit, *x_irq, *x_retfill;
+    uint8_t *x_epilogue, *x_lookup, *x_miss, *x_chain, *x_dynexit, *x_ipexit, *x_irq, *x_retfill, *x_smc, *x_step, *x_chreq;
     /* out-of-line SMC slow paths pending for the current block */
     struct { uint8_t *site, *resume; uint16_t next_ip; uint8_t len, noexit; uint32_t retire; } slow[64];
     int nslow;
     int count_exits;    /* debug: exits store `retire` into cpu->retired */
+    int count_ret;      /* exits add `retire` to cpu->icnt (exact retired count) */
+    int no_count;       /* frontend: suppress counting on exits already counted */
     uint32_t retire;
 } Emit;
 
@@ -153,12 +155,13 @@ void be_call_helper(Emit *e, void *fn, uint32_t arg);
 void be_call_cond(Emit *e, int cc);         /* result (0/1) -> V_T0       */
 void be_call_flags(Emit *e);                /* materialize lazy flags     */
 void be_finish_block(Emit *e);              /* emit pending slow paths    */
+void be_count(Emit *e, uint32_t n);         /* cpu->icnt += n if count_ret (no NZCV, clobbers V_T1) */
 
 /* Runtime helpers called from generated code (defined in jit.c). */
 uint32_t b86h_step(B86Cpu *c, uint32_t ip_next, uint32_t blk); /* ip | next<<16 */
 uint32_t b86h_cond(B86Cpu *c, uint32_t cc);
 void     b86h_flags(B86Cpu *c);
-uint32_t b86h_smc(B86Cpu *c, uint8_t *host, uint32_t len, uint32_t blk);
+uint32_t b86h_smc(B86Cpu *c, uint8_t *host, uint32_t lenflags, uint32_t blk); /* len | noexit<<8 */
 uint32_t b86h_rep(B86Cpu *c, uint32_t ip_next, uint32_t blk);    /* REP MOVS/STOS */
 
 #endif

@@ -49,7 +49,7 @@ enum {
 };
 
 /* Return codes from b86_step / b86_run. */
-enum { B86_OK = 0, B86_HALT = 1, B86_EXIT = 2, B86_BUDGET = 3 };
+enum { B86_OK = 0, B86_HALT = 1, B86_EXIT = 2, B86_BUDGET = 3, B86_TRAP = 4 };
 
 struct B86Cpu;
 typedef uint8_t (*B86In8)(struct B86Cpu *, uint16_t port);
@@ -80,6 +80,10 @@ typedef struct B86Cpu {
     void    *fast;          /* JIT direct-mapped (key -> host) table        */
     uintptr_t patch;        /* JIT: branch site to patch on a chain exit    */
     uint32_t retired;       /* JIT debug: guest insns retired by last block  */
+    uint32_t icnt;          /* JIT: retired guest insns (wraps; enable with
+                               b86_jit_set_count_retired, read deltas)      */
+    uint32_t trap_cs;       /* b86_jit_run returns B86_TRAP before running
+                               any code whose CS equals this (0xFFFFFFFF: off) */
     uint32_t pad1;
 
     /* --- configuration ----------------------------------------------------- */
@@ -118,6 +122,7 @@ typedef struct B86JitStats {
 } B86JitStats;
 
 /* Code buffer must be executable (and, on Pico, in SRAM). */
+/* Guest memory (b86_init) must be 64-byte aligned; returns NULL otherwise. */
 struct B86Jit *b86_jit_create(B86Cpu *c, void *code_buf, size_t code_size);
 /* Same, with the per-store / per-indirect-jump tables placed in `hot`
    (>= b86_jit_hot_bytes(); use SRAM on RP2350). Other metadata uses calloc. */
@@ -128,6 +133,19 @@ void     b86_jit_destroy(struct B86Jit *j);
 /* Run until HLT, an exit request, or roughly max_insns guest instructions. */
 int      b86_jit_run(B86Cpu *c, uint64_t max_insns);
 void     b86_jit_flush(struct B86Jit *j);
+/* Host code wrote guest memory [lin, lin+len) behind the JIT's back (disk
+   DMA, another interpreter): drop translations that depend on it. */
+void     b86_jit_invalidate(struct B86Jit *j, uint32_t lin, uint32_t len);
+/* Count retired guest instructions exactly in cpu->icnt (one add per block
+   exit, not per instruction). Takes effect for code translated afterwards;
+   call before running or follow with b86_jit_flush. */
+void     b86_jit_set_count_retired(struct B86Jit *j, int on);
+/* Optional shadow (B86_MEM_BYTES) of translated guest bytes; enables
+   byte-exact b86_jit_sync_external. Set before translating anything. */
+void     b86_jit_set_shadow(struct B86Jit *j, uint8_t *shadow);
+/* Memory in [lin, lin+len) may have been written by someone else: kill only
+   translations whose bytes actually changed. Returns lines that differed. */
+uint32_t b86_jit_sync_external(struct B86Jit *j, uint32_t lin, uint32_t len);
 const B86JitStats *b86_jit_stats(struct B86Jit *j);
 /* Testing: translate at most this many instructions per block (0 = default). */
 void     b86_jit_set_max_block(struct B86Jit *j, unsigned n);
