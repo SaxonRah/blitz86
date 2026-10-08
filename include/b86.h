@@ -43,6 +43,8 @@ enum {
     LZ_NONE = 0,
     LZ_ADD8, LZ_ADD16, LZ_SUB8, LZ_SUB16,
     LZ_LOG8, LZ_LOG16, LZ_INC8, LZ_INC16, LZ_DEC8, LZ_DEC16,
+    LZ_SHL8, LZ_SHL16, LZ_SHR8, LZ_SHR16, LZ_SAR8, LZ_SAR16,   /* count 1 */
+    LZ_ADC8, LZ_ADC16, LZ_SBB8, LZ_SBB16,                       /* explicit lz_b */
     LZ_COUNT
 };
 
@@ -62,6 +64,7 @@ typedef struct B86Cpu {
     uint32_t lz_kind;
     uint32_t lz_a;
     uint32_t lz_res;
+    uint32_t lz_b;          /* ADC/SBB only: second operand (carry-in unknown) */
     uint32_t lz_ikind;      /* INC/DEC overlay: OSZAP from (lz_ia, lz_ires), */
     uint32_t lz_ia;         /* CF still from the main record / flags. Lets */
     uint32_t lz_ires;       /* INC/DEC record lazily without touching CF.   */
@@ -69,7 +72,7 @@ typedef struct B86Cpu {
     uint32_t ip;
     uint32_t seg[4];        /* ES CS SS DS                                  */
     volatile uint32_t irq;  /* host sets nonzero to force a return to C    */
-    uint32_t pad0;
+    uint32_t scratch;       /* spill slot for generated code               */
     uint8_t *segp[4];       /* mem + seg*16, kept in sync with seg[]       */
     uint8_t *mem;
     uint8_t *codemap;       /* NULL, or one byte per 64-byte line          */
@@ -116,6 +119,11 @@ typedef struct B86JitStats {
 
 /* Code buffer must be executable (and, on Pico, in SRAM). */
 struct B86Jit *b86_jit_create(B86Cpu *c, void *code_buf, size_t code_size);
+/* Same, with the per-store / per-indirect-jump tables placed in `hot`
+   (>= b86_jit_hot_bytes(); use SRAM on RP2350). Other metadata uses calloc. */
+struct B86Jit *b86_jit_create_ex(B86Cpu *c, void *code_buf, size_t code_size,
+                                 void *hot, size_t hot_size);
+size_t   b86_jit_hot_bytes(void);
 void     b86_jit_destroy(struct B86Jit *j);
 /* Run until HLT, an exit request, or roughly max_insns guest instructions. */
 int      b86_jit_run(B86Cpu *c, uint64_t max_insns);
@@ -130,6 +138,7 @@ void     b86_jit_set_lookahead(struct B86Jit *j, int on);
 void     b86_jit_set_single_step(struct B86Jit *j, int on);
 /* Testing: never use the fast table, so each b86_jit_run(c,1) is one block. */
 void     b86_jit_set_no_fast(struct B86Jit *j, int on);
+void     b86_jit_set_no_chain(struct B86Jit *j, int on);   /* testing */
 /* Testing: exits record cpu->retired (takes effect after a flush). */
 void     b86_jit_set_count_exits(struct B86Jit *j, int on);
 

@@ -76,6 +76,17 @@ Each flag producer then takes one of three forms:
   never have a carry-in. INC/DEC write an *overlay* record so CF keeps
   coming from the earlier producer with no extra work.
 * **dead** — nothing at all; dead CMP/TEST emit no code.
+* **deferred** — flags needed only at exits (side exits, block end) are not
+  recorded in line: the exit path rebuilds the record from registers
+  (`a = res - b` / `res + b`, INC/DEC overlay, CMP/TEST recomputed). This
+  removes all flag stores from typical loop bodies. Requirements: register
+  or immediate operands, operand registers unmodified up to each exit that
+  needs the record, and no flag-materializing helper in between.
+
+When the fused consumers read only ZF/SF, the producer is a plain ALU op
+plus one test (`LSLS` on Thumb-2, `CMN wzr` on AArch64). Backward
+conditional branches are laid out inline (`B!cc skip; records; poll;
+B target`) so a loop iteration takes one taken branch.
 
 Decisions are made in two passes: (A) each Jcc finds its producer walking
 backwards and fuses if nothing in between can clobber NZCV (conservatively:
@@ -102,6 +113,17 @@ so a consumer is never fused to a producer that did not set NZCV.
 * Backward branches and the indirect stub poll `cpu->irq`, so the host can
   always regain control (timers, USB, video) within one loop iteration.
 
+### Small-loop unrolling and the RET inline cache
+
+A block whose back-edge targets its own start is unrolled 2-4x inside the
+superblock: copies end in the *inverted* branch (exit to the loop's
+fall-through), only the last copy has the interrupt poll and back-edge.
+
+Each near RET has an inline cache: `cmp ip, #cached; bne lookup; poll;
+b target`, filled once by the dispatcher (`XR_RETFILL`), falling back to
+the hashed lookup on a mismatch. The poll stays on the hit path so loops
+built from push/ret still yield to the host.
+
 ## 6. Self-modifying code
 
 Stores test one byte per 64-byte line (`codemap`): 3 instructions on
@@ -113,9 +135,12 @@ their entry patched to an exit stub, so blocks that chained into them stay
 safe. A store that invalidates its own running block exits right after the
 store with exact state.
 
-Implicit stack writes (PUSH, CALL, interrupt frames) are not SMC-checked;
-code built on the stack is not supported. Explicit `[bp+..]` stores are
-checked.
+Every guest store is checked, including implicit stack writes (PUSH, CALL;
+interrupt frames go through the interpreter, which checks too). An earlier
+version skipped PUSH checks; fuzz seed 51187 (a stack growing down into the
+bytes being executed) showed that was a silent-corruption hazard, and the
+fix costs about one host instruction per push. CALL's push uses a
+"invalidate but continue" mode because the block is left immediately.
 
 ## 7. Correctness strategy
 
@@ -135,37 +160,42 @@ checked.
 
 ## 8. Measured cost (steady state, from qemu exec logs)
 
-Host instructions executed per guest instruction. "native" kernels run
-entirely in translated code.
+Host instructions executed per guest instruction (`make bench`), all
+kernels now run entirely in translated code except REP's bulk helper.
 
 | kernel | AArch64 | Thumb-2 |
 |---|---|---|
-| regmix: `add/xor/sub/inc/loop` | 3.80 | 4.20 |
-| cmpbr: `cmp/jl/sub/add/dec/jnz` | 4.54 | 4.54 |
-| strlen: `mov al,[si]/inc/or/jnz` | 3.74 | 4.73 |
-| memrmw: `add [bx+si+4],ax/add/dec/jnz` | 6.75 | 7.50 |
-| call: `call/add/ret/dec/jnz` | 8.20 | 9.60 |
-| stack: `push/push/pop/pop/loop` | 3.60 | 4.60 |
-| lodsto: `lodsb/stosb/loop` (helper) | 134 | – |
-| shift: `shl/adc/shr/loop` (helper) | 195 | – |
-| mul: `mov/mul/add/loop` (helper) | 70 | – |
+| regmix: `add/xor/sub/inc/loop` | 1.46 | 1.53 |
+| cmpbr: `cmp/jl/sub/add/dec/jnz` | 2.41 | 2.31 |
+| strlen: `mov al,[si]/inc/or/jnz` | 2.19 | 2.50 |
+| memrmw: `add [bx+si+4],ax/add/dec/jnz` | 3.44 | 3.96 |
+| call: `call/add/ret/dec/jnz` | 6.94 | 8.23 |
+| stack: `push/push/pop/pop/loop` | 4.35 | 5.67 |
+| lodsto: `lodsb/stosb/loop` | 6.62 | 9.0 (older) |
+| repmov: `rep movsw` x64 (per REP insn) | 22.1 | 28.8 (older) |
+| shift: `shl/adc/shr/loop` | 3.50 | 3.91 |
+| mul: `mov/mul/add/loop` | 2.98 | 3.13 |
 
-On a Cortex-M33 most of these instructions are single-cycle (loads 2,
-taken branches 2–4), so the native kernels land roughly at 5–12 cycles per
-guest instruction, i.e. **25–60 MIPS at 300 MHz** — before any of the
-optimizations below. On the A53 at 1 GHz, dual issue, the same kernels
-are in the 150–300 MIPS range. These are estimates from instruction
-counts; hardware timing is the next measurement.
+### First hardware run (RP2350 @ 300 MHz, before the fixes in this release)
+
+The first on-device run measured 4.0 / 9.4 / 3.4 MIPS (loop / regmix /
+callmix). That build had block chaining disabled (seed-51187 diagnostic
+left in `src/jit.c`), the fast lookup table disabled by the driver, and
+the SMC line map + fast table allocated in PSRAM, so every loop iteration
+returned to the C dispatcher (~150 cycles). This release re-enables all
+three and places the hot tables in SRAM (`b86_jit_create_ex`).
 
 ## 9. Known gaps and the optimization queue
 
 Ranked by expected payoff:
 
-1. **Native string ops**: LODS/STOS/MOVS/SCAS/CMPS without REP, and a
-   bulk C helper for REP MOVS/STOS (memcpy/memset with one SMC range check).
-   Today they single-step through the interpreter (~130 host insns each).
-2. **Native shifts/rotates with live flags, MUL/IMUL, ADC/SBB, CLC/STC/CMC,
-   XLAT, LES/LDS, PUSHF/POPF, LAHF/SAHF.**
+1. **Remaining helper-only instructions**: SCAS/CMPS (+REPZ/REPNZ),
+   rotates, shifts by CL with live flags, DIV/IDIV, XLAT, LES/LDS,
+   PUSHF/POPF, LAHF/SAHF, XCHG with memory, far control transfer.
+   (Done in this release: LODS/STOS/MOVS, bulk REP MOVS/STOS, SHL/SHR/SAR
+   by 1 with lazy/fused flags, shifts by CL and MUL/IMUL when flags are
+   dead, ADC/SBB with fused carry-in, CLC/STC/CMC.)
+2. **Hardware timing** on both boards with the drivers in microDOS.
 3. **Exit-time flag materialization**: loop bodies currently write lazy
    records every iteration when flags are live only on the loop-exit path.
    Most producers' records can be rebuilt in the out-of-line exit stub

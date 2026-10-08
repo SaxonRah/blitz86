@@ -34,7 +34,7 @@ enum { AC_EQ, AC_NE, AC_CS, AC_CC, AC_MI, AC_PL, AC_VS, AC_VC,
        AC_HI, AC_LS, AC_GE, AC_LT, AC_GT, AC_LE, AC_AL };
 
 /* Exit reasons returned by the enter trampoline. */
-enum { XR_LOOKUP = 0, XR_CHAIN = 1, XR_HALT = 2, XR_IRQ = 3 };
+enum { XR_LOOKUP = 0, XR_CHAIN = 1, XR_HALT = 2, XR_IRQ = 3, XR_RETFILL = 4 };
 
 typedef struct Emit {
     uint8_t *base;      /* start of code buffer */
@@ -43,9 +43,9 @@ typedef struct Emit {
     B86Cpu *cpu;
     uint32_t blk;       /* index of block being translated */
     /* shared stubs (absolute positions inside the code buffer) */
-    uint8_t *x_epilogue, *x_lookup, *x_miss, *x_chain, *x_dynexit, *x_ipexit, *x_irq;
+    uint8_t *x_epilogue, *x_lookup, *x_miss, *x_chain, *x_dynexit, *x_ipexit, *x_irq, *x_retfill;
     /* out-of-line SMC slow paths pending for the current block */
-    struct { uint8_t *site, *resume; uint16_t next_ip; uint8_t len; uint32_t retire; } slow[64];
+    struct { uint8_t *site, *resume; uint16_t next_ip; uint8_t len, noexit; uint32_t retire; } slow[64];
     int nslow;
     int count_exits;    /* debug: exits store `retire` into cpu->retired */
     uint32_t retire;
@@ -56,7 +56,10 @@ extern const int be_store_clobbers_nzcv;
 extern const int be_logic_mode;             /* FM_* produced by be_test_res */
 
 /* Direct-mapped table the shared lookup stub probes for indirect jumps. */
-#define B86_FASTN 4096u
+#ifndef B86_FAST_BITS
+#define B86_FAST_BITS 12u          /* Pico: 10 keeps it at 8 KiB of SRAM */
+#endif
+#define B86_FASTN (1u << B86_FAST_BITS)
 typedef struct B86Fast { uint32_t key; uintptr_t host; } B86Fast;
 
 /* Trampolines, emitted once at the start of the buffer. Returns the
@@ -74,6 +77,7 @@ uintptr_t be_code_ptr(uint8_t *p);       /* value to store in the fast table */
 void be_mov(Emit *e, int d, int s);
 void be_movi(Emit *e, int d, uint32_t imm);
 void be_op(Emit *e, int aop, int d, int a, int b);
+void be_op_lsl(Emit *e, int aop, int d, int a, int b, unsigned sh); /* d = a op (b << sh) */
 void be_opi(Emit *e, int aop, int d, int a, uint32_t imm16);  /* low 16 bits exact */
 void be_mvn(Emit *e, int d, int s);
 void be_neg(Emit *e, int d, int s);
@@ -82,6 +86,11 @@ void be_ubfx(Emit *e, int d, int s, unsigned lsb, unsigned w);
 void be_sbfx(Emit *e, int d, int s, unsigned lsb, unsigned w);
 void be_bfi(Emit *e, int d, int s, unsigned lsb, unsigned w);
 void be_sxtb(Emit *e, int d, int s);
+void be_mul(Emit *e, int d, int a, int b);                 /* 32-bit low product */
+/* d = a <<|>>|>>> cnt (type 0 LSL, 1 LSR, 2 ASR) with 8086 unmasked-count
+   semantics for values held zero/sign-extended in 32 bits; cnt bits 8+ are
+   ignored. */
+void be_shift_reg(Emit *e, int type, int d, int a, int cnt);
 
 /* NZCV producers (operands hold values in their low bits) */
 int  be_addsub_sh(Emit *e, int sub, int x, int d, int a, int b, int sh);    /* d = a +/- b */
@@ -90,14 +99,17 @@ int  be_cmp_sh(Emit *e, int x, int a, int b, int sh);
 int  be_cmpi_sh(Emit *e, int x, int a, uint32_t imm, int sh, int tmp);
 int  be_neg_sh(Emit *e, int x, int d, int a, int sh);
 int  be_test_res(Emit *e, int x, int r, int sh);    /* flags of a logic result */
+void be_test_nz(Emit *e, int x, int r, int sh);     /* N,Z only (C,V garbage); may write x */
 int  be_imm_ok_sh(uint32_t imm, int sh);            /* encodable without tmp   */
+void be_get_carry(Emit *e, int d, int ac);          /* d = (cond ac holds) ? 1 : 0 */
 
 /* Guest memory. EA = segbase + (uint16)(b1 + b2 + disp); b1/b2 may be -1. */
 void be_ea(Emit *e, int d, int seg, int b1, int b2, int32_t disp);
 void be_ea_off(Emit *e, int d, int b1, int b2, int32_t disp);   /* LEA */
 void be_load(Emit *e, int w16, int d, int addr);
-/* check: emit SMC line check. next_ip is where to resume if this store
-   invalidated the running block. */
+/* check: 0 none; 1 SMC line check, exit to next_ip if this store
+   invalidated the running block; 2 check and invalidate but keep going
+   (the store is followed by a block exit anyway, e.g. CALL's push). */
 void be_store(Emit *e, int w16, int v, int addr, int check, uint16_t next_ip);
 void be_set_seg(Emit *e, int s, int v);
 
@@ -110,6 +122,7 @@ void be_stctx_imm(Emit *e, uint32_t imm, unsigned off);
 uint8_t *be_jcc(Emit *e, int ac);           /* conditional, bind later */
 uint8_t *be_jmp(Emit *e);                   /* unconditional, bind later */
 uint8_t *be_cbnz(Emit *e, int r);           /* branch if r != 0 */
+uint8_t *be_cbz(Emit *e, int r);            /* branch if r == 0 */
 uint8_t *be_cbz16(Emit *e, int r);          /* branch if (uint16)r == 0 */
 uint8_t *be_cbnz16(Emit *e, int r);         /* branch if (uint16)r != 0 */
 void     be_bind(Emit *e, uint8_t *site, uint8_t *target);
@@ -119,9 +132,16 @@ void be_exit_chain(Emit *e, uint16_t target_ip, int poll);  /* patchable */
 void be_exit_ip_reg(Emit *e, int r);        /* near indirect: ip in r     */
 void be_exit_ip_imm(Emit *e, uint16_t ip, int reason);
 void be_exit_dyn(Emit *e);                  /* ctx->ip already valid      */
+/* Near RET with the return ip (zero-extended) in V_T0: per-site inline cache
+   (compare + poll + direct branch), filled once by the dispatcher via
+   XR_RETFILL (cpu->patch = site, cpu->scratch = ip of the RET). */
+void be_exit_ret(Emit *e, uint16_t ret_ip);
+void be_patch_ret(uint8_t *site, uint16_t ip, uint8_t *target);
 
 /* Helpers into C. All sync guest registers through ctx as needed. */
 void be_call_step(Emit *e, uint16_t ip, uint16_t next); /* interp one insn; exits if control changed */
+/* uint32_t fn(B86Cpu*, arg, blk): GPRs synced both ways; nonzero -> dynamic exit */
+void be_call_helper(Emit *e, void *fn, uint32_t arg);
 void be_call_cond(Emit *e, int cc);         /* result (0/1) -> V_T0       */
 void be_call_flags(Emit *e);                /* materialize lazy flags     */
 void be_finish_block(Emit *e);              /* emit pending slow paths    */
@@ -131,5 +151,6 @@ uint32_t b86h_step(B86Cpu *c, uint32_t ip_next, uint32_t blk); /* ip | next<<16 
 uint32_t b86h_cond(B86Cpu *c, uint32_t cc);
 void     b86h_flags(B86Cpu *c);
 uint32_t b86h_smc(B86Cpu *c, uint8_t *host, uint32_t len, uint32_t blk);
+uint32_t b86h_rep(B86Cpu *c, uint32_t ip_next, uint32_t blk);    /* REP MOVS/STOS */
 
 #endif

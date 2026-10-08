@@ -17,7 +17,8 @@ QA64    ?= qemu-aarch64
 QT2     ?= qemu-arm
 B        = build
 
-all: $(B)/sst_interp $(B)/sst_jit_a64 $(B)/sst_jit_t2 $(B)/fuzz_a64 $(B)/fuzz_t2 $(B)/bench_a64 $(B)/bench_t2
+all: $(B)/sst_interp $(B)/sst_jit_a64 $(B)/sst_jit_t2 $(B)/fuzz_a64 $(B)/fuzz_t2 $(B)/bench_a64 $(B)/bench_t2 \
+     $(B)/hwbench_a64 $(B)/hwbench_t2
 
 $(B):
 	mkdir -p $(B)
@@ -44,6 +45,11 @@ test: all
 	$(QA64) $(B)/fuzz_a64 $(FUZZ_N) 1
 	$(QT2) $(B)/fuzz_t2 $(FUZZ_N) 1
 
+# the nine workloads of the microDOS Pico/Pi drivers, same logic, under qemu
+hwbench: $(B)/hwbench_a64 $(B)/hwbench_t2
+	$(QA64) $(B)/hwbench_a64
+	$(QT2) $(B)/hwbench_t2
+
 quick: all
 	$(B)/sst_interp $(SST)/quick.bin
 	$(QA64) $(B)/sst_jit_a64 $(SST)/quick.bin
@@ -58,4 +64,4 @@ bench: $(B)/bench_a64 $(B)/bench_t2
 clean:
 	rm -rf $(B)
 
-.PHONY: all sst test-interp test quick bench clean
+.PHONY: all sst test-interp test quick bench hwbench clean

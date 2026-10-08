@@ -206,6 +206,12 @@ void *be_emit_runtime(Emit *e)
     put(e, movz(0, XR_LOOKUP, 0));
     b_abs(e, e->x_ipexit);
 
+    /* retfill: w9 = ip, x16 = site */
+    e->x_retfill = e->p;
+    put(e, ldst(STRX, I0, R_CTX, OFF(patch), 3));
+    put(e, movz(0, XR_RETFILL, 0));
+    b_abs(e, e->x_ipexit);
+
     /* lookup: w9 = ip (garbage above bit 15) */
     e->x_lookup = e->p;
     put(e, ubfm(9, 9, 0, 15));
@@ -214,7 +220,7 @@ void *be_emit_runtime(Emit *e)
     put(e, ldst(LDRW, I0, R_CTX, OFF(seg[B86_CS]), 2));
     put(e, alur(W_ORR, 9, 9, I0, 0, 16));                   /* key */
     put(e, alur(W_EOR, I0, 9, 9, 1, 16));                   /* key ^ key>>16 */
-    put(e, ubfm(I0, I0, 0, 11));                            /* & 4095 */
+    put(e, ubfm(I0, I0, 0, B86_FAST_BITS - 1));             /* & (FASTN-1) */
     put(e, ldst(LDRX, I1, R_CTX, OFF(fast), 3));
     put(e, alur(X_ADD, I1, I1, I0, 0, 4));                  /* + idx*16 */
     put(e, ldst(LDRW, I0, I1, 0, 2));
@@ -238,6 +244,7 @@ static uint32_t aop_base(int aop)
                    case AOP_ORR: return W_ORR; default: return W_EOR; }
 }
 void be_op(Emit *e, int aop, int d, int a, int b) { put(e, alur(aop_base(aop), hr(d), hr(a), hr(b), 0, 0)); }
+void be_op_lsl(Emit *e, int aop, int d, int a, int b, unsigned sh) { put(e, alur(aop_base(aop), hr(d), hr(a), hr(b), 0, (int)sh)); }
 
 void be_opi(Emit *e, int aop, int d, int a, uint32_t imm)
 {
@@ -261,6 +268,25 @@ void be_ubfx(Emit *e, int d, int s, unsigned lsb, unsigned w) { put(e, ubfm(hr(d
 void be_sbfx(Emit *e, int d, int s, unsigned lsb, unsigned w) { put(e, sbfm(hr(d), hr(s), (int)lsb, (int)(lsb + w - 1))); }
 void be_bfi(Emit *e, int d, int s, unsigned lsb, unsigned w) { put(e, bfm(hr(d), hr(s), (int)((32 - lsb) & 31), (int)(w - 1))); }
 void be_sxtb(Emit *e, int d, int s) { put(e, sbfm(hr(d), hr(s), 0, 7)); }
+
+void be_mul(Emit *e, int d, int a, int b) { put(e, 0x1B007C00u | (uint32_t)hr(b) << 16 | (uint32_t)hr(a) << 5 | (uint32_t)hr(d)); }
+void be_shift_reg(Emit *e, int type, int d, int a, int cnt)
+{
+    /* A64 variable shifts use count mod 32; x86 counts are unmasked bytes,
+       so clamp the count to 31 (enough to clear/sign-fill a 16-bit value). */
+    put(e, ubfm(I1, hr(cnt), 0, 7));                                  /* UXTB w17, cnt */
+    put(e, 0x71000000u | 31u << 10 | (uint32_t)I1 << 5 | 31u);        /* CMP w17, #31 */
+    put(e, movz(I0, 31, 0));
+    put(e, 0x1A800000u | (uint32_t)I0 << 16 | 0x9u << 12 | (uint32_t)I1 << 5 | (uint32_t)I1); /* CSEL w17, w17, w16, LS */
+    static const uint32_t op[3] = { 0x1AC02000u, 0x1AC02400u, 0x1AC02800u };    /* LSLV LSRV ASRV */
+    put(e, op[type] | (uint32_t)I1 << 16 | (uint32_t)hr(a) << 5 | (uint32_t)hr(d));
+}
+
+void be_get_carry(Emit *e, int d, int ac)
+{
+    /* CSET d, ac  ==  CSINC d, wzr, wzr, invert(ac) */
+    put(e, 0x1A9F07E0u | (uint32_t)(ac ^ 1) << 12 | (uint32_t)hr(d));
+}
 
 /* ---- NZCV producers -------------------------------------------------------- */
 
@@ -312,6 +338,8 @@ int be_neg_sh(Emit *e, int x, int d, int a, int sh)
     put(e, ubfm(hr(d), hr(x), sh, 31));
     return FM_SUB;
 }
+
+void be_test_nz(Emit *e, int x, int r, int sh) { be_test_res(e, x, r, sh); }
 
 int be_test_res(Emit *e, int x, int r, int sh)
 {
@@ -383,6 +411,7 @@ void be_store(Emit *e, int w16, int v, int addr, int check, uint16_t next_ip)
     e->slow[e->nslow].next_ip = next_ip;
     e->slow[e->nslow].len = (uint8_t)(w16 ? 2 : 1);
     e->slow[e->nslow].retire = e->retire;
+    e->slow[e->nslow].noexit = (uint8_t)(check == 2);
     e->nslow++;
 }
 
@@ -420,6 +449,7 @@ static void retire_mark(Emit *e, uint32_t n)
 
 uint8_t *be_jcc(Emit *e, int ac) { uint8_t *s = e->p; put(e, 0x54000000u | (uint32_t)ac); return s; }
 uint8_t *be_jmp(Emit *e) { uint8_t *s = e->p; put(e, 0x14000000u); return s; }
+uint8_t *be_cbz(Emit *e, int r) { uint8_t *s = e->p; put(e, 0x34000000u | (uint32_t)hr(r)); return s; }
 uint8_t *be_cbnz(Emit *e, int r) { uint8_t *s = e->p; put(e, 0x35000000u | (uint32_t)hr(r)); return s; }
 uint8_t *be_cbz16(Emit *e, int r)
 {
@@ -463,6 +493,40 @@ void be_exit_ip_imm(Emit *e, uint16_t ip, int reason)
 }
 void be_exit_dyn(Emit *e) { retire_mark(e, e->retire); b_abs(e, e->x_dynexit); }
 
+/* +0 MOVZ w16,#ip  +4 CMP w9,w16  +8 B.NE miss  +12 LDR w16,[irq]  +16 CBNZ w16,irqhop
+   +20 B target  +24 hop: B lookup  +28 irqhop: B irq  +32 fill */
+void be_exit_ret(Emit *e, uint16_t ret_ip)
+{
+    retire_mark(e, e->retire);
+    uint8_t *site = e->p;
+    put(e, movz(I0, 0, 0));
+    put(e, alur(W_SUBS, XZR, 9, I0, 0, 0));
+    uint8_t *bne = e->p; put(e, 0x54000000u | AC_NE);
+    put(e, ldst(LDRW, I0, R_CTX, OFF(irq), 2));
+    uint8_t *cb = e->p; put(e, 0x35000000u | I0);
+    uint8_t *b = e->p; put(e, 0x14000000u);
+    b_abs(e, e->x_lookup);                                       /* +24 */
+    be_bind(e, cb, e->p);
+    b_abs(e, e->x_irq);                                          /* +28 */
+    be_bind(e, bne, e->p);
+    be_bind(e, b, e->p);
+    put(e, movz(I1, ret_ip, 0));                                 /* fill */
+    put(e, ldst(STRW, I1, R_CTX, OFF(scratch), 2));
+    imm64(e, I0, (uint64_t)(uintptr_t)site);
+    b_abs(e, e->x_retfill);
+}
+
+void be_patch_ret(uint8_t *site, uint16_t ip, uint8_t *target)
+{
+    uint32_t ins = movz(I0, ip, 0);
+    memcpy(site, &ins, 4);
+    ins = 0x54000000u | (((uint32_t)((site + 24) - (site + 8)) >> 2) & 0x7FFFF) << 5 | AC_NE;
+    memcpy(site + 8, &ins, 4);
+    ins = b_to(site + 20, target);
+    memcpy(site + 20, &ins, 4);
+    be_flush_icache(site, 24);
+}
+
 /* ---- helper calls ---------------------------------------------------------------------- */
 
 static void call_abs(Emit *e, void *fn)
@@ -473,12 +537,17 @@ static void call_abs(Emit *e, void *fn)
 
 void be_call_step(Emit *e, uint16_t ip, uint16_t next)
 {
+    be_call_helper(e, (void *)b86h_step, (uint32_t)ip | (uint32_t)next << 16);
+}
+
+void be_call_helper(Emit *e, void *fn, uint32_t arg)
+{
     retire_mark(e, e->retire);
     save_gprs(e);
     movx(e, 0, R_CTX);
-    imm32(e, 1, (uint32_t)ip | (uint32_t)next << 16);
+    imm32(e, 1, arg);
     imm32(e, 2, e->blk);
-    call_abs(e, (void *)b86h_step);
+    call_abs(e, fn);
     load_gprs(e);
     reload_segs(e);
     uint8_t *s = e->p; put(e, 0x34000000u | 0);                  /* CBZ w0, cont */
@@ -520,6 +589,7 @@ void be_finish_block(Emit *e)
         put(e, ldp_x(9, 10, XSP, 0));
         put(e, 0x910083FFu);                                      /* ADD sp, sp, #32 */
         reload_segs(e);
+        if (e->slow[i].noexit) { b_abs(e, e->slow[i].resume); continue; }
         uint8_t *cb = e->p; put(e, 0x34000000u | 0);              /* CBZ w0, resume */
         be_bind(e, cb, e->slow[i].resume);
         retire_mark(e, e->slow[i].retire);

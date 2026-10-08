@@ -19,8 +19,14 @@
 #include <stdio.h>
 #endif
 
-#define MAXB        8192u
-#define MAPN        16384u
+#ifndef B86_MAXB
+#define B86_MAXB    8192u           /* blocks per cache generation */
+#endif
+#ifndef B86_MAP_BITS
+#define B86_MAP_BITS 14u            /* block hash: 2^bits slots (> 2 * MAXB) */
+#endif
+#define MAXB        B86_MAXB
+#define MAPN        (1u << B86_MAP_BITS)
 #define PG_SHIFT    9u                      /* SMC bucket page: 512 bytes */
 #define NPG         ((B86_MEM_BYTES >> PG_SHIFT) + 2u)
 #define MAX_SPAN    480u                    /* guarded bytes per block   */
@@ -55,6 +61,8 @@ typedef struct B86Jit {
     unsigned max_insns;
     int no_lookahead;
     int single_step;            /* testing: never enter a block from the fast table */
+    int no_chain;               /* testing: never patch chain exits */
+    int hot_external;           /* fast/codemap supplied by the caller */
     B86JitStats st;
 } J;
 
@@ -74,6 +82,12 @@ typedef struct Insn {
     uint16_t fuse, fdef, live, live_taken;
     uint8_t arm, lazy, fused, mode;     /* producer / consumer decisions */
     uint8_t prod;                       /* fused consumer: producer index */
+    uint16_t nfd;                       /* native only if these flags are dead */
+    uint16_t armneed;                   /* flags fused consumers read from NZCV */
+    uint8_t defer;                      /* lazy record rebuilt at exits instead */
+    uint8_t wm;                         /* guest GPRs (bit per reg16) written   */
+    uint8_t pendb;                      /* INC/DEC overlay possibly live before */
+    uint8_t inv;                        /* unrolled LOOP copy: exit when CX == 0 */
     uint8_t valid;                      /* x86 flags representable in NZCV */
 } Insn;
 
@@ -175,7 +189,7 @@ static void classify(Insn *d)
     if (op < 0x40 && (op & 7) < 6) {
         int a = op >> 3;
         d->fdef = ALLF; d->fuse = (a == 2 || a == 3) ? B86_CF : 0;
-        d->native = (a != 2 && a != 3) && !d->rep;
+        d->native = !d->rep;
         return;
     }
     switch (op) {
@@ -188,8 +202,8 @@ static void classify(Insn *d)
     case 0x9D: d->fuse = 0; d->fdef = ALLF; return;
     case 0x9E: d->fuse = 0; d->fdef = ALLF & ~B86_OF; return;
     case 0x9F: d->fuse = ALLF & ~B86_OF; return;
-    case 0xF5: d->fuse = B86_CF; d->fdef = B86_CF; return;
-    case 0xF8: case 0xF9: d->fuse = 0; d->fdef = B86_CF; return;
+    case 0xF5: case 0xF8: case 0xF9:   /* inline after materializing: reads the ctx record */
+        d->fuse = ALLF; d->fdef = B86_CF; d->native = 1; d->nzclob = 1; return;
     case 0xFA: case 0xFB: case 0xFC: case 0xFD: d->fuse = 0; d->native = 1; return;
     case 0xD6: d->fuse = B86_CF; return;
     case 0xD5: d->fuse = 0; d->fdef = ALLF; return;
@@ -214,13 +228,14 @@ static void classify(Insn *d)
         d->fuse = 0; return;
     case 0x80: case 0x81: case 0x82: case 0x83:
         d->fdef = ALLF; d->fuse = (d->reg == 2 || d->reg == 3) ? B86_CF : 0;
-        d->native = (d->reg != 2 && d->reg != 3); return;
+        d->native = 1; return;
     case 0xF6: case 0xF7:
         switch (d->reg) {
         case 0: case 1: d->fuse = 0; d->fdef = ALLF; d->native = 1; return;
         case 2: d->fuse = 0; d->native = 1; return;
         case 3: d->fuse = 0; d->fdef = ALLF; d->native = 1; return;
-        case 4: case 5: d->fuse = 0; d->fdef = ALLF & ~B86_AF; return;  /* interp leaves AF */
+        case 4: case 5: d->fuse = 0; d->fdef = ALLF & ~B86_AF;   /* interp leaves AF */
+            d->native = 1; d->nfd = d->fdef; return;
         default: d->fuse = ALLF; return;     /* DIV may fault: INT pushes flags */
         }
     case 0xFE:
@@ -237,13 +252,19 @@ static void classify(Insn *d)
     case 0xD0: case 0xD1:
         d->fuse = (d->reg == 2 || d->reg == 3) ? B86_CF : 0;
         d->fdef = d->reg < 4 ? (B86_CF | B86_OF) : ALLF;
-        d->native = (d->reg == 4 || d->reg == 5 || d->reg == 7); /* only if flags dead */
+        d->native = (d->reg == 4 || d->reg == 5 || d->reg == 7);
         return;
     case 0xD2: case 0xD3: /* count may be 0: defines nothing for sure */
-        d->fuse = (d->reg == 2 || d->reg == 3) ? B86_CF : 0; d->fdef = 0; return;
+        d->fuse = (d->reg == 2 || d->reg == 3) ? B86_CF : 0; d->fdef = 0;
+        if (d->reg == 4 || d->reg == 5 || d->reg == 7) { d->native = 1; d->nfd = ALLF; d->nzclob = 1; }
+        return;
     case 0xD4: d->fuse = ALLF; d->fdef = 0; return;
-    case 0xA4: case 0xA5: case 0xAA: case 0xAB: case 0xAC: case 0xAD:
-        d->fuse = 0; return;
+    case 0xA4: case 0xA5: case 0xAA: case 0xAB:
+        d->fuse = 0; d->native = 1;          /* REP form: bulk helper */
+        if (d->rep) d->nzclob = 1;
+        return;
+    case 0xAC: case 0xAD:
+        d->fuse = 0; d->native = !d->rep; return;
     case 0xA6: case 0xA7: case 0xAE: case 0xAF:
         d->fuse = 0; d->fdef = d->rep ? 0 : ALLF; return;
     case 0xE0: case 0xE1: d->cls = C_JCC; d->target = (uint16_t)(d->next + (int8_t)d->imm);
@@ -253,8 +274,8 @@ static void classify(Insn *d)
     case 0xE8: d->cls = C_CALL; d->target = (uint16_t)(d->next + d->imm); d->fuse = 0; d->native = 1; return;
     case 0xE9: d->cls = C_JMP; d->target = (uint16_t)(d->next + d->imm); d->fuse = 0; d->native = 1; return;
     case 0xEB: d->cls = C_JMP; d->target = (uint16_t)(d->next + (int8_t)d->imm); d->fuse = 0; d->native = 1; return;
-    case 0xC2: case 0xC0: case 0xC3: case 0xC1: d->cls = C_RET; d->fuse = ALLF; d->native = 1; return;
-    case 0xF4: d->cls = C_HLT; d->fuse = ALLF; d->native = 1; return;
+    case 0xC2: case 0xC0: case 0xC3: case 0xC1: d->cls = C_RET; d->fuse = 0; d->native = 1; return;
+    case 0xF4: d->cls = C_HLT; d->fuse = 0; d->native = 1; return;
     case 0x9A: case 0xCA: case 0xC8: case 0xCB: case 0xC9: case 0xCC: case 0xCD:
     case 0xCE: case 0xCF: case 0xEA:
         d->cls = C_END; return;
@@ -329,6 +350,7 @@ static int producer_class(const Insn *d, uint8_t *valid)
     else if ((op == 0xF6 || op == 0xF7) && d->reg == 3) { *valid = 0xF; return FM_SUB; }
     else if ((op >= 0x40 && op <= 0x47) || ((op == 0xFE || op == 0xFF) && d->reg == 0)) { *valid = 0x7; return FM_ADD; }
     else if ((op >= 0x48 && op <= 0x4F) || ((op == 0xFE || op == 0xFF) && d->reg == 1)) { *valid = 0x7; return FM_SUB; }
+    if ((op == 0xD0 || op == 0xD1) && d->reg == 4) { *valid = 0xF; return FM_ADD; }  /* ADDS x,x,x */
     if (xop < 0) return 0;
     *valid = 0xF; /* bit0 OF bit1 SF bit2 ZF bit3 CF */
     switch (xop) {
@@ -363,6 +385,7 @@ static int is_mem_dst_producer(const Insn *d)
     if (op >= 0x80 && op <= 0x83) return d->reg != 7;
     if (op == 0xF6 || op == 0xF7) return d->reg == 3;
     if (op == 0xFE || op == 0xFF) return d->reg < 2;
+    if (op == 0xD0 || op == 0xD1) return 1;
     return 0;
 }
 
@@ -371,6 +394,10 @@ static int checked_store(const Insn *d)
 {
     uint8_t op = d->op;
     if (op == 0xA2 || op == 0xA3) return 1;
+    if (op == 0xA4 || op == 0xA5 || op == 0xAA || op == 0xAB) return 1;   /* STOS/MOVS (+REP) */
+    if ((op >= 0x50 && op <= 0x57) || op == 0x06 || op == 0x0E || op == 0x16 || op == 0x1E || op == 0xE8)
+        return 1;                                                          /* PUSH / CALL */
+    if (op == 0xFF && (d->reg == 2 || d->reg >= 6)) return 1;
     if (!d->has_modrm || d->mod == 3) return 0;
     if (is_mem_dst_producer(d)) return 1;
     switch (op) {
@@ -381,6 +408,13 @@ static int checked_store(const Insn *d)
 }
 
 static int is_jcc(const Insn *d) { return d->op >= 0x60 && d->op <= 0x7F && d->native; }
+static int is_carry_alu(const Insn *d)
+{
+    if (!d->native) return 0;
+    if (d->op < 0x40 && (d->op & 7) < 6) return (d->op >> 3) == 2 || (d->op >> 3) == 3;
+    if (d->op >= 0x80 && d->op <= 0x83) return d->reg == 2 || d->reg == 3;
+    return 0;
+}
 
 static uint16_t live_after(const Insn *d)
 {
@@ -399,6 +433,138 @@ static int nz_clobber(const Insn *m)
     return 0;
 }
 
+
+/* Guest GPRs an instruction may write (bit per 16-bit register). */
+static uint8_t r8bit(int r) { return (uint8_t)(1u << (r & 3)); }
+static uint8_t wmask(const Insn *d)
+{
+    uint8_t op = d->op;
+    int m3 = d->has_modrm && d->mod == 3;
+    if (!d->native) return 0xFF;
+    if (op < 0x40 && (op & 7) < 6) {
+        if ((op >> 3) == 7) return 0;
+        switch (op & 7) {
+        case 0: return m3 ? r8bit(d->rm) : 0;
+        case 1: return m3 ? (uint8_t)(1u << d->rm) : 0;
+        case 2: return r8bit(d->reg);
+        case 3: return (uint8_t)(1u << d->reg);
+        default: return 1;
+        }
+    }
+    if (op >= 0x40 && op <= 0x4F) return (uint8_t)(1u << (op & 7));
+    if (op >= 0x50 && op <= 0x57) return 1u << B86_SP;
+    if (op >= 0x58 && op <= 0x5F) return (uint8_t)((1u << B86_SP) | (1u << (op & 7)));
+    if (op >= 0xB0 && op <= 0xB7) return r8bit(op & 7);
+    if (op >= 0xB8 && op <= 0xBF) return (uint8_t)(1u << (op & 7));
+    if (op >= 0x60 && op <= 0x7F) return 0;
+    switch (op) {
+    case 0x80: case 0x81: case 0x82: case 0x83:
+        return (d->reg == 7 || !m3) ? 0 : ((op & 1) ? (uint8_t)(1u << d->rm) : r8bit(d->rm));
+    case 0x84: case 0x85: case 0xA8: case 0xA9: case 0x90: return 0;
+    case 0x87: return (uint8_t)((1u << d->reg) | (1u << d->rm));
+    case 0x88: case 0xC6: return m3 ? r8bit(d->rm) : 0;
+    case 0x89: case 0xC7: case 0x8C: return m3 ? (uint8_t)(1u << d->rm) : 0;
+    case 0x8A: return r8bit(d->reg);
+    case 0x8B: case 0x8D: return (uint8_t)(1u << d->reg);
+    case 0x8E: case 0xFA: case 0xFB: case 0xFC: case 0xFD: case 0xF5: case 0xF8: case 0xF9:
+    case 0xE3: case 0xE9: case 0xEB: case 0xF4: return 0;
+    case 0xA0: case 0xA1: case 0x98: return 1;
+    case 0xA2: case 0xA3: return 0;
+    case 0x91: case 0x92: case 0x93: case 0x94: case 0x95: case 0x96: case 0x97: return (uint8_t)(1u | (1u << (op & 7)));
+    case 0x99: return 1u << B86_DX;
+    case 0x06: case 0x0E: case 0x16: case 0x1E: case 0x07: case 0x17: case 0x1F:
+    case 0xE8: case 0xC2: case 0xC3: case 0xC0: case 0xC1: return 1u << B86_SP;
+    case 0xE0: case 0xE1: case 0xE2: return 1u << B86_CX;
+    case 0xF6: case 0xF7:
+        if (d->reg < 2) return 0;
+        if (d->reg < 4) return m3 ? ((op & 1) ? (uint8_t)(1u << d->rm) : r8bit(d->rm)) : 0;
+        return (uint8_t)((1u << B86_AX) | (1u << B86_DX));
+    case 0xFE: return m3 ? r8bit(d->rm) : 0;
+    case 0xFF:
+        if (d->reg < 2) return m3 ? (uint8_t)(1u << d->rm) : 0;
+        return (d->reg == 4) ? 0 : (uint8_t)(1u << B86_SP);
+    case 0xD0: case 0xD1: case 0xD2: case 0xD3:
+        return m3 ? ((op & 1) ? (uint8_t)(1u << d->rm) : r8bit(d->rm)) : 0;
+    }
+    return 0xFF;
+}
+
+/* A producer whose lazy record can be rebuilt from registers at an exit. */
+typedef struct DeferInfo { int kind, w, ra, rb, writes, overlay; uint32_t imm; } DeferInfo;
+static int defer_info(const Insn *d, DeferInfo *o)
+{
+    uint8_t op = d->op;
+    int xop = -1, w = op & 1, ra = -1, rb = -1, imm_src = 0, incdec = 0;
+    uint32_t imm = 0;
+    int m3 = d->has_modrm && d->mod == 3;
+    if (!d->native || d->rep) return 0;
+    if (op < 0x40 && (op & 7) < 6) {
+        xop = op >> 3;
+        switch (op & 7) {
+        case 0: case 1: if (!m3) return 0; ra = d->rm; rb = d->reg; break;
+        case 2: case 3: if (!m3) return 0; ra = d->reg; rb = d->rm; break;
+        case 4: w = 0; ra = 0; imm_src = 1; imm = d->imm; break;
+        default: w = 1; ra = 0; imm_src = 1; imm = d->imm; break;
+        }
+    } else if (op >= 0x80 && op <= 0x83) {
+        if (!m3) return 0;
+        xop = d->reg; ra = d->rm; imm_src = 1;
+        imm = op == 0x83 ? (uint16_t)(int8_t)d->imm : d->imm;
+    } else if (op == 0x84 || op == 0x85) {
+        if (!m3) return 0;
+        xop = 8; ra = d->rm; rb = d->reg;
+    } else if (op == 0xA8 || op == 0xA9) {
+        xop = 8; ra = 0; imm_src = 1; imm = d->imm;
+    } else if ((op == 0xF6 || op == 0xF7) && d->reg < 2) {
+        if (!m3) return 0;
+        xop = 8; ra = d->rm; imm_src = 1; imm = d->imm;
+    } else if (op >= 0x40 && op <= 0x4F) {
+        w = 1; ra = op & 7; incdec = op >= 0x48 ? 2 : 1; xop = incdec == 2 ? 5 : 0; imm_src = 1; imm = 1;
+    } else if ((op == 0xFE || op == 0xFF) && d->reg < 2) {
+        if (!m3) return 0;
+        ra = d->rm; incdec = d->reg ? 2 : 1; xop = d->reg ? 5 : 0; imm_src = 1; imm = 1;
+    } else return 0;
+    if (xop == 2 || xop == 3) return 0;                       /* ADC/SBB: carry-in */
+    if (!w && (ra >= 4 || (!imm_src && rb >= 4))) return 0;   /* AH..BH need extraction */
+    int writes = xop != 7 && xop != 8;
+    int logic = xop == 1 || xop == 4 || xop == 6 || xop == 8;
+    if (writes && !logic && !imm_src && (rb & (w ? 7 : 3)) == (ra & (w ? 7 : 3))) return 0; /* b clobbered */
+    o->w = w; o->ra = w ? ra : (ra & 3); o->rb = imm_src ? -1 : (w ? rb : (rb & 3)); o->imm = imm;
+    o->writes = writes; o->overlay = incdec != 0;
+    if (incdec) o->kind = incdec == 2 ? (w ? LZ_DEC16 : LZ_DEC8) : (w ? LZ_INC16 : LZ_INC8);
+    else if (logic) o->kind = w ? LZ_LOG16 : LZ_LOG8;
+    else if (xop == 0) o->kind = w ? LZ_ADD16 : LZ_ADD8;
+    else o->kind = w ? LZ_SUB16 : LZ_SUB8;
+    o->writes = writes;
+    if (logic && xop != 8) o->writes = 1;
+    o->ra = o->ra; (void)logic;
+    return 1;
+}
+static uint8_t defer_regs(const DeferInfo *o)
+{
+    return (uint8_t)((1u << o->ra) | (o->rb >= 0 ? (1u << o->rb) : 0u));
+}
+
+/* Lowerings that call into C and fold the lazy records into the flags
+   word (clearing the INC/DEC overlay). A full record rebuilt at a later exit
+   would override flags defined after it, so no deferral across these. */
+static int materializes(const Insn *d)
+{
+    uint8_t op = d->op;
+    if (!d->native) return 1;
+    if (is_jcc(d) && !d->fused) return 1;
+    if (op == 0xE0 || op == 0xE1 || op == 0xF5 || op == 0xF8 || op == 0xF9) return 1;
+    if (is_carry_alu(d) && !d->fused) return 1;
+    return 0;
+}
+
+/* CALL's push uses check mode 2 (no exit), so it is not an exit point. */
+static int smc_exit_store(const Insn *d)
+{
+    if (d->op == 0xE8 || (d->op == 0xFF && d->reg == 2)) return 0;
+    return 1;
+}
+
 static void analyze(J *j, uint32_t cs, Insn *v, int n, uint16_t live_out, Guard *g)
 {
     uint16_t live = live_out;
@@ -408,11 +574,15 @@ static void analyze(J *j, uint32_t cs, Insn *v, int n, uint16_t live_out, Guard 
         d->live = live;
         live = live_before(d);
     }
+    /* Instructions lowered only when their flag results are dead. */
+    for (int i = 0; i < n; ++i)
+        if (v[i].nfd && (live_after(&v[i]) & v[i].nfd)) v[i].native = 0;
     /* Pass A: fuse each native Jcc with its producer through NZCV. */
     for (int q = 0; q < n; ++q) {
         Insn *c = &v[q];
-        if (!is_jcc(c)) continue;
-        uint16_t use = cc_use[(c->op & 15) >> 1];
+        int carry = is_carry_alu(c);
+        if (!is_jcc(c) && !carry) continue;
+        uint16_t use = carry ? B86_CF : cc_use[(c->op & 15) >> 1];
         int p = -1;
         for (int m = q - 1; m >= 0; --m) {
             if (v[m].fdef & use) { p = m; break; }
@@ -424,31 +594,42 @@ static void analyze(J *j, uint32_t cs, Insn *v, int n, uint16_t live_out, Guard 
         int mode = pr->native ? producer_class(pr, &valid) : 0;
         if (!mode || (pr->fdef & use) != use) continue;
         if ((flagbits(use) & ~valid) != 0) continue;
-        int ac = arm_cond(mode, c->op & 15);
+        int ac = carry ? arm_cond(mode, 2) : arm_cond(mode, c->op & 15);   /* 2 = "B": CF set */
         if (ac < 0) continue;
         if (is_mem_dst_producer(pr) && be_store_clobbers_nzcv) continue;
         c->fused = 1; c->mode = (uint8_t)ac; c->prod = (uint8_t)p;
-        pr->arm = 1; pr->mode = (uint8_t)mode;
+        pr->arm = 1; pr->mode = (uint8_t)mode; pr->armneed |= use;
     }
-    /* Pass B: lazy record unless every reader is a fused consumer. */
+    for (int i = 0; i < n; ++i) v[i].wm = wmask(&v[i]);
+    /* Pass B: lazy record unless every reader is a fused consumer. A record
+       needed only at exits (side exits / block end) is deferred into the
+       exit path when it can be rebuilt from registers there. */
     for (int i = 0; i < n; ++i) {
         Insn *p = &v[i];
         if (!p->native || !p->fdef) continue;
         uint16_t rem = p->fdef & live_after(p);
         if (!rem) continue;
+        DeferInfo di;
+        int can = defer_info(p, &di);
+        uint8_t need = can ? defer_regs(&di) : 0xFF, touched = 0;
+        int mid = 0, exits = 0;
         /* An SMC store that kills its own block exits right after the store,
            so flags held only in NZCV across a checked store need the record. */
-        if (checked_store(p) && p->arm) p->lazy = 1;
+        if (checked_store(p) && p->arm) mid = 1;
         int k;
         for (k = i + 1; k < n && rem; ++k) {
             Insn *q = &v[k];
-            if (q->native && checked_store(q) && (live_after(q) & rem)) p->lazy = 1;
-            if ((q->fuse & rem) && !(q->fused && q->prod == i)) p->lazy = 1;
-            if (q->cls == C_JCC && (q->live_taken & rem)) p->lazy = 1;
-            if (!q->native && (live_before(q) & rem)) p->lazy = 1;
+            touched |= q->wm;
+            if (q->native && checked_store(q) && smc_exit_store(q) && (live_after(q) & rem)) mid = 1;
+            if ((q->fuse & rem) && !(q->fused && q->prod == i)) mid = 1;
+            if (q->cls == C_JCC && (q->live_taken & rem)) { exits = 1; if (touched & need) can = 0; }
+            if (!q->native && (live_before(q) & rem)) mid = 1;
+            if (materializes(q)) mid = 1;
             rem &= (uint16_t)~q->fdef;
         }
-        if (rem && (v[n - 1].live & rem)) p->lazy = 1;
+        if (rem && (v[n - 1].live & rem)) { exits = 1; if (touched & need) can = 0; }
+        p->lazy = (uint8_t)(mid || exits);
+        p->defer = (uint8_t)(p->lazy && !mid && can);
     }
 }
 
@@ -456,7 +637,7 @@ static void analyze(J *j, uint32_t cs, Insn *v, int n, uint16_t live_out, Guard 
 /* Lowering helpers                                                         */
 /* ------------------------------------------------------------------------ */
 
-typedef struct Side { uint8_t *site; uint16_t target; uint8_t poll; uint32_t retire; } Side;
+typedef struct Side { uint8_t *site; uint16_t target; uint8_t poll; uint32_t retire; int idx; uint16_t live; } Side;
 
 typedef struct Tx {
     J *j;
@@ -466,7 +647,20 @@ typedef struct Tx {
     int nside;
     int fail;
     int inc_pending;            /* an INC/DEC overlay record may be live */
+    Insn *v;                    /* the block being lowered */
+    int cur;                    /* index of the instruction being lowered */
 } Tx;
+
+static void emit_deferred(Tx *t, int k, uint16_t live);
+
+/* Backward conditional exit laid out inline: `skip` is the branch taken when
+   the condition FAILS. Taken path = records + poll + one patchable B. */
+static void emit_back_exit(Tx *t, uint8_t *skip, uint16_t target)
+{
+    emit_deferred(t, t->cur, t->v[t->cur].live_taken);
+    be_exit_chain(t->e, target, 1);
+    be_bind(t->e, skip, t->e->p);
+}
 
 static void add_side(Tx *t, uint8_t *site, uint16_t target, uint16_t from)
 {
@@ -475,7 +669,53 @@ static void add_side(Tx *t, uint8_t *site, uint16_t target, uint16_t from)
     t->side[t->nside].target = target;
     t->side[t->nside].poll = target <= from;
     t->side[t->nside].retire = t->e->retire;
+    t->side[t->nside].idx = t->cur;
+    t->side[t->nside].live = t->v[t->cur].live_taken;
     t->nside++;
+}
+
+/* Rebuild deferred lazy records on an exit path: flags state after
+   instruction k, `live` = flags needed past the exit. */
+static void emit_record(Tx *t, const DeferInfo *o, int clear_overlay)
+{
+    Emit *e = t->e;
+    unsigned ok = o->overlay ? OFF(lz_ikind) : OFF(lz_kind);
+    unsigned oa = o->overlay ? OFF(lz_ia) : OFF(lz_a);
+    unsigned orr = o->overlay ? OFF(lz_ires) : OFF(lz_res);
+    int logic = o->kind == LZ_LOG8 || o->kind == LZ_LOG16;
+    int sub = o->kind == LZ_SUB8 || o->kind == LZ_SUB16 || o->kind == LZ_DEC8 || o->kind == LZ_DEC16;
+    be_stctx_imm(e, (uint32_t)o->kind, ok);
+    if (clear_overlay) be_stctx_imm(e, LZ_NONE, OFF(lz_ikind));
+    if (o->writes) {
+        be_stctx(e, o->ra, orr);                        /* result lives in ra */
+        if (!logic) {                                   /* a = res -/+ b */
+            if (o->rb < 0) be_opi(e, sub ? AOP_ADD : AOP_SUB, V_T0, o->ra, o->imm);
+            else be_op(e, sub ? AOP_ADD : AOP_SUB, V_T0, o->ra, o->rb);
+            be_stctx(e, V_T0, oa);
+        }
+    } else {                                            /* CMP / TEST */
+        int aop = logic ? AOP_AND : AOP_SUB;
+        if (!logic) be_stctx(e, o->ra, oa);
+        if (o->rb < 0) be_opi(e, aop, V_T0, o->ra, o->imm);
+        else be_op(e, aop, V_T0, o->ra, o->rb);
+        be_stctx(e, V_T0, orr);
+    }
+}
+
+static void emit_deferred(Tx *t, int k, uint16_t live)
+{
+    Insn *v = t->v;
+    int P = -1, Q = -1;
+    if (!live) return;
+    for (int m = k; m >= 0; --m) {
+        if (v[m].fdef & B86_CF) { P = m; break; }
+        if (Q < 0 && (v[m].fdef & B86_ZF)) Q = m;
+    }
+    DeferInfo o;
+    if (P >= 0 && v[P].defer && (live & v[P].fdef) && defer_info(&v[P], &o))
+        emit_record(t, &o, Q < 0 && v[P].pendb);
+    if (Q >= 0 && v[Q].defer && (live & v[Q].fdef) && defer_info(&v[Q], &o))
+        emit_record(t, &o, 0);
 }
 
 /* EA of modrm memory operand into V_T0 */
@@ -517,6 +757,8 @@ typedef struct { int k, r; uint32_t imm; } Op;
 
 static int lz_kind(int xop, int w, int incdec)
 {
+    if (xop == 2) return w ? LZ_ADC16 : LZ_ADC8;
+    if (xop == 3) return w ? LZ_SBB16 : LZ_SBB8;
     if (incdec == 1) return w ? LZ_INC16 : LZ_INC8;
     if (incdec == 2) return w ? LZ_DEC16 : LZ_DEC8;
     if (xop == 0) return w ? LZ_ADD16 : LZ_ADD8;
@@ -542,9 +784,13 @@ static int emit_alu(Tx *t, Insn *d, int xop, int w, Op dst, Op src, int incdec)
     int sh = w ? 16 : 24;
     int writes = xop != 7 && xop != 8;
     int logic = xop == 1 || xop == 4 || xop == 6 || xop == 8;
-    int sub = xop == 5 || xop == 7;
-    int need_flags = d->arm || d->lazy;
-    int aop = xop == 0 ? AOP_ADD : sub ? AOP_SUB : xop == 1 ? AOP_ORR : xop == 4 || xop == 8 ? AOP_AND : AOP_EOR;
+    int carry = xop == 2 || xop == 3;
+    int sub = xop == 5 || xop == 7 || xop == 3;
+    int lz = d->lazy && !d->defer;                 /* record written in line */
+    int need_flags = d->arm || lz;
+    int nzonly = d->arm && !(d->armneed & ~(B86_ZF | B86_SF));
+    int aop = (xop == 0 || xop == 2) ? AOP_ADD : sub ? AOP_SUB : xop == 1 ? AOP_ORR : xop == 4 || xop == 8 ? AOP_AND : AOP_EOR;
+    if (carry && d->arm) return 0;               /* ADC/SBB never feed NZCV */
     int mem = dst.k == O_MEM || src.k == O_MEM;
     uint32_t imm = src.imm;
 
@@ -568,7 +814,7 @@ static int emit_alu(Tx *t, Insn *d, int xop, int w, Op dst, Op src, int incdec)
     if (dst.k == O_MEM && !writes) pool.busy[V_T0] = 0;       /* no store: address dies after load */
     /* CMP feeding both NZCV and a lazy record recomputes a - b after the
        shifted compare, so its scratch must not alias a. */
-    int keep_a = !writes && d->arm && d->lazy && !logic;
+    int keep_a = !writes && d->arm && lz && !logic;
     if (dst.k == O_R16 && writes) res = dst.r;
     else if (dst.k == O_MEM && writes) res = V_T1;
     else if (a >= V_T0 && !keep_a) res = a;
@@ -579,6 +825,15 @@ static int emit_alu(Tx *t, Insn *d, int xop, int w, Op dst, Op src, int incdec)
         tmp = pick(&pool);
         if (tmp < 0) return 0;
     }
+    int cft = -1;
+    if (carry) {
+        if (res >= V_T0 && res != a) pool.busy[res] = 1;
+        if (x >= V_T0 && x != res && x != a && x != b) pool.busy[x] = 0;   /* x unused */
+        cft = pick(&pool);
+        if (cft < 0) return 0;
+        if (!d->fused) be_call_flags(e);         /* CF from ctx; clobbers temps */
+        if (!d->fused) t->inc_pending = 0;
+    }
     if (d->arm && logic && res < V_T0) { /* test_res needs a scratch: x */ }
 
     /* ---- emit ---- */
@@ -586,22 +841,42 @@ static int emit_alu(Tx *t, Insn *d, int xop, int w, Op dst, Op src, int incdec)
     unsigned o_a = incdec ? OFF(lz_ia) : OFF(lz_a);
     unsigned o_res = incdec ? OFF(lz_ires) : OFF(lz_res);
     if (mem) ea_modrm(t, d);
-    if (d->lazy) {
+    if (lz) {
         be_stctx_imm(e, (uint32_t)lz_kind(xop, w, incdec), o_kind);
         if (incdec) t->inc_pending = 1;
         else if (t->inc_pending) { be_stctx_imm(e, LZ_NONE, OFF(lz_ikind)); t->inc_pending = 0; }
+        if (carry && src.k == O_IMM) be_stctx_imm(e, imm, OFF(lz_b));
     }
     if (mem) be_load(e, w, V_T1, V_T0);
     if (ax >= 0) be_ubfx(e, a, ax, 8, 8);
     if (bx >= 0) be_ubfx(e, b, bx, 8, 8);
-    if (d->lazy && !logic) be_stctx(e, a, o_a);
+    if (carry) {               /* after the load: a src address in T0 is dead now */
+        if (d->fused) be_get_carry(e, cft, d->mode);
+        else { be_ldctx(e, cft, OFF(flags)); be_ubfx(e, cft, cft, 0, 1); }
+    }
+    if (lz && !logic) be_stctx(e, a, o_a);
+    if (carry) {
+        if (lz && src.k != O_IMM) be_stctx(e, b, OFF(lz_b));
+        if (src.k == O_IMM) be_opi(e, aop, res, a, imm); else be_op(e, aop, res, a, b);
+        be_op(e, aop, res, res, cft);
+        if (lz) be_stctx(e, res, o_res);
+        if (dst.k == O_R8) put8(t, dst.r, res);
+        if (dst.k == O_MEM) be_store(e, w, V_T1, V_T0, 1, d->next);
+        return 1;
+    }
 
     if (logic) {
         int r = writes ? res : x;
         if (src.k == O_IMM) be_opi(e, aop, r, a, imm); else be_op(e, aop, r, a, b);
-        if (d->lazy) be_stctx(e, r, o_res);
+        if (lz) be_stctx(e, r, o_res);
         if (dst.k == O_R8 && writes) put8(t, dst.r, r);
-        if (d->arm) be_test_res(e, (r >= V_T0) ? r : x, r, sh);
+        if (d->arm && nzonly) be_test_nz(e, (r >= V_T0) ? r : x, r, sh);
+        else if (d->arm) be_test_res(e, (r >= V_T0) ? r : x, r, sh);
+    } else if (d->arm && nzonly && writes) {         /* Z/S only: plain op + test */
+        if (src.k == O_IMM) be_opi(e, aop, res, a, imm); else be_op(e, aop, res, a, b);
+        if (lz) be_stctx(e, res, o_res);
+        if (dst.k == O_R8) put8(t, dst.r, res);
+        be_test_nz(e, (res >= V_T0) ? res : x, res, sh);
     } else if (d->arm) {
         if (src.k == O_IMM) {
             if (writes) be_addsubi_sh(e, sub, x, res, a, imm, sh, tmp);
@@ -610,7 +885,7 @@ static int emit_alu(Tx *t, Insn *d, int xop, int w, Op dst, Op src, int incdec)
             if (writes) be_addsub_sh(e, sub, x, res, a, b, sh);
             else be_cmp_sh(e, x, a, b, sh);
         }
-        if (d->lazy) {
+        if (lz) {
             if (!writes) {
                 if (src.k == O_IMM) be_opi(e, AOP_SUB, x, a, imm); else be_op(e, AOP_SUB, x, a, b);
                 be_stctx(e, x, o_res);
@@ -620,18 +895,20 @@ static int emit_alu(Tx *t, Insn *d, int xop, int w, Op dst, Op src, int incdec)
     } else {
         int r = writes ? res : x;
         if (src.k == O_IMM) be_opi(e, aop, r, a, imm); else be_op(e, aop, r, a, b);
-        if (d->lazy) be_stctx(e, r, o_res);
+        if (lz) be_stctx(e, r, o_res);
         if (dst.k == O_R8 && writes) put8(t, dst.r, r);
     }
     if (dst.k == O_MEM && writes) be_store(e, w, V_T1, V_T0, 1, d->next);
     return 1;
 }
 
-static void emit_push(Tx *t, int v, uint16_t next)
+/* PUSH is SMC-checked like any store: a stack that grows into code must
+   invalidate it (seed 51187). mode 2 = invalidate but continue (CALL). */
+static void emit_push(Tx *t, int v, uint16_t next, int mode)
 {
     be_opi(t->e, AOP_SUB, B86_SP, B86_SP, 2);
     be_ea(t->e, V_T0, B86_SS, B86_SP, -1, 0);
-    be_store(t->e, 1, v, V_T0, 0, next);
+    be_store(t->e, 1, v, V_T0, mode, next);
 }
 
 static void emit_pop_to(Tx *t, int dst)
@@ -640,6 +917,57 @@ static void emit_pop_to(Tx *t, int dst)
     if (dst == B86_SP) { be_load(t->e, 1, B86_SP, V_T0); return; }
     be_load(t->e, 1, dst, V_T0);
     be_opi(t->e, AOP_ADD, B86_SP, B86_SP, 2);
+}
+
+/* reg += (DF ? -n : n), n = 1 or 2; uses `tmp` */
+static void step_index(Tx *t, int reg, int w, int tmp)
+{
+    be_ldctx(t->e, tmp, OFF(flags));
+    be_ubfx(t->e, tmp, tmp, 10, 1);                /* DF */
+    be_opi(t->e, AOP_ADD, reg, reg, w ? 2u : 1u);
+    be_op_lsl(t->e, AOP_SUB, reg, reg, tmp, w ? 2u : 1u);
+}
+
+/* LODS / STOS / MOVS without REP natively; REP MOVS/STOS via bulk helper */
+static int emit_string(Tx *t, Insn *d)
+{
+    Emit *e = t->e;
+    uint8_t op = d->op;
+    int w = op & 1;
+    int sseg = d->seg != 0xFF ? d->seg : B86_DS;
+    if (d->rep) {
+        if (op >= 0xAC) return 0;
+        be_call_helper(e, (void *)b86h_rep, (uint32_t)d->ip | (uint32_t)d->next << 16);
+        t->inc_pending = t->inc_pending;          /* helper does not touch lazy flags */
+        return 1;
+    }
+    switch (op & 0xFE) {
+    case 0xAC:                                    /* LODS */
+        be_ea(e, V_T0, sseg, B86_SI, -1, 0);
+        if (w) be_load(e, 1, B86_AX, V_T0);
+        else { be_load(e, 0, V_T1, V_T0); put8(t, 0, V_T1); }
+        step_index(t, B86_SI, w, V_T0);
+        return 1;
+    case 0xAA:                                    /* STOS */
+        be_ea(e, V_T0, B86_ES, B86_DI, -1, 0);
+        be_store(e, w, B86_AX, V_T0, 1, d->next);
+        step_index(t, B86_DI, w, V_T0);
+        return 1;
+    default: {                                    /* MOVS */
+        be_ea(e, V_T0, sseg, B86_SI, -1, 0);
+        int v = be_has_t2 ? V_T2 : V_T1;
+        be_load(e, w, v, V_T0);
+        if (!be_has_t2) be_stctx(e, V_T1, OFF(scratch));   /* ES base load clobbers T1 */
+        be_ea(e, V_T0, B86_ES, B86_DI, -1, 0);
+        if (!be_has_t2) be_ldctx(e, V_T1, OFF(scratch));
+        be_store(e, w, v, V_T0, 1, d->next);
+        step_index(t, B86_SI, w, V_T0);
+        be_ldctx(e, V_T0, OFF(flags));
+        be_ubfx(e, V_T0, V_T0, 10, 1);
+        be_opi(e, AOP_ADD, B86_DI, B86_DI, w ? 2u : 1u);
+        be_op_lsl(e, AOP_SUB, B86_DI, B86_DI, V_T0, w ? 2u : 1u);
+        return 1; }
+    }
 }
 
 static Op op_rm(const Insn *d, int w)
@@ -692,21 +1020,23 @@ static int lower(Tx *t, Insn *d)
     if ((op == 0xFE || op == 0xFF) && d->reg < 2) {
         return emit_alu(t, d, d->reg ? 5 : 0, w, op_rm(d, w), op_imm(1), d->reg ? 2 : 1);
     }
-    if (op >= 0x50 && op <= 0x57) { emit_push(t, op & 7, d->next); return 1; }
+    if (op >= 0x50 && op <= 0x57) { emit_push(t, op & 7, d->next, 1); return 1; }
     if (op >= 0x58 && op <= 0x5F) { emit_pop_to(t, op & 7); return 1; }
     if (op >= 0xB0 && op <= 0xB7) { be_movi(e, V_T0, d->imm); put8(t, op & 7, V_T0); return 1; }
     if (op >= 0xB8 && op <= 0xBF) { be_movi(e, op & 7, d->imm); return 1; }
     if ((op >= 0x60 && op <= 0x7F)) {
         int cc = op & 15;
         uint8_t *site;
+        int back = d->target <= d->ip;
         if (d->fused) {
-            site = be_jcc(e, d->mode);      /* ARM condition from analysis */
+            site = be_jcc(e, back ? (d->mode ^ 1) : d->mode);   /* ARM condition */
         } else {
             be_call_cond(e, cc);
             t->inc_pending = 0;
-            site = be_cbnz(e, V_T0);
+            site = back ? be_cbz(e, V_T0) : be_cbnz(e, V_T0);
         }
-        add_side(t, site, d->target, d->ip);
+        if (back) emit_back_exit(t, site, d->target);
+        else add_side(t, site, d->target, d->ip);
         return 1;
     }
 
@@ -745,6 +1075,22 @@ static int lower(Tx *t, Insn *d)
             if (d->lazy) be_stctx(e, res, OFF(lz_res));
             if (mem) be_store(e, w, V_T1, V_T0, 1, d->next);
             else if (!w) put8(t, d->rm, res);
+            return 1;
+        }
+        if (d->reg == 4 || d->reg == 5) {     /* MUL / IMUL, flags dead */
+            int sgn = d->reg == 5;
+            load_rm(t, d, w, V_T1);
+            if (w) {
+                if (sgn) { be_sbfx(e, V_T1, V_T1, 0, 16); be_sbfx(e, V_T0, B86_AX, 0, 16); }
+                else { be_ubfx(e, V_T1, V_T1, 0, 16); be_ubfx(e, V_T0, B86_AX, 0, 16); }
+                be_mul(e, V_T0, V_T0, V_T1);
+                be_mov(e, B86_AX, V_T0);
+                be_ubfx(e, B86_DX, V_T0, 16, 16);
+            } else {
+                if (sgn) { be_sbfx(e, V_T1, V_T1, 0, 8); be_sbfx(e, V_T0, B86_AX, 0, 8); }
+                else { be_ubfx(e, V_T1, V_T1, 0, 8); be_ubfx(e, V_T0, B86_AX, 0, 8); }
+                be_mul(e, B86_AX, V_T0, V_T1);
+            }
             return 1;
         }
         return 0;
@@ -813,7 +1159,7 @@ static int lower(Tx *t, Insn *d)
     case 0x99: be_sbfx(e, B86_DX, B86_AX, 15, 1); return 1;
     case 0x06: case 0x0E: case 0x16: case 0x1E:
         be_ldctx(e, V_T1, OFF(seg[op >> 3]));
-        emit_push(t, V_T1, d->next);
+        emit_push(t, V_T1, d->next, 1);
         return 1;
     case 0x07: case 0x17: case 0x1F:
         emit_pop_to(t, V_T1);
@@ -826,26 +1172,61 @@ static int lower(Tx *t, Insn *d)
         else be_opi(e, AOP_AND, V_T0, V_T0, (uint16_t)~bit);
         be_stctx(e, V_T0, OFF(flags));
         return 1; }
-    case 0xD0: case 0xD1: {
-        if (d->live & d->fdef) return 0;     /* flags needed: helper */
-        int src, dst;
+    case 0xD0: case 0xD1: {                   /* SHL/SHR/SAR by 1 */
         int mem = d->mod != 3;
-        if (mem) { ea_modrm(t, d); be_load(e, w, V_T1, V_T0); src = dst = V_T1; }
-        else if (w) { src = dst = d->rm; }
-        else { src = get8(t, d->rm, V_T1); dst = V_T1; }
+        int sh = w ? 16 : 24;
         unsigned bits = w ? 16 : 8;
-        if (d->reg == 4) be_lsl(e, dst, src, 1);
-        else if (d->reg == 5) be_ubfx(e, dst, src, 1, bits - 1);
-        else be_sbfx(e, dst, src, 1, bits - 1);
+        int kind = (d->reg == 4 ? LZ_SHL8 : d->reg == 5 ? LZ_SHR8 : LZ_SAR8) + w;
+        int a, res, x = -1;
+        if (mem) { a = res = V_T1; if (d->arm) { if (!be_has_t2) return 0; x = V_T2; } }
+        else if (w) { a = res = d->rm; x = V_T0; }
+        else { a = (d->rm < 4) ? d->rm : V_T1; res = V_T1; x = V_T0; }
+        if (mem) ea_modrm(t, d);
+        if (d->lazy) {
+            be_stctx_imm(e, (uint32_t)kind, OFF(lz_kind));
+            if (t->inc_pending) { be_stctx_imm(e, LZ_NONE, OFF(lz_ikind)); t->inc_pending = 0; }
+        }
+        if (mem) be_load(e, w, V_T1, V_T0);
+        else if (!w && d->rm >= 4) be_ubfx(e, V_T1, d->rm - 4, 8, 8);
+        if (d->lazy) be_stctx(e, a, OFF(lz_a));
+        if (d->arm) be_addsub_sh(e, 0, x, res, a, a, sh);        /* x = a<<sh; ADDS x,x,x */
+        else if (d->reg == 4) be_lsl(e, res, a, 1);
+        else if (d->reg == 5) be_ubfx(e, res, a, 1, bits - 1);
+        else be_sbfx(e, res, a, 1, bits - 1);
+        if (d->lazy) be_stctx(e, res, OFF(lz_res));
         if (mem) be_store(e, w, V_T1, V_T0, 1, d->next);
-        else if (!w) put8(t, d->rm, dst);
+        else if (!w) put8(t, d->rm, res);
         return 1; }
+    case 0xD2: case 0xD3: {                   /* SHL/SHR/SAR by CL, flags dead */
+        int mem = d->mod != 3;
+        int v;
+        if (mem) { ea_modrm(t, d); be_load(e, w, V_T1, V_T0); v = V_T1; }
+        else if (w) v = d->rm;
+        else { v = V_T1; if (d->rm < 4) be_mov(e, V_T1, d->rm); else be_ubfx(e, V_T1, d->rm - 4, 8, 8); }
+        int src = v;
+        if (d->reg == 5) { be_ubfx(e, V_T1, v, 0, w ? 16 : 8); src = V_T1; }
+        else if (d->reg == 7) { be_sbfx(e, V_T1, v, 0, w ? 16 : 8); src = V_T1; }
+        be_shift_reg(e, d->reg == 4 ? 0 : d->reg == 5 ? 1 : 2, v, src, B86_CX);
+        if (mem) be_store(e, w, V_T1, V_T0, 1, d->next);
+        else if (!w) put8(t, d->rm, V_T1);
+        return 1; }
+    case 0xF5: case 0xF8: case 0xF9:          /* CMC / CLC / STC */
+        be_call_flags(e);
+        t->inc_pending = 0;
+        be_ldctx(e, V_T0, OFF(flags));
+        be_opi(e, op == 0xF5 ? AOP_EOR : op == 0xF8 ? AOP_AND : AOP_ORR, V_T0, V_T0,
+               op == 0xF8 ? (uint16_t)~B86_CF : B86_CF);
+        be_stctx(e, V_T0, OFF(flags));
+        return 1;
     case 0xE2: /* LOOP */
         be_opi(e, AOP_SUB, B86_CX, B86_CX, 1);
-        add_side(t, be_cbnz16(e, B86_CX), d->target, d->ip);
+        if (d->inv) { add_side(t, be_cbz16(e, B86_CX), d->target, d->ip); return 1; }
+        if (d->target <= d->ip) emit_back_exit(t, be_cbz16(e, B86_CX), d->target);
+        else add_side(t, be_cbnz16(e, B86_CX), d->target, d->ip);
         return 1;
     case 0xE3: /* JCXZ */
-        add_side(t, be_cbz16(e, B86_CX), d->target, d->ip);
+        if (d->target <= d->ip) emit_back_exit(t, be_cbnz16(e, B86_CX), d->target);
+        else add_side(t, be_cbz16(e, B86_CX), d->target, d->ip);
         return 1;
     case 0xE0: case 0xE1: { /* LOOPNZ / LOOPZ */
         be_opi(e, AOP_SUB, B86_CX, B86_CX, 1);
@@ -856,42 +1237,50 @@ static int lower(Tx *t, Insn *d)
         be_bind(e, skip, e->p);
         return 1; }
     case 0xE8: /* CALL near: push return, chain to target */
+        emit_deferred(t, t->cur - 1, d->live);
         be_movi(e, V_T1, d->next);
-        emit_push(t, V_T1, d->next);
+        emit_push(t, V_T1, d->next, 2);
         be_exit_chain(e, d->target, d->target <= d->ip);
         return 1;
     case 0xE9: case 0xEB:
+        emit_deferred(t, t->cur - 1, d->live);
         be_exit_chain(e, d->target, d->target <= d->ip);
         return 1;
     case 0xC3: case 0xC1: case 0xC2: case 0xC0:
+        emit_deferred(t, t->cur - 1, d->live);
         be_ea(e, V_T0, B86_SS, B86_SP, -1, 0);
         be_load(e, 1, V_T0, V_T0);
         be_opi(e, AOP_ADD, B86_SP, B86_SP, (op == 0xC2 || op == 0xC0) ? (uint16_t)(2 + d->imm) : 2);
-        be_exit_ip_reg(e, V_T0);
+        be_exit_ret(e, d->ip);
         return 1;
     case 0xFF:
         if (d->reg == 4) {           /* JMP near r/m */
+            emit_deferred(t, t->cur - 1, d->live);
             load_rm(t, d, 1, V_T0);
             be_exit_ip_reg(e, V_T0);
             return 1;
         }
         if (d->reg == 2) {           /* CALL near r/m (needs 3 temps) */
+            emit_deferred(t, t->cur - 1, d->live);
             load_rm(t, d, 1, V_T2);
             be_movi(e, V_T1, d->next);
-            emit_push(t, V_T1, d->next);
+            emit_push(t, V_T1, d->next, 2);
             be_mov(e, V_T0, V_T2);
             be_exit_ip_reg(e, V_T0);
             return 1;
         }
         if (d->reg >= 6) {           /* PUSH r/m */
             load_rm(t, d, 1, V_T1);
-            emit_push(t, V_T1, d->next);
+            emit_push(t, V_T1, d->next, 1);
             return 1;
         }
         return 0;
     case 0xF4:
+        emit_deferred(t, t->cur - 1, d->live);
         be_exit_ip_imm(e, d->next, XR_HALT);
         return 1;
+    case 0xA4: case 0xA5: case 0xAA: case 0xAB: case 0xAC: case 0xAD:
+        return emit_string(t, d);
     }
     return 0;
 }
@@ -900,7 +1289,7 @@ static int lower(Tx *t, Insn *d)
 /* Block cache                                                              */
 /* ------------------------------------------------------------------------ */
 
-static uint32_t map_hash(uint32_t key) { return (key * 2654435761u) >> (32 - 14); }
+static uint32_t map_hash(uint32_t key) { return (key * 2654435761u) >> (32 - B86_MAP_BITS); }
 static uint32_t fast_hash(uint32_t key) { return (key ^ (key >> 16)) & (B86_FASTN - 1); }
 
 static Block *map_find(J *j, uint32_t key)
@@ -1017,6 +1406,41 @@ static Block *translate(J *j, uint32_t cs, uint16_t ip)
         if (ends_block(d)) break;
         pc = d->next;
     }
+    /* Unroll a small self-loop (back-edge to the block start): copies end in
+       the INVERTED branch, which exits to the loop's fall-through and
+       otherwise falls into the next copy; only the last copy carries the
+       interrupt poll and the back-edge. Semantics are unchanged. */
+    if (!j->single_step && !j->max_insns) {
+        int k = -1;
+        for (int i = 0; i < n; ++i) {
+            Insn *d = &v[i];
+            if (d->cls == C_JCC && d->native && d->target == ip &&
+                ((d->op >= 0x60 && d->op <= 0x7F) || d->op == 0xE2)) { k = i; break; }
+        }
+        if (k >= 0) {
+            int body = k + 1, U = body <= 6 ? 4 : body <= 12 ? 2 : 1;
+            while (U > 1 && n + (U - 1) * body > 120) U--;
+            if (U > 1) {
+                static Insn w[128];
+                int m = 0;
+                for (int u = 0; u < U - 1; ++u)
+                    for (int i = 0; i <= k; ++i) {
+                        w[m] = v[i];
+                        if (i == k) {
+                            Insn *b = &w[m];
+                            uint16_t fall = b->next;
+                            if (b->op == 0xE2) b->inv = 1; else b->op ^= 1;
+                            b->target = fall;
+                            b->next = ip;
+                        }
+                        m++;
+                    }
+                for (int i = 0; i < n; ++i) w[m++] = v[i];
+                memcpy(v, w, sizeof(Insn) * (size_t)m);
+                n = m;
+            }
+        }
+    }
     Insn *last = &v[n - 1];
     uint32_t glo0 = glo, ghi0 = ghi;
 
@@ -1054,12 +1478,15 @@ static Block *translate(J *j, uint32_t cs, uint16_t ip)
         memset(&tx, 0, sizeof tx);
         tx.j = j; tx.e = e; tx.cs = cs;
         tx.inc_pending = 1;
+        tx.v = v;
 
         int demoted = 0;
         uint64_t helpers = 0;
         for (int i = 0; i < n; ++i) {
             Insn *d = &v[i];
             e->retire = (uint32_t)i + 1;
+            tx.cur = i;
+            d->pendb = (uint8_t)tx.inc_pending;
             int ok = d->native && lower(&tx, d);
             if (!ok && d->native) { d->native = 0; demoted = 1; break; }
             if (!ok) {
@@ -1068,7 +1495,7 @@ static Block *translate(J *j, uint32_t cs, uint16_t ip)
                 helpers++;
                 if (d->cls != C_SEQ && d->cls != C_JCC) { be_exit_dyn(e); break; }
             }
-            if (i == n - 1 && !ends_block(d)) be_exit_chain(e, d->next, 0);
+            if (i == n - 1 && !ends_block(d)) { emit_deferred(&tx, i, d->live); be_exit_chain(e, d->next, 0); }
         }
         if (demoted && attempt < n) continue;
         j->st.helper_insns += helpers;
@@ -1077,6 +1504,7 @@ static Block *translate(J *j, uint32_t cs, uint16_t ip)
     for (int s = 0; s < tx.nside; ++s) {
         be_bind(e, tx.side[s].site, e->p);
         e->retire = tx.side[s].retire;
+        emit_deferred(&tx, tx.side[s].idx, tx.side[s].live);
         be_exit_chain(e, tx.side[s].target, tx.side[s].poll);
     }
     be_finish_block(e);
@@ -1128,6 +1556,52 @@ uint32_t b86h_step(B86Cpu *c, uint32_t ip_next, uint32_t blk)
     return j->blk[blk].dead;
 }
 
+/* REP MOVS / REP STOS in bulk. Same results as the interpreter: element-
+   wise forward/backward semantics, 16-bit SI/DI wrap, A20-on addressing.
+   Falls back to the interpreter for anything unusual. */
+uint32_t b86h_rep(B86Cpu *c, uint32_t ip_next, uint32_t blk)
+{
+    J *j = c->jit;
+    uint32_t cs = c->seg[B86_CS];
+    uint16_t ip = (uint16_t)ip_next;
+    int sseg = B86_DS;
+    uint8_t op;
+    for (uint16_t p = ip;; ++p) {
+        op = c->mem[(cs << 4) + p];
+        if (op == 0x26 || op == 0x2E || op == 0x36 || op == 0x3E) sseg = (op >> 3) & 3;
+        else if (op != 0xF2 && op != 0xF3 && op != 0xF0 && op != 0xF1) break;
+    }
+    uint32_t n = (uint16_t)c->r[B86_CX];
+    int w = op & 1, movs = op < 0xA8;
+    uint32_t sz = w ? 2u : 1u;
+    int back = (c->flags & B86_DF) != 0;
+    uint16_t si = (uint16_t)c->r[B86_SI], di = (uint16_t)c->r[B86_DI];
+    uint32_t span = n * sz;
+    /* fast path: forward, no 16-bit wrap of SI/DI during the run */
+    if (!back && n && (uint32_t)di + span <= 0x10000u && (!movs || (uint32_t)si + span <= 0x10000u)) {
+        uint8_t *dst = c->segp[B86_ES] + di;
+        if (movs) {
+            uint8_t *src = c->segp[sseg] + si;
+            if (dst > src && dst < src + span) {          /* overlap: element-exact */
+                if (w) for (uint32_t i = 0; i < n; ++i) { uint8_t lo = src[2 * i], hi = src[2 * i + 1]; dst[2 * i] = lo; dst[2 * i + 1] = hi; }
+                else for (uint32_t i = 0; i < n; ++i) dst[i] = src[i];
+            } else memmove(dst, src, span);
+            si = (uint16_t)(si + span);
+        } else if (!w) memset(dst, (int)(c->r[B86_AX] & 0xFF), span);
+        else { uint8_t lo = (uint8_t)c->r[B86_AX], hi = (uint8_t)(c->r[B86_AX] >> 8);
+               for (uint32_t i = 0; i < n; ++i) { dst[2 * i] = lo; dst[2 * i + 1] = hi; } }
+        di = (uint16_t)(di + span);
+        c->r[B86_CX] = 0; c->r[B86_SI] = si; c->r[B86_DI] = di;
+        c->ip = ip_next >> 16;
+        uint32_t lin = (uint32_t)(dst - c->mem);
+        uint32_t l0 = lin >> B86_LINE_SHIFT, l1 = (lin + span - 1) >> B86_LINE_SHIFT;
+        for (uint32_t l = l0; l <= l1; ++l)
+            if (j->codemap[l]) { j->st.smc_hits++; invalidate(j, lin, lin + span); break; }
+        return j->blk[blk].dead;
+    }
+    return b86h_step(c, ip_next, blk);
+}
+
 uint32_t b86h_cond(B86Cpu *c, uint32_t cc)
 {
     b86_flags_materialize(c);
@@ -1160,17 +1634,41 @@ uint32_t b86h_smc(B86Cpu *c, uint8_t *host, uint32_t len, uint32_t blk)
 /* Public API                                                               */
 /* ------------------------------------------------------------------------ */
 
+size_t b86_jit_hot_bytes(void)
+{
+    return B86_FASTN * sizeof(B86Fast) + ((B86_LINES + 15u) & ~15u);
+}
+
+void b86_jit_destroy(J *j);
 J *b86_jit_create(B86Cpu *c, void *code, size_t size)
 {
+    return b86_jit_create_ex(c, code, size, NULL, 0);
+}
+
+/* `hot` (optional, >= b86_jit_hot_bytes(), fastest RAM) holds the tables
+   that translated code reads on every indirect jump and every store: the
+   fast lookup table and the SMC line map. Everything else is touched only
+   by the dispatcher and may live in slow memory (PSRAM). */
+J *b86_jit_create_ex(B86Cpu *c, void *code, size_t size, void *hot, size_t hot_size)
+{
     J *j = calloc(1, sizeof *j);
+    if (!j) return NULL;
     j->cpu = c;
     j->buf = code;
     j->buf_end = (uint8_t *)code + size;
     j->blk = calloc(MAXB, sizeof *j->blk);
     j->map = calloc(MAPN, sizeof *j->map);
     j->pg_head = calloc(NPG, sizeof *j->pg_head);
-    j->fast = calloc(B86_FASTN, sizeof *j->fast);
-    j->codemap = calloc(B86_LINES, 1);
+    if (hot && hot_size >= b86_jit_hot_bytes()) {
+        memset(hot, 0, b86_jit_hot_bytes());
+        j->fast = (B86Fast *)hot;
+        j->codemap = (uint8_t *)hot + B86_FASTN * sizeof(B86Fast);
+        j->hot_external = 1;
+    } else {
+        j->fast = calloc(B86_FASTN, sizeof *j->fast);
+        j->codemap = calloc(B86_LINES, 1);
+    }
+    if (!j->blk || !j->map || !j->pg_head || !j->fast || !j->codemap) { b86_jit_destroy(j); return NULL; }
     c->jit = j;
     c->codemap = j->codemap;
     c->codemap_host = j->codemap - ((uintptr_t)c->mem >> B86_LINE_SHIFT);
@@ -1191,13 +1689,16 @@ void b86_jit_destroy(J *j)
 {
     if (!j) return;
     if (j->cpu) { j->cpu->jit = NULL; j->cpu->codemap = NULL; j->cpu->smc_hook = NULL; }
-    free(j->blk); free(j->map); free(j->pg_head); free(j->fast); free(j->codemap); free(j);
+    free(j->blk); free(j->map); free(j->pg_head);
+    if (!j->hot_external) { free(j->fast); free(j->codemap); }
+    free(j);
 }
 
 const B86JitStats *b86_jit_stats(J *j) { return &j->st; }
 void b86_jit_set_max_block(J *j, unsigned n) { j->max_insns = n; }
 void b86_jit_set_lookahead(J *j, int on) { j->no_lookahead = !on; }
 void b86_jit_set_no_fast(J *j, int on) { j->single_step = on; }
+void b86_jit_set_no_chain(J *j, int on) { j->no_chain = on; }
 void b86_jit_set_count_exits(J *j, int on) { j->e.count_exits = on; }
 void b86_jit_set_single_step(J *j, int on)
 {
@@ -1210,8 +1711,8 @@ int b86_jit_run(B86Cpu *c, uint64_t max_dispatch)
 {
     J *j = c->jit;
     uint64_t n = 0;
-    uint8_t *patch_site = NULL;
-    uint32_t patch_gen = 0;
+    uint8_t *patch_site = NULL, *rf_site = NULL;
+    uint32_t patch_gen = 0, rf_gen = 0;
     for (;;) {
         if (c->irq & 0x80000000u) { c->irq &= 0x7FFFFFFFu; return B86_HALT; }
         if (c->irq) return B86_EXIT;
@@ -1220,10 +1721,13 @@ int b86_jit_run(B86Cpu *c, uint64_t max_dispatch)
         uint32_t key = (c->seg[B86_CS] << 16) | (c->ip & 0xFFFFu);
         Block *b = map_find(j, key);
         if (!b) b = translate(j, c->seg[B86_CS], (uint16_t)c->ip);
-        /* SEED51187_DIAG: branch patch disabled. */
-        (void)patch_site;
-        (void)patch_gen;
+        if (patch_site && patch_gen == j->flush_gen && !j->no_chain) {
+            be_patch_branch(patch_site, b->host);
+            j->st.chains++;
+        }
         patch_site = NULL;
+        if (rf_site && rf_gen == j->flush_gen && !j->no_chain) be_patch_ret(rf_site, (uint16_t)c->ip, b->host);
+        rf_site = NULL;
         if (!j->single_step) {
             uint32_t f = fast_hash(key);
             j->fast[f].key = key;
@@ -1236,6 +1740,10 @@ int b86_jit_run(B86Cpu *c, uint64_t max_dispatch)
         case XR_CHAIN:
             patch_site = (uint8_t *)c->patch;
             patch_gen = j->flush_gen;
+            break;
+        case XR_RETFILL:
+            rf_site = (uint8_t *)c->patch;
+            rf_gen = j->flush_gen;
             break;
         default: break;
         }

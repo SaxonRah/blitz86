@@ -74,6 +74,7 @@ int main(int argc, char **argv)
         int hma_code = ((uint32_t)t.init[S_CS] << 4) + t.init[S_IP] + 8 > 0xFFFFFu;
         if (hma_code || !check(&c, &t, 0)) { wrap++; clear(&t); memset(mem + 0x100000, 0, B86_MEM_BYTES - 0x100000); continue; }
         clear(&t);
+        if (getenv("SST_TRACE")) fprintf(stderr, "vec %02X.%d cs:ip %04X:%04X\n", t.op, t.reg, t.init[S_CS], t.init[S_IP]);
         /* 2. translator */
         b86_jit_flush(j);
         setup(&c, &t);

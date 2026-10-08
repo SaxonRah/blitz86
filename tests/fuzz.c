@@ -340,6 +340,7 @@ static void init_cpu(B86Cpu *c, uint8_t *mem, uint64_t seed)
     b86_set_flags(c, 0xF002 | (uint16_t)(seed & 0x8D5));
 }
 
+uint8_t fuzz_lastb[48]; uint16_t fuzz_lastip, fuzz_lastfl;
 static B86Cpu *alarm_cpu;
 static void on_alarm(int sig) { (void)sig; if (alarm_cpu) alarm_cpu->irq = 1; }
 
@@ -373,6 +374,8 @@ int main(int argc, char **argv)
         /* the JIT keeps its cpu pointer; copy state into it */
         tmp = b;
         b86_jit_flush(j);
+        b86_jit_set_no_chain(j, getenv("FUZZ_NOCHAIN") != NULL);
+        if (getenv("FUZZ_NOFAST")) b86_jit_set_no_fast(j, 1);
         if (getenv("FUZZ_TRACE")) {
             /* lockstep: one JIT block, then interpreter up to the same CS:IP */
             static uint8_t snap[B86_MEM_BYTES];
@@ -381,7 +384,9 @@ int main(int argc, char **argv)
             b86_jit_set_no_fast(j, 1);
             b86_jit_set_count_exits(j, 1);
             b86_jit_flush(j);
-            for (long blkn = 0; blkn < 200000; ++blkn) {
+            long blkn;
+            uint64_t ref_steps = 0;
+            for (blkn = 0; blkn < 400000; ++blkn) {
                 uint16_t ip0 = (uint16_t)tmp.ip; uint32_t cs0 = tmp.seg[B86_CS];
                 uint8_t cur[48]; memcpy(cur, memB + (cs0 << 4) + ip0, 48);
                 uint16_t pre[8]; for (int i = 0; i < 8; ++i) pre[i] = (uint16_t)tmp.r[i];
@@ -392,6 +397,7 @@ int main(int argc, char **argv)
                 int r = b86_jit_run(&tmp, 1);
                 int steps = 0, rr = B86_OK;
                 for (uint32_t q = 0; q < tmp.retired && rr == B86_OK; ++q) { rr = b86_step(&ref); steps++; }
+                ref_steps += (uint64_t)steps;
                 int diff = ref.seg[B86_CS] != tmp.seg[B86_CS] || (uint16_t)ref.ip != (uint16_t)tmp.ip;
                 for (int i = 0; i < 8; ++i) if ((uint16_t)ref.r[i] != (uint16_t)tmp.r[i]) diff = 1;
                 long md = -1;
@@ -411,13 +417,24 @@ int main(int argc, char **argv)
                     break;
                 }
                 memcpy(prevb, cur, 48); previp = ip0; prevfl = pref; prevjfl = jfl;
+                { extern uint8_t fuzz_lastb[48]; extern uint16_t fuzz_lastip, fuzz_lastfl;
+                  memcpy(fuzz_lastb, cur, 48); fuzz_lastip = ip0; fuzz_lastfl = pref; }
                 if (r == B86_HALT || rr != B86_OK) break;
             }
+            printf("trace flags ref %04X jit %04X\n", b86_get_flags(&ref), b86_get_flags(&tmp));
+            {
+                extern uint8_t fuzz_lastb[48]; extern uint16_t fuzz_lastip, fuzz_lastfl;
+                printf("last block %04X entry flags %04X:", fuzz_lastip, fuzz_lastfl);
+                for (int k = 0; k < 48; ++k) printf(" %02X", fuzz_lastb[k]);
+                printf("\n");
+            }
+            printf("trace end: %ld blocks, %llu ref steps, jit ip %04X:%04X ref ip %04X:%04X retired(last)=%u\n",
+                   blkn, (unsigned long long)ref_steps, tmp.seg[B86_CS], (uint16_t)tmp.ip, ref.seg[B86_CS], (uint16_t)ref.ip, tmp.retired);
             b86_jit_set_no_fast(j, 0);
             b86_jit_set_count_exits(j, 0);
             continue;
         }
-        alarm_cpu = &tmp; alarm(20);
+        alarm_cpu = &tmp; alarm(getenv("FUZZ_ALARM") ? (unsigned)atoi(getenv("FUZZ_ALARM")) : 20u);
         int rb = b86_jit_run(&tmp, ~0ull);
         alarm(0); alarm_cpu = NULL;
         b = tmp;

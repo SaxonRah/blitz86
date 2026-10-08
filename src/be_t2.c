@@ -207,6 +207,11 @@ void *be_emit_runtime(Emit *e)
     movw(e, LR, XR_IRQ);
     emit_b(e, e->x_ipexit);
 
+    e->x_retfill = e->p;                             /* r12 = ip, lr = site */
+    ldst(e, STRW, LR, R_CTX, OFF(patch));
+    movw(e, LR, XR_RETFILL);
+    emit_b(e, e->x_ipexit);
+
     e->x_lookup = e->p;                              /* r12 = ip */
     put32(e, 0xFA1Fu, 0xF080u | R12 << 8 | R12);     /* UXTH r12, r12 */
     ldst(e, STRW, R12, R_CTX, OFF(ip));
@@ -217,7 +222,7 @@ void *be_emit_runtime(Emit *e)
     dp_reg(e, DP_ORR, 0, R12, R12, LR, 0, 16);       /* key */
     put16(e, 0xB401u);                               /* PUSH {r0} */
     dp_reg(e, DP_EOR, 0, 0, R12, R12, 1, 16);        /* r0 = key ^ key>>16 */
-    bitfield(e, 0xF3C0u, 0, 0, 0, 11);               /* UBFX r0, r0, #0, #12 */
+    bitfield(e, 0xF3C0u, 0, 0, 0, B86_FAST_BITS - 1); /* UBFX r0, r0, #0, #bits */
     ldst(e, LDRW, LR, R_CTX, OFF(fast));
     dp_reg(e, DP_ADD, 0, LR, LR, 0, 0, 3);           /* lr += idx*8 */
     ldst(e, LDRW, 0, LR, 0);
@@ -240,6 +245,7 @@ static int dp_of(int aop)
                    case AOP_ORR: return DP_ORR; default: return DP_EOR; }
 }
 void be_op(Emit *e, int aop, int d, int a, int b) { dp_reg(e, dp_of(aop), 0, hr(d), hr(a), hr(b), 0, 0); }
+void be_op_lsl(Emit *e, int aop, int d, int a, int b, unsigned sh) { dp_reg(e, dp_of(aop), 0, hr(d), hr(a), hr(b), 0, (int)sh); }
 
 static void opi_raw(Emit *e, int aop, int d, int a, uint32_t imm)
 {
@@ -281,6 +287,22 @@ void be_ubfx(Emit *e, int d, int s, unsigned lsb, unsigned w) { bitfield(e, 0xF3
 void be_sbfx(Emit *e, int d, int s, unsigned lsb, unsigned w) { bitfield(e, 0xF340u, hr(d), hr(s), lsb, w - 1); }
 void be_bfi(Emit *e, int d, int s, unsigned lsb, unsigned w) { bitfield(e, 0xF360u, hr(d), hr(s), lsb, lsb + w - 1); }
 void be_sxtb(Emit *e, int d, int s) { put32(e, 0xFA4Fu, 0xF080u | (uint32_t)hr(d) << 8 | (uint32_t)hr(s)); }
+
+void be_mul(Emit *e, int d, int a, int b) { put32(e, 0xFB00u | (uint32_t)hr(a), 0xF000u | (uint32_t)hr(d) << 8 | (uint32_t)hr(b)); }
+void be_shift_reg(Emit *e, int type, int d, int a, int cnt)
+{
+    /* register shifts use the bottom byte of cnt; >= 32 gives 0 / sign fill,
+       which is exactly the 8086's unmasked-count behaviour */
+    put32(e, 0xFA00u | (uint32_t)type << 5 | (uint32_t)hr(a), 0xF000u | (uint32_t)hr(d) << 8 | (uint32_t)hr(cnt));
+}
+
+void be_get_carry(Emit *e, int d, int ac)
+{
+    /* d = C (MOV d,#0 ; ADC d,d,#0), inverted for AC_CC; no flags written */
+    dp_imm(e, DP_ORR, 0, hr(d), PC, 0);
+    dp_imm(e, 10, 0, hr(d), hr(d), 0);
+    if (ac == AC_CC) dp_imm(e, DP_EOR, 0, hr(d), hr(d), 1);
+}
 
 /* ---- NZCV producers ------------------------------------------------------------ */
 
@@ -328,6 +350,8 @@ int be_neg_sh(Emit *e, int x, int d, int a, int sh)
     shift_imm(e, 0, hr(d), hr(x), 1, (unsigned)sh);
     return FM_SUB;
 }
+
+void be_test_nz(Emit *e, int x, int r, int sh) { shift_imm(e, 1, hr(x), hr(r), 0, (unsigned)sh); }   /* LSLS */
 
 int be_test_res(Emit *e, int x, int r, int sh)
 {
@@ -386,6 +410,7 @@ void be_store(Emit *e, int w16, int v, int addr, int check, uint16_t next_ip)
     e->slow[e->nslow].next_ip = next_ip;
     e->slow[e->nslow].len = (uint8_t)(w16 ? 2 : 1);
     e->slow[e->nslow].retire = e->retire;
+    e->slow[e->nslow].noexit = (uint8_t)(check == 2);
     e->nslow++;
 }
 
@@ -408,6 +433,7 @@ void be_stctx_imm(Emit *e, uint32_t imm, unsigned off) { imm32(e, LR, imm); ldst
 
 uint8_t *be_jcc(Emit *e, int ac) { return emit_bcc(e, ac, NULL); }
 uint8_t *be_jmp(Emit *e) { return emit_b(e, NULL); }
+uint8_t *be_cbz(Emit *e, int r) { cmp_imm0(e, hr(r)); return emit_bcc(e, AC_EQ, NULL); }
 uint8_t *be_cbnz(Emit *e, int r) { cmp_imm0(e, hr(r)); return emit_bcc(e, AC_NE, NULL); }
 uint8_t *be_cbz16(Emit *e, int r) { shift_imm(e, 1, LR, hr(r), 0, 16); return emit_bcc(e, AC_EQ, NULL); }
 uint8_t *be_cbnz16(Emit *e, int r) { shift_imm(e, 1, LR, hr(r), 0, 16); return emit_bcc(e, AC_NE, NULL); }
@@ -443,16 +469,55 @@ void be_exit_ip_imm(Emit *e, uint16_t ip, int reason)
 }
 void be_exit_dyn(Emit *e) { retire_mark(e, e->retire); emit_b(e, e->x_dynexit); }
 
+/* +0 MOVW lr,#ip  +4 CMP r12,lr  +8 BNE miss  +12 LDR lr,[irq]  +16 CMP lr,#0
+   +20 BNE irqhop  +24 B target  +28 hop: B lookup  +32 irqhop: B irq  +36 fill */
+void be_exit_ret(Emit *e, uint16_t ret_ip)
+{
+    retire_mark(e, e->retire);
+    uint8_t *site = e->p;
+    movw(e, LR, 0);
+    put32(e, 0xEBB0u | R12, 0x0F00u | LR);                       /* CMP r12, lr */
+    uint8_t *bne = emit_bcc(e, AC_NE, NULL);
+    ldst(e, LDRW, LR, R_CTX, OFF(irq));
+    cmp_imm0(e, LR);
+    uint8_t *birq = emit_bcc(e, AC_NE, NULL);
+    uint8_t *b = emit_b(e, NULL);
+    emit_b(e, e->x_lookup);                                      /* +28 */
+    be_bind(e, birq, e->p);
+    emit_b(e, e->x_irq);                                         /* +32 */
+    be_bind(e, bne, e->p);
+    be_bind(e, b, e->p);
+    movw(e, LR, ret_ip);                                         /* fill */
+    ldst(e, STRW, LR, R_CTX, OFF(scratch));
+    imm32(e, LR, (uint32_t)(uintptr_t)site);
+    emit_b(e, e->x_retfill);
+}
+
+void be_patch_ret(uint8_t *site, uint16_t ip, uint8_t *target)
+{
+    uint32_t v = ip;
+    uint32_t h1 = 0xF240u | (v >> 11 & 1) << 10 | (v >> 12), h2 = (v >> 8 & 7) << 12 | (uint32_t)LR << 8 | (v & 0xFF);
+    site[0] = (uint8_t)h1; site[1] = (uint8_t)(h1 >> 8); site[2] = (uint8_t)h2; site[3] = (uint8_t)(h2 >> 8);
+    enc_bcc(site + 8, site + 28, AC_NE);
+    enc_b(site + 24, target);
+    be_flush_icache(site, 28);
+}
+
 /* ---- helper calls ------------------------------------------------------------------------ */
 
 void be_call_step(Emit *e, uint16_t ip, uint16_t next)
 {
+    be_call_helper(e, (void *)b86h_step, (uint32_t)ip | (uint32_t)next << 16);
+}
+
+void be_call_helper(Emit *e, void *fn, uint32_t arg)
+{
     retire_mark(e, e->retire);
     put32(e, 0xE880u | R_CTX, 0x00FFu);                          /* STM r8, {r0-r7} */
     mov(e, 0, R_CTX);
-    imm32(e, 1, (uint32_t)ip | (uint32_t)next << 16);
+    imm32(e, 1, arg);
     imm32(e, 2, e->blk);
-    call_abs(e, (void *)b86h_step);
+    call_abs(e, fn);
     mov(e, R12, 0);
     put32(e, 0xE890u | R_CTX, 0x00FFu);                          /* LDM r8, {r0-r7} */
     reload_segs(e);
@@ -490,6 +555,11 @@ void be_finish_block(Emit *e)
         movw(e, 2, e->slow[i].len);
         imm32(e, 3, e->blk);
         call_abs(e, (void *)b86h_smc);
+        if (e->slow[i].noexit) {
+            put32(e, 0xE8BDu, 0x500Fu);
+            emit_b(e, e->slow[i].resume);
+            continue;
+        }
         cmp_imm0(e, 0);
         put32(e, 0xE8BDu, 0x500Fu);                              /* POP {r0-r3, r12, lr} */
         uint8_t *ex = emit_bcc(e, AC_NE, NULL);

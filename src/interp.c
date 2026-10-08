@@ -37,22 +37,36 @@ void b86_init(B86Cpu *c, uint8_t *mem)
     for (int s = 0; s < 4; ++s) b86_set_seg(c, s, 0);
 }
 
-static uint32_t lazy_eval(uint32_t k, uint32_t a0, uint32_t r0, uint32_t f)
+static uint32_t lazy_eval(uint32_t k, uint32_t a0, uint32_t r0, uint32_t b0, uint32_t f)
 {
     int w16 = (k == LZ_ADD16 || k == LZ_SUB16 || k == LZ_LOG16 ||
-               k == LZ_INC16 || k == LZ_DEC16);
+               k == LZ_INC16 || k == LZ_DEC16 || k == LZ_SHL16 || k == LZ_SHR16 || k == LZ_SAR16 ||
+               k == LZ_ADC16 || k == LZ_SBB16);
     uint32_t m = w16 ? 0xFFFFu : 0xFFu, sb = w16 ? 0x8000u : 0x80u;
     uint32_t a = a0 & m, r = r0 & m, b;
+    if (k >= LZ_SHL8 && k <= LZ_SAR16) {          /* shifts by 1 (8086 semantics) */
+        uint32_t cf, of;
+        if (k <= LZ_SHL16) { cf = (a & sb) != 0; of = ((r & sb) != 0) ^ cf; }
+        else if (k <= LZ_SHR16) { cf = a & 1; of = (a & sb) != 0; }
+        else { cf = a & 1; of = 0; }
+        f &= ~(uint32_t)B86_ARITH;
+        if (cf) f |= B86_CF;
+        if (of) f |= B86_OF;
+        if (r == 0) f |= B86_ZF;
+        if (r & sb) f |= B86_SF;
+        return f | b86_parity[r & 0xFFu];
+    }
     if (k == LZ_ADD8 || k == LZ_ADD16 || k == LZ_INC8 || k == LZ_INC16) b = (r - a) & m;
+    else if (k >= LZ_ADC8) b = b0 & m;
     else b = (a - r) & m;
     uint32_t cf = 0, of = 0, af = 0;
     switch (k) {
-    case LZ_ADD8: case LZ_ADD16: case LZ_INC8: case LZ_INC16:
+    case LZ_ADD8: case LZ_ADD16: case LZ_INC8: case LZ_INC16: case LZ_ADC8: case LZ_ADC16:
         cf = ((a & b) | ((a | b) & ~r)) & sb;
         of = ((a ^ r) & (b ^ r)) & sb;
         af = (a ^ b ^ r) & 0x10u;
         break;
-    case LZ_SUB8: case LZ_SUB16: case LZ_DEC8: case LZ_DEC16:
+    case LZ_SUB8: case LZ_SUB16: case LZ_DEC8: case LZ_DEC16: case LZ_SBB8: case LZ_SBB16:
         cf = ((~a & b) | (~(a ^ b) & r)) & sb;
         of = ((a ^ b) & (a ^ r)) & sb;
         af = (a ^ b ^ r) & 0x10u;
@@ -73,8 +87,8 @@ static uint32_t lazy_eval(uint32_t k, uint32_t a0, uint32_t r0, uint32_t f)
 
 void b86_flags_materialize(B86Cpu *c)
 {
-    if (c->lz_kind != LZ_NONE) c->flags = lazy_eval(c->lz_kind, c->lz_a, c->lz_res, c->flags);
-    if (c->lz_ikind != LZ_NONE) c->flags = lazy_eval(c->lz_ikind, c->lz_ia, c->lz_ires, c->flags);
+    if (c->lz_kind != LZ_NONE) c->flags = lazy_eval(c->lz_kind, c->lz_a, c->lz_res, c->lz_b, c->flags);
+    if (c->lz_ikind != LZ_NONE) c->flags = lazy_eval(c->lz_ikind, c->lz_ia, c->lz_ires, 0, c->flags);
     c->lz_kind = LZ_NONE;
     c->lz_ikind = LZ_NONE;
 }
