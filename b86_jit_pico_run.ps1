@@ -13,7 +13,7 @@ param(
 $ErrorActionPreference='Stop'
 $ProgressPreference='SilentlyContinue'
 $build=Join-Path $MicroDos 'build-pico\out'
-$uf2=Join-Path $build 'blitz86_pico_probe.uf2'
+$uf2=Join-Path $build 'blitz86_pico_jit.uf2'
 $logs=Join-Path $Blitz86 'logs'
 New-Item -ItemType Directory -Path $logs -Force | Out-Null
 $log=Join-Path $logs ('b86-hw-{0}-{1}.txt' -f $Action,(Get-Date -Format 'yyyyMMdd-HHmmss'))
@@ -115,7 +115,7 @@ function Capture {
                 $line=$buf.Substring(0,$pos).TrimEnd("`r")
                 $buf=$buf.Substring($pos+1)
                 Log $line
-                if($line -match '\[b86\] COMPLETE result=(PASS|FAIL)') {
+                if($line -match '\[b86-jit\] COMPLETE result=(PASS|FAIL)') {
                     $pass=$Matches[1] -eq 'PASS'
                     $complete=$true
                 }
@@ -126,9 +126,9 @@ function Capture {
         if($serial.IsOpen){$serial.Close()}
         $serial.Dispose()
     }
-    if(-not $complete){throw "Serial opened, but no [b86] COMPLETE marker arrived in $Seconds seconds"}
+    if(-not $complete){throw "Serial opened, but no [b86-jit] COMPLETE marker arrived in $Seconds seconds"}
     if(-not $pass){throw 'Pico reported FAIL'}
-    Log '[b86] Pico hardware probe verified PASS'
+    Log '[b86-jit] Native Thumb-2 probe verified PASS'
 }
 function Flash {
     if(-not(Test-Path $uf2)){throw "UF2 missing: $uf2. Run build."}

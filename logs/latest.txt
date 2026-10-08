@@ -1,8 +1,61 @@
-blitz86 microDOS hardware workflow: capture
-Serial scan: COM4,COM5 / Pico candidates: COM4,COM5
+blitz86 microDOS hardware workflow: run
+BEGIN Request Pico BOOTSEL
+COMMAND: C:\Users\Jupiter\.pico-sdk\picotool\2.3.0\picotool\picotool.exe reboot -f -u
+PASS Request Pico BOOTSEL
+BEGIN Flash blitz86 test firmware
+COMMAND: C:\Users\Jupiter\.pico-sdk\picotool\2.3.0\picotool\picotool.exe load -v -x C:\microDOS\build-pico\out\blitz86_pico_jit.uf2
+Family ID 'rp2350-arm-s' can be downloaded in absolute space:
+  00000000->02000000
+Loading into Flash:   [                              ]  0%
+Loading into Flash:   [=                             ]  5%
+Loading into Flash:   [===                           ]  11%
+Loading into Flash:   [=====                         ]  17%
+Loading into Flash:   [======                        ]  23%
+Loading into Flash:   [========                      ]  29%
+Loading into Flash:   [==========                    ]  35%
+Loading into Flash:   [============                  ]  41%
+Loading into Flash:   [=============                 ]  46%
+Loading into Flash:   [===============               ]  52%
+Loading into Flash:   [=================             ]  58%
+Loading into Flash:   [===================           ]  64%
+Loading into Flash:   [=====================         ]  70%
+Loading into Flash:   [======================        ]  76%
+Loading into Flash:   [========================      ]  82%
+Loading into Flash:   [==========================    ]  87%
+Loading into Flash:   [===========================   ]  93%
+Loading into Flash:   [============================= ]  99%
+Loading into Flash:   [==============================]  100%
+
+Verifying Flash:      [                              ]  0%
+Verifying Flash:      [=                             ]  5%
+Verifying Flash:      [===                           ]  11%
+Verifying Flash:      [=====                         ]  17%
+Verifying Flash:      [======                        ]  23%
+Verifying Flash:      [========                      ]  29%
+Verifying Flash:      [==========                    ]  35%
+Verifying Flash:      [============                  ]  41%
+Verifying Flash:      [=============                 ]  46%
+Verifying Flash:      [===============               ]  52%
+Verifying Flash:      [=================             ]  58%
+Verifying Flash:      [===================           ]  64%
+Verifying Flash:      [=====================         ]  70%
+Verifying Flash:      [======================        ]  76%
+Verifying Flash:      [========================      ]  82%
+Verifying Flash:      [==========================    ]  87%
+Verifying Flash:      [===========================   ]  93%
+Verifying Flash:      [============================= ]  99%
+Verifying Flash:      [==============================]  100%
+
+  OK
+
+The device was rebooted to start the application.
+PASS Flash blitz86 test firmware
+Serial scan: COM4 / Pico app CDC: 
+Serial scan: COM4,COM5 / Pico app CDC: COM5
 Capturing COM5 (timeout 90s, DTR enabled)
-[b86] BEGIN B1/B2 probe clock=300000 kHz
-[b86] interp result=1 AX=6001 CX=0000 icount=24579 us=16319
-[b86] COMPLETE result=PASS
-[b86] Pico hardware probe verified PASS
+[b86-jit] BEGIN Thumb-2 native entry
+[b86-jit] interp result=1 AX=6001 CX=0000 us=16321
+[b86-jit] native result=1 AX=6001 CX=0000 steps=24579 us=22494
+[b86-jit] COMPLETE result=PASS
+[b86-jit] Native Thumb-2 probe verified PASS
 WORKFLOW PASS

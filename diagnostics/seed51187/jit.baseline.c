@@ -1220,9 +1220,10 @@ int b86_jit_run(B86Cpu *c, uint64_t max_dispatch)
         uint32_t key = (c->seg[B86_CS] << 16) | (c->ip & 0xFFFFu);
         Block *b = map_find(j, key);
         if (!b) b = translate(j, c->seg[B86_CS], (uint16_t)c->ip);
-        /* SEED51187_DIAG: branch patch disabled. */
-        (void)patch_site;
-        (void)patch_gen;
+        if (patch_site && patch_gen == j->flush_gen) {
+            be_patch_branch(patch_site, b->host);
+            j->st.chains++;
+        }
         patch_site = NULL;
         if (!j->single_step) {
             uint32_t f = fast_hash(key);

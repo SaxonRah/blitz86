@@ -1224,11 +1224,7 @@ int b86_jit_run(B86Cpu *c, uint64_t max_dispatch)
         (void)patch_site;
         (void)patch_gen;
         patch_site = NULL;
-        if (!j->single_step) {
-            uint32_t f = fast_hash(key);
-            j->fast[f].key = key;
-            j->fast[f].host = be_code_ptr(b->host);
-        }
+        /* SEED51187_DIAG: fast table population disabled. */
         j->st.dispatches++;
         int r = j->enter(c, be_code_ptr(b->host));
         switch (r) {

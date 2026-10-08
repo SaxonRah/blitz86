@@ -1,17 +1,19 @@
-# blitz86 hardware runner v3 — serial re-enumeration
+# blitz86 unified hardware v5 — HID preflight PowerShell quoting fix
 
-Full replacement `b86_hw.ps1` for `C:\blitz86_v2`. The existing sidecar and Pico firmware do not need to be reinstalled or rebuilt.
+The v4 Pi preflight used `python -c` with nested quotes, which PowerShell passed incorrectly, producing a Python SyntaxError. This package replaces it with an actual Python script and preserves the existing microDOS v29 HID / rpiboot runner.
+
+Extract **both** `b86_hardware.ps1` and `tools/b86_hid_preflight.py` into `C:\blitz86_v2`, maintaining the `tools` folder.
 
 ```powershell
 cd C:\blitz86_v2
-Copy-Item "$HOME\Downloads\blitz86_hw_v3\b86_hw.ps1" .\b86_hw.ps1 -Force
-Unblock-File .\b86_hw.ps1
-.\b86_hw.ps1 doctor
-.\b86_hw.ps1 capture -Port COM5
+Unblock-File .\b86_hardware.ps1
+.\b86_hardware.ps1 pi
 ```
 
-The `capture` action does NOT reflash. It searches Windows PnP devices and currently available COM ports for Raspberry Pi VID 2E8A, waits up to 40 seconds, and connects even if the device has been assigned a different COM port. It raises DTR/RTS and sends `R` to repeat the test. All output is saved in `C:\blitz86_v2\logs\latest.txt`. The `run` action still flashes and then captures; `run -NoFlash` only captures.
+To independently diagnose bridge discovery:
 
-If capture fails with no ports, check `Get-PnpDevice -PresentOnly | Where-Object {$_.FriendlyName -match 'Pico|RP2350|Serial|USB'}` and Device Manager. It may be a real USB enumeration problem rather than a COM-number issue.
+```powershell
+python .\tools\b86_hid_preflight.py
+```
 
-This runner has not been executed against Windows here.
+Result exit codes: 0 found, 12 not found, 13 missing hidapi, 14 USB enumeration error. The Pi runner will then stream rpiboot/HID output and check its blitz86 PASS marker. No firmware or CMake changes. Windows execution is not verified here.
