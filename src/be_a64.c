@@ -404,7 +404,7 @@ void be_store(Emit *e, int w16, int v, int addr, int check, uint16_t next_ip)
     if (!check) return;
     put(e, 0xD3400000u | 6u << 16 | 63u << 10 | (uint32_t)hr(addr) << 5 | I0); /* LSR x16, xaddr, #6 */
     put(e, ldrb_reg(I0, R_CM, I0));
-    if (e->nslow >= 64 - (w16 ? 1 : 0)) { e->overflow = 1; return; }
+    if (e->nslow >= 64) { e->overflow = 1; return; }
     e->slow[e->nslow].site = e->p;
     put(e, 0x35000000u | I0);                                  /* CBNZ w16, slow */
     e->slow[e->nslow].resume = e->p;
@@ -413,29 +413,6 @@ void be_store(Emit *e, int w16, int v, int addr, int check, uint16_t next_ip)
     e->slow[e->nslow].retire = e->retire;
     e->slow[e->nslow].noexit = (uint8_t)(check == 2);
     e->nslow++;
-    /* Check the last byte's physical code-map line as well.  This
-       catches a word store crossing a 64-byte translated-code boundary,
-       including aliases between different guest segments. */
-    if (w16) {
-        /* Cross-line word stores alone require a second physical-line test.
-           ubfm obtains low six bits; CMP #63 preserves correct aliasing. */
-        put(e, ubfm(I0, hr(addr), 0, 5));
-        put(e, 0x7100001Fu | 63u << 10 | I0 << 5); /* CMP w16,#63 */
-        uint8_t *same_line = e->p;
-        put(e, 0x54000001u);                       /* B.NE same_line */
-        put(e, 0x91000400u | (uint32_t)hr(addr) << 5 | I0); /* ADD x16,xaddr,#1 */
-        put(e, 0xD3400000u | 6u << 16 | 63u << 10 | I0 << 5 | I0); /* LSR x16,#6 */
-        put(e, ldrb_reg(I0, R_CM, I0));
-        e->slow[e->nslow].site = e->p;
-        put(e, 0x35000000u | I0);
-        e->slow[e->nslow].resume = e->p;
-        e->slow[e->nslow].next_ip = next_ip;
-        e->slow[e->nslow].len = 2;
-        e->slow[e->nslow].retire = e->retire;
-        e->slow[e->nslow].noexit = (uint8_t)(check == 2);
-        e->nslow++;
-        be_bind(e, same_line, e->p);
-    }
 }
 
 void be_set_seg(Emit *e, int s, int v)
