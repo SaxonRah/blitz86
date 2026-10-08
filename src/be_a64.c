@@ -493,34 +493,49 @@ void be_exit_ip_imm(Emit *e, uint16_t ip, int reason)
 }
 void be_exit_dyn(Emit *e) { retire_mark(e, e->retire); b_abs(e, e->x_dynexit); }
 
-/* +0 MOVZ w16,#ip  +4 CMP w9,w16  +8 B.NE miss  +12 LDR w16,[irq]  +16 CBNZ w16,irqhop
-   +20 B target  +24 hop: B lookup  +28 irqhop: B irq  +32 fill */
-void be_exit_ret(Emit *e, uint16_t ret_ip)
+/* +0 MOVZ w16,#ip  +4 CMP w9,w16  +8 B.NE miss  +12 LDR w16,[irq]  +16 CBNZ w16,irq
+   +20 B hit */
+void be_ret_cache(Emit *e, uint8_t **site, uint8_t **bne, uint8_t **birq, uint8_t **bhit)
 {
-    retire_mark(e, e->retire);
-    uint8_t *site = e->p;
+    *site = e->p;
     put(e, movz(I0, 0, 0));
     put(e, alur(W_SUBS, XZR, 9, I0, 0, 0));
-    uint8_t *bne = e->p; put(e, 0x54000000u | AC_NE);
+    *bne = e->p; put(e, 0x54000000u | AC_NE);
     put(e, ldst(LDRW, I0, R_CTX, OFF(irq), 2));
-    uint8_t *cb = e->p; put(e, 0x35000000u | I0);
-    uint8_t *b = e->p; put(e, 0x14000000u);
-    b_abs(e, e->x_lookup);                                       /* +24 */
-    be_bind(e, cb, e->p);
-    b_abs(e, e->x_irq);                                          /* +28 */
-    be_bind(e, bne, e->p);
-    be_bind(e, b, e->p);
-    put(e, movz(I1, ret_ip, 0));                                 /* fill */
+    *birq = e->p; put(e, 0x35000000u | I0);
+    *bhit = e->p; put(e, 0x14000000u);
+}
+uint8_t *be_ret_hit_branch(uint8_t *site) { return site + 20; }
+void be_exit_irq_ip(Emit *e) { retire_mark(e, e->retire); b_abs(e, e->x_irq); }
+void be_ret_fill(Emit *e, uint16_t ret_ip, uint8_t *site)
+{
+    retire_mark(e, e->retire);
+    put(e, movz(I1, ret_ip, 0));
     put(e, ldst(STRW, I1, R_CTX, OFF(scratch), 2));
     imm64(e, I0, (uint64_t)(uintptr_t)site);
     b_abs(e, e->x_retfill);
 }
 
-void be_patch_ret(uint8_t *site, uint16_t ip, uint8_t *target)
+/* plain layout: core, +24 hop: B lookup, +28 irqhop: B irq, +32 fill */
+void be_exit_ret(Emit *e, uint16_t ret_ip)
+{
+    uint8_t *site, *bne, *birq, *b;
+    retire_mark(e, e->retire);
+    be_ret_cache(e, &site, &bne, &birq, &b);
+    b_abs(e, e->x_lookup);                                       /* +24 */
+    be_bind(e, birq, e->p);
+    b_abs(e, e->x_irq);                                          /* +28 */
+    be_bind(e, bne, e->p);
+    be_bind(e, b, e->p);
+    be_ret_fill(e, ret_ip, site);
+}
+
+void be_patch_ret(uint8_t *site, uint16_t ip, uint8_t *target, uint8_t *miss)
 {
     uint32_t ins = movz(I0, ip, 0);
     memcpy(site, &ins, 4);
-    ins = 0x54000000u | (((uint32_t)((site + 24) - (site + 8)) >> 2) & 0x7FFFF) << 5 | AC_NE;
+    uint8_t *m = miss ? miss : site + 24;
+    ins = 0x54000000u | (((uint32_t)(m - (site + 8)) >> 2) & 0x7FFFF) << 5 | AC_NE;
     memcpy(site + 8, &ins, 4);
     ins = b_to(site + 20, target);
     memcpy(site + 20, &ins, 4);

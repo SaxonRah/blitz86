@@ -139,6 +139,7 @@ void     b86_jit_set_single_step(struct B86Jit *j, int on);
 /* Testing: never use the fast table, so each b86_jit_run(c,1) is one block. */
 void     b86_jit_set_no_fast(struct B86Jit *j, int on);
 void     b86_jit_set_no_chain(struct B86Jit *j, int on);   /* testing */
+void     b86_jit_set_no_spec(struct B86Jit *j, int on);    /* testing */
 /* Testing: exits record cpu->retired (takes effect after a flush). */
 void     b86_jit_set_count_exits(struct B86Jit *j, int on);
 

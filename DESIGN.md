@@ -124,6 +124,22 @@ b target`, filled once by the dispatcher (`XR_RETFILL`), falling back to
 the hashed lookup on a mismatch. The poll stays on the hit path so loops
 built from push/ret still yield to the host.
 
+### Flag records across RET
+
+A RET whose exit would rebuild deferred flag records writes them only on
+its cold paths (cache miss, irq, first fill). The cache hit enters a
+continuation translated *for that RET site*: the pending producers become a
+virtual prefix (no code), so the continuation's own exit-time
+materialization rebuilds the record only at exits that need it. In a loop
+of calls nothing is stored per iteration. A specialized block is reachable
+only from its RET site; its dead stub writes the pending records, and when
+it is invalidated the site is repointed to "write record, then normal block".
+
+Lookahead follows direct JMP/CALL, so a loop back-edge landing on a CALL no
+longer forces every flag live. Blocks keep up to three guarded ranges (the
+block plus two lookahead regions) so SMC anywhere they depend on still
+invalidates them.
+
 ## 6. Self-modifying code
 
 Stores test one byte per 64-byte line (`codemap`): 3 instructions on
@@ -169,7 +185,7 @@ kernels now run entirely in translated code except REP's bulk helper.
 | cmpbr: `cmp/jl/sub/add/dec/jnz` | 2.41 | 2.31 |
 | strlen: `mov al,[si]/inc/or/jnz` | 2.19 | 2.50 |
 | memrmw: `add [bx+si+4],ax/add/dec/jnz` | 3.44 | 3.96 |
-| call: `call/add/ret/dec/jnz` | 6.94 | 8.23 |
+| call: `call/add/ret/dec/jnz` | 4.82 | 5.76 |
 | stack: `push/push/pop/pop/loop` | 4.35 | 5.67 |
 | lodsto: `lodsb/stosb/loop` | 6.62 | 9.0 (older) |
 | repmov: `rep movsw` x64 (per REP insn) | 22.1 | 28.8 (older) |

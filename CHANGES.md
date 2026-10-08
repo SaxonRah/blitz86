@@ -1,5 +1,20 @@
 # Changes
 
+## 2026-10-08 (d) — flag records across RET
+
+* RET cold paths write the callee's deferred flag record; the inline-cache
+  hit enters a continuation specialized with the pending producers as a
+  virtual prefix (records rebuilt only at exits that need them).
+* Lookahead follows direct JMP/CALL; blocks guard up to three ranges.
+* Call kernel host insns/guest insn: Thumb-2 8.2 -> 5.8, AArch64 7.0 -> 4.8.
+* Fuzz caught a bug during development: the "record then normal block"
+  fallback jumped to the path's final branch, skipping the record (fixed;
+  covered by `FUZZ_NOSPEC=1`).
+* Test knob: `b86_jit_set_no_spec`.
+
+Verified (qemu): silicon 585,933/585,933 both backends; fuzz 0 mismatches
+both backends (incl. NOSPEC and Pico table sizes); hwbench 9/9 both.
+
 ## 2026-10-08 (c) — unrolling + RET inline cache
 
 Hardware result of (b), RP2350 @300 MHz warm median: regmix 121.7 MIPS

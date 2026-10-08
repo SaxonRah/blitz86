@@ -136,7 +136,15 @@ void be_exit_dyn(Emit *e);                  /* ctx->ip already valid      */
    (compare + poll + direct branch), filled once by the dispatcher via
    XR_RETFILL (cpu->patch = site, cpu->scratch = ip of the RET). */
 void be_exit_ret(Emit *e, uint16_t ret_ip);
-void be_patch_ret(uint8_t *site, uint16_t ip, uint8_t *target);
+/* Building blocks for a RET whose cold paths write flag records:
+   core = cmp/bne(miss)/poll/bne(irq)/b(hit); all three branches unbound. */
+void be_ret_cache(Emit *e, uint8_t **site, uint8_t **bne, uint8_t **birq, uint8_t **bhit);
+void be_exit_irq_ip(Emit *e);                        /* B irq, ip in V_T0     */
+void be_ret_fill(Emit *e, uint16_t ret_ip, uint8_t *site);
+uint8_t *be_ret_hit_branch(uint8_t *site);
+/* Install: cached ip -> target; mismatches go to `miss` (NULL: the default
+   lookup hop of be_exit_ret's layout). */
+void be_patch_ret(uint8_t *site, uint16_t ip, uint8_t *target, uint8_t *miss);
 
 /* Helpers into C. All sync guest registers through ctx as needed. */
 void be_call_step(Emit *e, uint16_t ip, uint16_t next); /* interp one insn; exits if control changed */

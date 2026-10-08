@@ -375,6 +375,7 @@ int main(int argc, char **argv)
         tmp = b;
         b86_jit_flush(j);
         b86_jit_set_no_chain(j, getenv("FUZZ_NOCHAIN") != NULL);
+        b86_jit_set_no_spec(j, getenv("FUZZ_NOSPEC") != NULL);
         if (getenv("FUZZ_NOFAST")) b86_jit_set_no_fast(j, 1);
         if (getenv("FUZZ_TRACE")) {
             /* lockstep: one JIT block, then interpreter up to the same CS:IP */

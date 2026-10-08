@@ -40,11 +40,19 @@ typedef struct Block {
     uint32_t glo, ghi;          /* guarded linear range [glo, ghi)        */
     uint8_t *host;
     uint8_t *dead_stub;
-    uint32_t next_pg;           /* bucket chain: index + 1                 */
+    uint32_t next_pg;           /* bucket chain (see pg_link)              */
+    uint32_t xlo[2], xhi[2];    /* extra guarded ranges (lookahead targets) */
+    uint32_t next_pgx[2];
+    uint8_t nx;
     uint32_t map_slot;
     uint16_t ninsn;
     uint8_t dead;
+    uint8_t spec;               /* continuation specialized for one RET site */
+    uint8_t *ret_b, *ret_rec;   /* spec: that site's hit branch / record path */
 } Block;
+
+struct Insn;
+#define RMN 256u
 
 typedef struct B86Jit {
     B86Cpu *cpu;
@@ -63,6 +71,9 @@ typedef struct B86Jit {
     int single_step;            /* testing: never enter a block from the fast table */
     int no_chain;               /* testing: never patch chain exits */
     int hot_external;           /* fast/codemap supplied by the caller */
+    int no_spec;                /* testing: no RET-specialized continuations */
+    struct RetMeta *rm;         /* RET sites carrying deferred flag records */
+    uint32_t nrm;
     B86JitStats st;
 } J;
 
@@ -88,6 +99,8 @@ typedef struct Insn {
     uint8_t wm;                         /* guest GPRs (bit per reg16) written   */
     uint8_t pendb;                      /* INC/DEC overlay possibly live before */
     uint8_t inv;                        /* unrolled LOOP copy: exit when CX == 0 */
+    uint8_t virt;                       /* 1: virtual producer (record pending in
+                                           registers); 2: marker, record already in ctx */
     uint8_t valid;                      /* x86 flags representable in NZCV */
 } Insn;
 
@@ -299,24 +312,53 @@ static int ends_block(const Insn *d)
            d->cls == C_IND || d->cls == C_END || d->cls == C_HLT;
 }
 
+/* A RET whose exit would rebuild deferred flag records: the hit path of its
+   inline cache enters a continuation specialized with these producers as a
+   virtual prefix, so the record is rebuilt only where actually needed. */
+typedef struct RetMeta { uint8_t *site, *miss, *recp, *recb; int npre; Insn pre[2]; } RetMeta;
+/* recp: start of `write record; B normal-target`, recb: that B */
+
 /* Flags live on entry to `ip`: scan forward until every flag is defined.
    The scanned bytes join the block's guarded range (so SMC there also
    invalidates this block); if that would exceed one SMC page we give up
    and assume every flag is live. */
-typedef struct Guard { uint32_t lo, hi; } Guard;
+typedef struct Guard { uint32_t lo, hi; uint32_t xlo[2], xhi[2]; int nx; } Guard;
 
+/* Add [lo,hi) to the guard: merge into a range if the result stays within
+   one SMC page span, else open an extra range (at most two). */
+static int guard_add(Guard *g, uint32_t lo, uint32_t hi)
+{
+    uint32_t nlo = lo < g->lo ? lo : g->lo, nhi = hi > g->hi ? hi : g->hi;
+    if (nhi - nlo <= 512u) { g->lo = nlo; g->hi = nhi; return 1; }
+    for (int r = 0; r < g->nx; ++r) {
+        nlo = lo < g->xlo[r] ? lo : g->xlo[r]; nhi = hi > g->xhi[r] ? hi : g->xhi[r];
+        if (nhi - nlo <= 512u) { g->xlo[r] = nlo; g->xhi[r] = nhi; return 1; }
+    }
+    if (g->nx < 2 && hi - lo <= 512u) { g->xlo[g->nx] = lo; g->xhi[g->nx] = hi; g->nx++; return 1; }
+    return 0;
+}
+
+/* Flags live on entry to `ip`. Scans forward (following direct JMP and
+   CALL) until every flag is defined. Scanned bytes join the block's guard
+   so that modifying them invalidates the block. */
 static uint16_t lookahead(J *j, uint32_t cs, uint16_t ip, Guard *g)
 {
     if (j->no_lookahead) return ALLF;
-    uint16_t need = 0, defd = 0, res = 0;
-    uint16_t p = ip;
-    int done = 0;
-    for (int i = 0; i < 12 && !done; ++i) {
+    uint16_t need = 0, defd = 0, res = ALLF;
+    uint16_t p = ip, seg = ip;
+    Guard t = *g;
+    int done = 0, follows = 0;
+    for (int i = 0; i < 16 && !done; ++i) {
         Insn d;
         decode(j->cpu, cs, p, &d);
         classify(&d);
         if (d.next < p) return ALLF;
         need |= d.fuse & ~defd;
+        if ((d.cls == C_JMP || d.cls == C_CALL) && follows < 2) {
+            if (!guard_add(&t, (cs << 4) + seg, (cs << 4) + d.next)) return ALLF;
+            p = seg = d.target; follows++;
+            continue;
+        }
         if (d.cls == C_JCC || ends_block(&d)) { res = (uint16_t)(need | (ALLF & ~defd)); p = d.next; done = 1; break; }
         defd |= d.fdef;
         p = d.next;
@@ -324,10 +366,8 @@ static uint16_t lookahead(J *j, uint32_t cs, uint16_t ip, Guard *g)
     }
     if (!done) res = (uint16_t)(need | (ALLF & ~defd));
     if (res == ALLF) return ALLF;
-    uint32_t lo = (cs << 4) + ip, hi = (cs << 4) + p;
-    uint32_t nlo = lo < g->lo ? lo : g->lo, nhi = hi > g->hi ? hi : g->hi;
-    if (nhi - nlo > 512u) return ALLF;
-    g->lo = nlo; g->hi = nhi;
+    if (!guard_add(&t, (cs << 4) + seg, (cs << 4) + p)) return ALLF;
+    *g = t;
     return res;
 }
 
@@ -341,6 +381,7 @@ static uint16_t live_before(const Insn *d)
    represents. Returns 0 if the producer cannot feed NZCV. */
 static int producer_class(const Insn *d, uint8_t *valid)
 {
+    if (d->virt) return 0;
     uint8_t op = d->op;
     int xop = -1;
     if (op < 0x40 && (op & 7) < 6) xop = op >> 3;
@@ -600,7 +641,7 @@ static void analyze(J *j, uint32_t cs, Insn *v, int n, uint16_t live_out, Guard 
         c->fused = 1; c->mode = (uint8_t)ac; c->prod = (uint8_t)p;
         pr->arm = 1; pr->mode = (uint8_t)mode; pr->armneed |= use;
     }
-    for (int i = 0; i < n; ++i) v[i].wm = wmask(&v[i]);
+    for (int i = 0; i < n; ++i) v[i].wm = v[i].virt ? 0 : wmask(&v[i]);
     /* Pass B: lazy record unless every reader is a fused consumer. A record
        needed only at exits (side exits / block end) is deferred into the
        exit path when it can be rebuilt from registers there. */
@@ -630,6 +671,7 @@ static void analyze(J *j, uint32_t cs, Insn *v, int n, uint16_t live_out, Guard 
         if (rem && (v[n - 1].live & rem)) { exits = 1; if (touched & need) can = 0; }
         p->lazy = (uint8_t)(mid || exits);
         p->defer = (uint8_t)(p->lazy && !mid && can);
+        if (p->virt == 2) p->lazy = p->defer = 0;    /* already in ctx */
     }
 }
 
@@ -700,6 +742,20 @@ static void emit_record(Tx *t, const DeferInfo *o, int clear_overlay)
         else be_op(e, aop, V_T0, o->ra, o->rb);
         be_stctx(e, V_T0, orr);
     }
+}
+
+static void deferred_pq(Tx *t, int k, uint16_t live, int *P, int *Q, int *pa, int *qa)
+{
+    Insn *v = t->v;
+    DeferInfo o;
+    *P = *Q = -1; *pa = *qa = 0;
+    if (!live) return;
+    for (int m = k; m >= 0; --m) {
+        if (v[m].fdef & B86_CF) { *P = m; break; }
+        if (*Q < 0 && (v[m].fdef & B86_ZF)) *Q = m;
+    }
+    *pa = *P >= 0 && v[*P].defer && (live & v[*P].fdef) && defer_info(&v[*P], &o);
+    *qa = *Q >= 0 && v[*Q].defer && (live & v[*Q].fdef) && defer_info(&v[*Q], &o);
 }
 
 static void emit_deferred(Tx *t, int k, uint16_t live)
@@ -999,6 +1055,19 @@ static int lower(Tx *t, Insn *d)
     uint8_t op = d->op;
     int w = d->w;
 
+    if (d->virt) {                    /* specialized continuation prefix */
+        DeferInfo o;
+        if (d->virt == 1 && d->lazy && !d->defer && defer_info(d, &o)) {
+            int full = (d->fdef & B86_CF) != 0;
+            Insn *nx = &t->v[t->cur + 1];
+            int qafter = full && nx->virt && !(nx->fdef & B86_CF);
+            emit_record(t, &o, full && !qafter && t->inc_pending);
+            if (full && !qafter) t->inc_pending = 0;
+            if (!full) t->inc_pending = 1;
+        }
+        return 1;
+    }
+
     if (op < 0x40 && (op & 7) < 6) {
         int xop = op >> 3;
         switch (op & 7) {
@@ -1246,13 +1315,46 @@ static int lower(Tx *t, Insn *d)
         emit_deferred(t, t->cur - 1, d->live);
         be_exit_chain(e, d->target, d->target <= d->ip);
         return 1;
-    case 0xC3: case 0xC1: case 0xC2: case 0xC0:
-        emit_deferred(t, t->cur - 1, d->live);
+    case 0xC3: case 0xC1: case 0xC2: case 0xC0: {
+        int P, Q, pa, qa;
+        uint16_t spadd = (op == 0xC2 || op == 0xC0) ? (uint16_t)(2 + d->imm) : 2;
+        deferred_pq(t, t->cur - 1, d->live, &P, &Q, &pa, &qa);
+        DeferInfo op_, oq_;
+        int sp_used = (pa && defer_info(&t->v[P], &op_) && (defer_regs(&op_) & (1u << B86_SP))) ||
+                      (qa && defer_info(&t->v[Q], &oq_) && (defer_regs(&oq_) & (1u << B86_SP)));
+        if (!(pa || qa) || sp_used || t->j->nrm >= RMN) {
+            emit_deferred(t, t->cur - 1, d->live);
+            be_ea(e, V_T0, B86_SS, B86_SP, -1, 0);
+            be_load(e, 1, V_T0, V_T0);
+            be_opi(e, AOP_ADD, B86_SP, B86_SP, spadd);
+            be_exit_ret(e, d->ip);
+            return 1;
+        }
+        /* records only on the cold paths; the cache hit enters a continuation
+           specialized with the pending producers as a virtual prefix */
         be_ea(e, V_T0, B86_SS, B86_SP, -1, 0);
         be_load(e, 1, V_T0, V_T0);
-        be_opi(e, AOP_ADD, B86_SP, B86_SP, (op == 0xC2 || op == 0xC0) ? (uint16_t)(2 + d->imm) : 2);
-        be_exit_ret(e, d->ip);
-        return 1;
+        be_opi(e, AOP_ADD, B86_SP, B86_SP, spadd);
+        uint8_t *site, *bne, *birq, *bhit;
+        be_ret_cache(e, &site, &bne, &birq, &bhit);
+        uint8_t *miss = e->p;                                   /* miss -> lookup */
+        be_stctx(e, V_T0, OFF(ip)); emit_deferred(t, t->cur - 1, d->live); be_ldctx(e, V_T0, OFF(ip));
+        be_exit_ip_reg(e, V_T0);
+        be_bind(e, birq, e->p);                                 /* irq */
+        be_stctx(e, V_T0, OFF(ip)); emit_deferred(t, t->cur - 1, d->live); be_ldctx(e, V_T0, OFF(ip));
+        be_exit_irq_ip(e);
+        uint8_t *fill = e->p;                                   /* first use */
+        be_stctx(e, V_T0, OFF(ip)); emit_deferred(t, t->cur - 1, d->live); be_ldctx(e, V_T0, OFF(ip));
+        be_ret_fill(e, d->ip, site);
+        uint8_t *recp = e->p;
+        emit_deferred(t, t->cur - 1, d->live);                  /* record, then normal block */
+        uint8_t *recb = be_jmp(e);
+        be_bind(e, bne, fill); be_bind(e, bhit, fill); be_bind(e, recb, fill);
+        RetMeta *m = &t->j->rm[t->j->nrm++];
+        m->site = site; m->miss = miss; m->recp = recp; m->recb = recb; m->npre = 0;
+        if (pa) { m->pre[m->npre] = t->v[P]; m->pre[m->npre].virt = 1; m->npre++; }
+        if (Q >= 0 && (qa || pa)) { m->pre[m->npre] = t->v[Q]; m->pre[m->npre].virt = (uint8_t)(qa ? 1 : 2); m->npre++; }
+        return 1; }
     case 0xFF:
         if (d->reg == 4) {           /* JMP near r/m */
             emit_deferred(t, t->cur - 1, d->live);
@@ -1334,6 +1436,10 @@ void b86_jit_flush(J *j)
         Block *b = &j->blk[i];
         j->map[b->map_slot] = 0;
         j->pg_head[b->glo >> PG_SHIFT] = 0;
+        for (int r = 0; r < b->nx; ++r) {
+            j->pg_head[b->xlo[r] >> PG_SHIFT] = 0;
+            for (uint32_t l = b->xlo[r] >> B86_LINE_SHIFT; l <= (b->xhi[r] - 1) >> B86_LINE_SHIFT; ++l) j->codemap[l] = 0;
+        }
         uint32_t f = fast_hash(b->key);
         j->fast[f].key = 0xFFFFFFFFu;
         j->fast[f].host = be_code_ptr(j->e.x_miss);
@@ -1341,6 +1447,7 @@ void b86_jit_flush(J *j)
             j->codemap[l] = 0;
     }
     j->nblk = 0;
+    j->nrm = 0;
     j->e.p = j->code_start;
     j->flush_gen++;
     j->st.flushes++;
@@ -1351,14 +1458,18 @@ static void kill_block(J *j, uint32_t idx)
     Block *b = &j->blk[idx];
     if (b->dead) return;
     b->dead = 1;
-    for (uint32_t l = b->glo >> B86_LINE_SHIFT; l <= (b->ghi - 1) >> B86_LINE_SHIFT; ++l)
-        if (j->codemap[l] && j->codemap[l] != 255) j->codemap[l]--;
+    for (int r = 0; r <= b->nx; ++r) {
+        uint32_t lo = r ? b->xlo[r - 1] : b->glo, hi = r ? b->xhi[r - 1] : b->ghi;
+        for (uint32_t l = lo >> B86_LINE_SHIFT; l <= (hi - 1) >> B86_LINE_SHIFT; ++l)
+            if (j->codemap[l] && j->codemap[l] != 255) j->codemap[l]--;
+    }
     uint32_t f = fast_hash(b->key);
     if (j->fast[f].key == b->key) {
         j->fast[f].key = 0xFFFFFFFFu;
         j->fast[f].host = be_code_ptr(j->e.x_miss);
     }
     be_kill_entry(b->host, b->dead_stub);
+    if (b->spec && b->ret_b) be_patch_branch(b->ret_b, b->ret_rec);
     j->st.smc_invalidations++;
 }
 
@@ -1367,9 +1478,12 @@ static void invalidate(J *j, uint32_t lo, uint32_t hi)
     uint32_t p0 = (lo >> PG_SHIFT), p1 = (hi - 1) >> PG_SHIFT;
     if (p0) p0--;
     for (uint32_t p = p0; p <= p1 && p < NPG; ++p) {
-        for (uint32_t v = j->pg_head[p]; v; v = j->blk[v - 1].next_pg) {
-            Block *b = &j->blk[v - 1];
-            if (!b->dead && b->glo < hi && lo < b->ghi) kill_block(j, v - 1);
+        for (uint32_t v = j->pg_head[p]; v; ) {
+            uint32_t idx = (v & 0x0FFFFFFFu) - 1, r = v >> 28;
+            Block *b = &j->blk[idx];
+            v = r ? b->next_pgx[r - 1] : b->next_pg;
+            uint32_t blo = r ? b->xlo[r - 1] : b->glo, bhi = r ? b->xhi[r - 1] : b->ghi;
+            if (!b->dead && blo < hi && lo < bhi) kill_block(j, idx);
         }
     }
 }
@@ -1385,22 +1499,26 @@ static void smc_hook(B86Cpu *c, uint32_t lin, uint32_t n)
 /* Translation                                                              */
 /* ------------------------------------------------------------------------ */
 
-static Block *translate(J *j, uint32_t cs, uint16_t ip)
+static Block *translate_ex(J *j, uint32_t cs, uint16_t ip, const Insn *pre, int npre);
+static Block *translate(J *j, uint32_t cs, uint16_t ip) { return translate_ex(j, cs, ip, NULL, 0); }
+
+static Block *translate_ex(J *j, uint32_t cs, uint16_t ip, const Insn *pre, int npre)
 {
     B86Cpu *c = j->cpu;
     static Insn v[128];
-    int n = 0;
+    int n = npre;
+    for (int i = 0; i < npre; ++i) v[i] = pre[i];
     uint32_t base = cs << 4;
     uint32_t glo = base + ip, ghi = glo;
     uint16_t pc = ip;
     unsigned maxn = j->max_insns ? j->max_insns : DEF_INSNS;
 
-    while ((unsigned)n < maxn) {
+    while ((unsigned)n < maxn + (unsigned)npre) {
         Insn *d = &v[n];
         decode(c, cs, pc, d);
         classify(d);
-        if (d->next < pc) { if (n == 0) { d->cls = C_END; d->native = 0; } else break; } /* wraps */
-        if (n > 0 && base + d->next - glo > MAX_SPAN) break;
+        if (d->next < pc) { if (n == npre) { d->cls = C_END; d->native = 0; } else break; } /* wraps */
+        if (n > npre && base + d->next - glo > MAX_SPAN) break;
         ghi = base + d->next;
         n++;
         if (ends_block(d)) break;
@@ -1410,7 +1528,7 @@ static Block *translate(J *j, uint32_t cs, uint16_t ip)
        the INVERTED branch, which exits to the loop's fall-through and
        otherwise falls into the next copy; only the last copy carries the
        interrupt poll and the back-edge. Semantics are unchanged. */
-    if (!j->single_step && !j->max_insns) {
+    if (!j->single_step && !j->max_insns && !npre) {
         int k = -1;
         for (int i = 0; i < n; ++i) {
             Insn *d = &v[i];
@@ -1460,7 +1578,7 @@ static Block *translate(J *j, uint32_t cs, uint16_t ip)
             v[i].arm = v[i].lazy = v[i].fused = v[i].mode = v[i].prod = 0;
             v[i].live = v[i].live_taken = 0;
         }
-        Guard g = { glo0, ghi0 };
+        Guard g = { glo0, ghi0, {0, 0}, {0, 0}, 0 };
         uint16_t live_out = ALLF;
         if (last->cls == C_JMP || last->cls == C_CALL) live_out = lookahead(j, cs, last->target, &g);
         else if (!ends_block(last)) live_out = lookahead(j, cs, last->next, &g);
@@ -1470,6 +1588,8 @@ static Block *translate(J *j, uint32_t cs, uint16_t ip)
         memset(b, 0, sizeof *b);
         b->key = (cs << 16) | ip;
         b->glo = glo; b->ghi = ghi; b->ninsn = (uint16_t)n;
+        b->nx = (uint8_t)g.nx;
+        for (int r = 0; r < g.nx; ++r) { b->xlo[r] = g.xlo[r]; b->xhi[r] = g.xhi[r]; }
         e->blk = idx;
         e->nslow = 0;
         e->overflow = 0;
@@ -1484,7 +1604,7 @@ static Block *translate(J *j, uint32_t cs, uint16_t ip)
         uint64_t helpers = 0;
         for (int i = 0; i < n; ++i) {
             Insn *d = &v[i];
-            e->retire = (uint32_t)i + 1;
+            e->retire = (uint32_t)(i + 1 - npre);
             tx.cur = i;
             d->pendb = (uint8_t)tx.inc_pending;
             int ok = d->native && lower(&tx, d);
@@ -1510,13 +1630,22 @@ static Block *translate(J *j, uint32_t cs, uint16_t ip)
     be_finish_block(e);
     b->dead_stub = e->p;
     e->retire = 0;
+    if (npre) {
+        /* entry state = the RET site's state: write every pending virtual
+           record before leaving (the retranslated target may need it) */
+        int P = -1, Q = -1;
+        for (int i = 0; i < npre; ++i) { if (v[i].fdef & B86_CF) P = i; else Q = i; }
+        DeferInfo o;
+        if (P >= 0 && v[P].virt == 1 && defer_info(&v[P], &o)) emit_record(&tx, &o, Q < 0);
+        if (Q >= 0 && v[Q].virt == 1 && defer_info(&v[Q], &o)) emit_record(&tx, &o, 0);
+    }
     be_exit_ip_imm(e, ip, XR_LOOKUP);
 
     if (e->overflow || tx.fail) {
         /* out of space or an internal limit: flush and retry smaller */
         b86_jit_flush(j);
-        if (tx.fail && maxn > 4) { unsigned m = j->max_insns; j->max_insns = maxn / 2; Block *r = translate(j, cs, ip); j->max_insns = m; return r; }
-        return translate(j, cs, ip);
+        if (tx.fail && maxn > 4) { unsigned m = j->max_insns; j->max_insns = maxn / 2; Block *r = translate_ex(j, cs, ip, pre, npre); j->max_insns = m; return r; }
+        return translate_ex(j, cs, ip, pre, npre);
     }
     be_flush_icache(start, (size_t)(e->p - start));
 #ifdef B86_DEBUG_DUMP
@@ -1529,14 +1658,17 @@ static Block *translate(J *j, uint32_t cs, uint16_t ip)
 #endif
 
     j->nblk++;
-    map_insert(j, idx);
-    uint32_t pg = glo >> PG_SHIFT;
-    b->next_pg = j->pg_head[pg];
-    j->pg_head[pg] = idx + 1;
-    for (uint32_t l = glo >> B86_LINE_SHIFT; l <= (ghi - 1) >> B86_LINE_SHIFT; ++l)
-        if (j->codemap[l] != 255) j->codemap[l]++;
+    if (npre) b->spec = 1; else map_insert(j, idx);
+    for (int r = 0; r <= b->nx; ++r) {
+        uint32_t lo = r ? b->xlo[r - 1] : b->glo, hi = r ? b->xhi[r - 1] : b->ghi;
+        uint32_t pg = lo >> PG_SHIFT;
+        if (r) b->next_pgx[r - 1] = j->pg_head[pg]; else b->next_pg = j->pg_head[pg];
+        j->pg_head[pg] = (idx + 1) | ((uint32_t)r << 28);
+        for (uint32_t l = lo >> B86_LINE_SHIFT; l <= (hi - 1) >> B86_LINE_SHIFT; ++l)
+            if (j->codemap[l] != 255) j->codemap[l]++;
+    }
     j->st.blocks++;
-    j->st.guest_insns += (uint64_t)n;
+    j->st.guest_insns += (uint64_t)(n - npre);
     j->st.host_bytes += (uint64_t)(e->p - start);
     return b;
 }
@@ -1659,6 +1791,7 @@ J *b86_jit_create_ex(B86Cpu *c, void *code, size_t size, void *hot, size_t hot_s
     j->blk = calloc(MAXB, sizeof *j->blk);
     j->map = calloc(MAPN, sizeof *j->map);
     j->pg_head = calloc(NPG, sizeof *j->pg_head);
+    j->rm = calloc(RMN, sizeof *j->rm);
     if (hot && hot_size >= b86_jit_hot_bytes()) {
         memset(hot, 0, b86_jit_hot_bytes());
         j->fast = (B86Fast *)hot;
@@ -1668,7 +1801,7 @@ J *b86_jit_create_ex(B86Cpu *c, void *code, size_t size, void *hot, size_t hot_s
         j->fast = calloc(B86_FASTN, sizeof *j->fast);
         j->codemap = calloc(B86_LINES, 1);
     }
-    if (!j->blk || !j->map || !j->pg_head || !j->fast || !j->codemap) { b86_jit_destroy(j); return NULL; }
+    if (!j->blk || !j->map || !j->pg_head || !j->rm || !j->fast || !j->codemap) { b86_jit_destroy(j); return NULL; }
     c->jit = j;
     c->codemap = j->codemap;
     c->codemap_host = j->codemap - ((uintptr_t)c->mem >> B86_LINE_SHIFT);
@@ -1689,7 +1822,7 @@ void b86_jit_destroy(J *j)
 {
     if (!j) return;
     if (j->cpu) { j->cpu->jit = NULL; j->cpu->codemap = NULL; j->cpu->smc_hook = NULL; }
-    free(j->blk); free(j->map); free(j->pg_head);
+    free(j->blk); free(j->map); free(j->pg_head); free(j->rm);
     if (!j->hot_external) { free(j->fast); free(j->codemap); }
     free(j);
 }
@@ -1699,6 +1832,7 @@ void b86_jit_set_max_block(J *j, unsigned n) { j->max_insns = n; }
 void b86_jit_set_lookahead(J *j, int on) { j->no_lookahead = !on; }
 void b86_jit_set_no_fast(J *j, int on) { j->single_step = on; }
 void b86_jit_set_no_chain(J *j, int on) { j->no_chain = on; }
+void b86_jit_set_no_spec(J *j, int on) { j->no_spec = on; }
 void b86_jit_set_count_exits(J *j, int on) { j->e.count_exits = on; }
 void b86_jit_set_single_step(J *j, int on)
 {
@@ -1726,7 +1860,22 @@ int b86_jit_run(B86Cpu *c, uint64_t max_dispatch)
             j->st.chains++;
         }
         patch_site = NULL;
-        if (rf_site && rf_gen == j->flush_gen && !j->no_chain) be_patch_ret(rf_site, (uint16_t)c->ip, b->host);
+        if (rf_site && rf_gen == j->flush_gen && !j->no_chain) {
+            RetMeta *m = NULL;
+            for (uint32_t r = 0; r < j->nrm; ++r) if (j->rm[r].site == rf_site) { m = &j->rm[r]; break; }
+            if (m && j->no_spec) { be_patch_branch(m->recb, b->host); be_patch_ret(rf_site, (uint16_t)c->ip, m->recp, m->miss); }
+            else if (!m) be_patch_ret(rf_site, (uint16_t)c->ip, b->host, NULL);
+            else {
+                uint8_t *site = rf_site;
+                Block *sb = translate_ex(j, c->seg[B86_CS], (uint16_t)c->ip, m->pre, m->npre);
+                if (rf_gen == j->flush_gen) {
+                    be_patch_branch(m->recb, b->host);
+                    sb->ret_b = be_ret_hit_branch(site);
+                    sb->ret_rec = m->recp;
+                    be_patch_ret(site, (uint16_t)c->ip, sb->host, m->miss);
+                } else { rf_site = NULL; continue; }   /* cache flushed: re-dispatch */
+            }
+        }
         rf_site = NULL;
         if (!j->single_step) {
             uint32_t f = fast_hash(key);
