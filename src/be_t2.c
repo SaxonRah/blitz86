@@ -26,18 +26,18 @@ const int be_logic_mode = FM_SUB;      /* LSL x,r,#sh ; CMP x,#0 : C=1 V=0 */
 #define LR 14
 #define PC 15
 
-static int hr(int v) { return v < 8 ? v : (v == V_T0 ? R12 : LR); }
+B86_HOT static int hr(int v) { return v < 8 ? v : (v == V_T0 ? R12 : LR); }
 
-static void put16(Emit *e, uint32_t hw)
+B86_HOT static void put16(Emit *e, uint32_t hw)
 {
     if (e->p + 2 > e->end) { e->overflow = 1; return; }
     e->p[0] = (uint8_t)hw; e->p[1] = (uint8_t)(hw >> 8);
     e->p += 2;
 }
-static void put32(Emit *e, uint32_t h1, uint32_t h2) { put16(e, h1); put16(e, h2); }
+B86_HOT static void put32(Emit *e, uint32_t h1, uint32_t h2) { put16(e, h1); put16(e, h2); }
 
 /* ---- immediates --------------------------------------------------------- */
-static int modimm(uint32_t v, uint32_t *enc)
+B86_HOT static int modimm(uint32_t v, uint32_t *enc)
 {
     uint32_t b = v & 0xFF;
     if (v < 256) { *enc = v; return 1; }
@@ -54,51 +54,51 @@ static int modimm(uint32_t v, uint32_t *enc)
 
 enum { DP_AND = 0, DP_BIC = 1, DP_ORR = 2, DP_ORN = 3, DP_EOR = 4, DP_ADD = 8, DP_SUB = 13, DP_RSB = 14 };
 
-static void dp_imm(Emit *e, int op, int s, int d, int n, uint32_t enc)
+B86_HOT static void dp_imm(Emit *e, int op, int s, int d, int n, uint32_t enc)
 {
     put32(e, 0xF000u | (enc >> 11 & 1) << 10 | (uint32_t)op << 5 | (uint32_t)s << 4 | (uint32_t)n,
              (enc >> 8 & 7) << 12 | (uint32_t)d << 8 | (enc & 0xFF));
 }
-static void dp_reg(Emit *e, int op, int s, int d, int n, int m, int type, int amt)
+B86_HOT static void dp_reg(Emit *e, int op, int s, int d, int n, int m, int type, int amt)
 {
     put32(e, 0xEA00u | (uint32_t)op << 5 | (uint32_t)s << 4 | (uint32_t)n,
              (uint32_t)(amt >> 2 & 7) << 12 | (uint32_t)d << 8 | (uint32_t)(amt & 3) << 6 | (uint32_t)type << 4 | (uint32_t)m);
 }
-static void movw(Emit *e, int d, uint32_t v)
+B86_HOT static void movw(Emit *e, int d, uint32_t v)
 {
     v &= 0xFFFF;
     put32(e, 0xF240u | (v >> 11 & 1) << 10 | (v >> 12), (v >> 8 & 7) << 12 | (uint32_t)d << 8 | (v & 0xFF));
 }
-static void movt(Emit *e, int d, uint32_t v)
+B86_HOT static void movt(Emit *e, int d, uint32_t v)
 {
     v &= 0xFFFF;
     put32(e, 0xF2C0u | (v >> 11 & 1) << 10 | (v >> 12), (v >> 8 & 7) << 12 | (uint32_t)d << 8 | (v & 0xFF));
 }
-static void imm32(Emit *e, int d, uint32_t v) { movw(e, d, v); if (v >> 16) movt(e, d, v >> 16); }
-static void addw(Emit *e, int d, int n, uint32_t v, int sub)
+B86_HOT static void imm32(Emit *e, int d, uint32_t v) { movw(e, d, v); if (v >> 16) movt(e, d, v >> 16); }
+B86_HOT static void addw(Emit *e, int d, int n, uint32_t v, int sub)
 {
     put32(e, (sub ? 0xF2A0u : 0xF200u) | (v >> 11 & 1) << 10 | (uint32_t)n, (v >> 8 & 7) << 12 | (uint32_t)d << 8 | (v & 0xFF));
 }
-static void mov(Emit *e, int d, int s) { if (d != s) put32(e, 0xEA4Fu, (uint32_t)d << 8 | (uint32_t)s); }
-static void shift_imm(Emit *e, int s_flag, int d, int m, int type, unsigned n)
+B86_HOT static void mov(Emit *e, int d, int s) { if (d != s) put32(e, 0xEA4Fu, (uint32_t)d << 8 | (uint32_t)s); }
+B86_HOT static void shift_imm(Emit *e, int s_flag, int d, int m, int type, unsigned n)
 {
     put32(e, s_flag ? 0xEA5Fu : 0xEA4Fu, (n >> 2 & 7) << 12 | (uint32_t)d << 8 | (n & 3) << 6 | (uint32_t)type << 4 | (uint32_t)m);
 }
-static void bitfield(Emit *e, uint32_t h1, int d, int n, unsigned lsb, unsigned last)
+B86_HOT static void bitfield(Emit *e, uint32_t h1, int d, int n, unsigned lsb, unsigned last)
 {
     put32(e, h1 | (uint32_t)n, (lsb >> 2 & 7) << 12 | (uint32_t)d << 8 | (lsb & 3) << 6 | last);
 }
-static void ldst(Emit *e, uint32_t h1, int t, int n, unsigned off) { put32(e, h1 | (uint32_t)n, (uint32_t)t << 12 | (off & 0xFFF)); }
+B86_HOT static void ldst(Emit *e, uint32_t h1, int t, int n, unsigned off) { put32(e, h1 | (uint32_t)n, (uint32_t)t << 12 | (off & 0xFFF)); }
 #define LDRW 0xF8D0u
 #define STRW 0xF8C0u
 #define LDRH 0xF8B0u
 #define STRH 0xF8A0u
 #define LDRB 0xF890u
 #define STRB 0xF880u
-static void cmp_imm0(Emit *e, int n) { dp_imm(e, DP_SUB, 1, PC, n, 0); }
+B86_HOT static void cmp_imm0(Emit *e, int n) { dp_imm(e, DP_SUB, 1, PC, n, 0); }
 
 /* ---- branches ------------------------------------------------------------ */
-static void enc_b(uint8_t *site, uint8_t *target)
+B86_HOT static void enc_b(uint8_t *site, uint8_t *target)
 {
     int32_t off = (int32_t)(target - (site + 4));
     uint32_t S = (uint32_t)(off >> 24) & 1, I1 = (uint32_t)(off >> 23) & 1, I2 = (uint32_t)(off >> 22) & 1;
@@ -107,6 +107,7 @@ static void enc_b(uint8_t *site, uint8_t *target)
     uint32_t h2 = 0x9000u | J1 << 13 | J2 << 11 | ((uint32_t)(off >> 1) & 0x7FF);
     site[0] = (uint8_t)h1; site[1] = (uint8_t)(h1 >> 8); site[2] = (uint8_t)h2; site[3] = (uint8_t)(h2 >> 8);
 }
+B86_HOT static void call_abs(Emit *e, void *fn);
 static void emit_bl(Emit *e, uint8_t *target)
 {
     uint8_t *site = e->p;
@@ -115,9 +116,9 @@ static void emit_bl(Emit *e, uint8_t *target)
     site[3] = (uint8_t)(site[3] | 0x40);                     /* B.W -> BL: hw2 bit 14 */
     e->p += 4;
 }
-static void put_word(Emit *e, uint32_t v) { put16(e, v & 0xFFFF); put16(e, v >> 16); }
+B86_HOT static void put_word(Emit *e, uint32_t v) { put16(e, v & 0xFFFF); put16(e, v >> 16); }
 
-static void enc_bcc(uint8_t *site, uint8_t *target, uint32_t cond)
+B86_HOT static void enc_bcc(uint8_t *site, uint8_t *target, uint32_t cond)
 {
     int32_t off = (int32_t)(target - (site + 4));
     if (off < -(1 << 20) || off >= (1 << 20)) __builtin_trap();
@@ -126,20 +127,20 @@ static void enc_bcc(uint8_t *site, uint8_t *target, uint32_t cond)
     uint32_t h2 = 0x8000u | J1 << 13 | J2 << 11 | ((uint32_t)(off >> 1) & 0x7FF);
     site[0] = (uint8_t)h1; site[1] = (uint8_t)(h1 >> 8); site[2] = (uint8_t)h2; site[3] = (uint8_t)(h2 >> 8);
 }
-static uint8_t *emit_b(Emit *e, uint8_t *target)
+B86_HOT static uint8_t *emit_b(Emit *e, uint8_t *target)
 {
     uint8_t *s = e->p;
     if (e->p + 4 > e->end) { e->overflow = 1; return s; }
     enc_b(s, target ? target : s + 4); e->p += 4; return s;
 }
-static uint8_t *emit_bcc(Emit *e, int cond, uint8_t *target)
+B86_HOT static uint8_t *emit_bcc(Emit *e, int cond, uint8_t *target)
 {
     uint8_t *s = e->p;
     if (e->p + 4 > e->end) { e->overflow = 1; return s; }
     enc_bcc(s, target ? target : s + 4, (uint32_t)cond); e->p += 4; return s;
 }
 
-void be_bind(Emit *e, uint8_t *site, uint8_t *target)
+B86_HOT void be_bind(Emit *e, uint8_t *site, uint8_t *target)
 {
     (void)e;
     if (!site) return;
@@ -148,7 +149,7 @@ void be_bind(Emit *e, uint8_t *site, uint8_t *target)
     else enc_bcc(site, target, (h1 >> 6) & 0xF);
 }
 
-void be_flush_icache(void *start, size_t len)
+B86_HOT void be_flush_icache(void *start, size_t len)
 {
 #if defined(__linux__)
     __builtin___clear_cache((char *)start, (char *)start + len);
@@ -157,23 +158,23 @@ void be_flush_icache(void *start, size_t len)
     __asm__ volatile("dsb 0xF\n\tisb 0xF" ::: "memory");
 #endif
 }
-void be_patch_branch(uint8_t *site, uint8_t *target) { enc_b(site, target); be_flush_icache(site, 4); }
-void be_kill_entry(uint8_t *entry, uint8_t *stub) { be_patch_branch(entry, stub); }
-uintptr_t be_code_ptr(uint8_t *p) { return (uintptr_t)p | 1u; }
+B86_HOT void be_patch_branch(uint8_t *site, uint8_t *target) { enc_b(site, target); be_flush_icache(site, 4); }
+B86_HOT void be_kill_entry(uint8_t *entry, uint8_t *stub) { be_patch_branch(entry, stub); }
+B86_HOT uintptr_t be_code_ptr(uint8_t *p) { return (uintptr_t)p | 1u; }
 
 /* ---- runtime -------------------------------------------------------------- */
 
-static void call_abs(Emit *e, void *fn)
+B86_HOT static void call_abs(Emit *e, void *fn)
 {
     imm32(e, R12, (uint32_t)(uintptr_t)fn);
     put16(e, 0x4780u | R12 << 3);                    /* BLX r12 */
 }
-static void reload_segs(Emit *e)
+B86_HOT static void reload_segs(Emit *e)
 {
     ldst(e, LDRW, R_DS, R_CTX, OFF(segp[B86_DS]));
     ldst(e, LDRW, R_SS, R_CTX, OFF(segp[B86_SS]));
 }
-void be_count(Emit *e, uint32_t n)
+B86_HOT void be_count(Emit *e, uint32_t n)
 {
     if (!e->count_ret || e->no_count || n == 0) return;
     ldst(e, LDRW, LR, R_CTX, OFF(icnt));
@@ -181,14 +182,14 @@ void be_count(Emit *e, uint32_t n)
     ldst(e, STRW, LR, R_CTX, OFF(icnt));
 }
 
-static void retire_mark(Emit *e, uint32_t n)
+B86_HOT static void retire_mark(Emit *e, uint32_t n)
 {
     if (!e->count_exits) return;
     movw(e, LR, n);
     ldst(e, STRW, LR, R_CTX, OFF(retired));
 }
 
-void *be_emit_runtime(Emit *e)
+B86_HOT void *be_emit_runtime(Emit *e)
 {
     if ((uintptr_t)e->p & 2) put16(e, 0xBF00);
     uint8_t *enter = e->p;
@@ -323,18 +324,18 @@ void *be_emit_runtime(Emit *e)
 
 /* ---- ALU ------------------------------------------------------------------ */
 
-void be_mov(Emit *e, int d, int s) { mov(e, hr(d), hr(s)); }
-void be_movi(Emit *e, int d, uint32_t imm) { imm32(e, hr(d), imm); }
+B86_HOT void be_mov(Emit *e, int d, int s) { mov(e, hr(d), hr(s)); }
+B86_HOT void be_movi(Emit *e, int d, uint32_t imm) { imm32(e, hr(d), imm); }
 
-static int dp_of(int aop)
+B86_HOT static int dp_of(int aop)
 {
     switch (aop) { case AOP_ADD: return DP_ADD; case AOP_SUB: return DP_SUB; case AOP_AND: return DP_AND;
                    case AOP_ORR: return DP_ORR; default: return DP_EOR; }
 }
-void be_op(Emit *e, int aop, int d, int a, int b) { dp_reg(e, dp_of(aop), 0, hr(d), hr(a), hr(b), 0, 0); }
-void be_op_lsl(Emit *e, int aop, int d, int a, int b, unsigned sh) { dp_reg(e, dp_of(aop), 0, hr(d), hr(a), hr(b), 0, (int)sh); }
+B86_HOT void be_op(Emit *e, int aop, int d, int a, int b) { dp_reg(e, dp_of(aop), 0, hr(d), hr(a), hr(b), 0, 0); }
+B86_HOT void be_op_lsl(Emit *e, int aop, int d, int a, int b, unsigned sh) { dp_reg(e, dp_of(aop), 0, hr(d), hr(a), hr(b), 0, (int)sh); }
 
-static void opi_raw(Emit *e, int aop, int d, int a, uint32_t imm)
+B86_HOT static void opi_raw(Emit *e, int aop, int d, int a, uint32_t imm)
 {
     uint32_t enc;
     imm &= 0xFFFF;
@@ -365,25 +366,25 @@ static void opi_raw(Emit *e, int aop, int d, int a, uint32_t imm)
     modimm(imm & 0xFF, &enc); dp_imm(e, op, 0, d, a, enc);
     modimm(imm & 0xFF00, &enc); dp_imm(e, op, 0, d, d, enc);
 }
-void be_opi(Emit *e, int aop, int d, int a, uint32_t imm) { opi_raw(e, aop, hr(d), hr(a), imm); }
+B86_HOT void be_opi(Emit *e, int aop, int d, int a, uint32_t imm) { opi_raw(e, aop, hr(d), hr(a), imm); }
 
-void be_mvn(Emit *e, int d, int s) { put32(e, 0xEA6Fu, (uint32_t)hr(d) << 8 | (uint32_t)hr(s)); }
-void be_neg(Emit *e, int d, int s) { dp_imm(e, DP_RSB, 0, hr(d), hr(s), 0); }
-void be_lsl(Emit *e, int d, int s, unsigned n) { shift_imm(e, 0, hr(d), hr(s), 0, n); }
-void be_ubfx(Emit *e, int d, int s, unsigned lsb, unsigned w) { bitfield(e, 0xF3C0u, hr(d), hr(s), lsb, w - 1); }
-void be_sbfx(Emit *e, int d, int s, unsigned lsb, unsigned w) { bitfield(e, 0xF340u, hr(d), hr(s), lsb, w - 1); }
-void be_bfi(Emit *e, int d, int s, unsigned lsb, unsigned w) { bitfield(e, 0xF360u, hr(d), hr(s), lsb, lsb + w - 1); }
-void be_sxtb(Emit *e, int d, int s) { put32(e, 0xFA4Fu, 0xF080u | (uint32_t)hr(d) << 8 | (uint32_t)hr(s)); }
+B86_HOT void be_mvn(Emit *e, int d, int s) { put32(e, 0xEA6Fu, (uint32_t)hr(d) << 8 | (uint32_t)hr(s)); }
+B86_HOT void be_neg(Emit *e, int d, int s) { dp_imm(e, DP_RSB, 0, hr(d), hr(s), 0); }
+B86_HOT void be_lsl(Emit *e, int d, int s, unsigned n) { shift_imm(e, 0, hr(d), hr(s), 0, n); }
+B86_HOT void be_ubfx(Emit *e, int d, int s, unsigned lsb, unsigned w) { bitfield(e, 0xF3C0u, hr(d), hr(s), lsb, w - 1); }
+B86_HOT void be_sbfx(Emit *e, int d, int s, unsigned lsb, unsigned w) { bitfield(e, 0xF340u, hr(d), hr(s), lsb, w - 1); }
+B86_HOT void be_bfi(Emit *e, int d, int s, unsigned lsb, unsigned w) { bitfield(e, 0xF360u, hr(d), hr(s), lsb, lsb + w - 1); }
+B86_HOT void be_sxtb(Emit *e, int d, int s) { put32(e, 0xFA4Fu, 0xF080u | (uint32_t)hr(d) << 8 | (uint32_t)hr(s)); }
 
-void be_mul(Emit *e, int d, int a, int b) { put32(e, 0xFB00u | (uint32_t)hr(a), 0xF000u | (uint32_t)hr(d) << 8 | (uint32_t)hr(b)); }
-void be_shift_reg(Emit *e, int type, int d, int a, int cnt)
+B86_HOT void be_mul(Emit *e, int d, int a, int b) { put32(e, 0xFB00u | (uint32_t)hr(a), 0xF000u | (uint32_t)hr(d) << 8 | (uint32_t)hr(b)); }
+B86_HOT void be_shift_reg(Emit *e, int type, int d, int a, int cnt)
 {
     /* register shifts use the bottom byte of cnt; >= 32 gives 0 / sign fill,
        which is exactly the 8086's unmasked-count behaviour */
     put32(e, 0xFA00u | (uint32_t)type << 5 | (uint32_t)hr(a), 0xF000u | (uint32_t)hr(d) << 8 | (uint32_t)hr(cnt));
 }
 
-void be_get_carry(Emit *e, int d, int ac)
+B86_HOT void be_get_carry(Emit *e, int d, int ac)
 {
     /* d = C (MOV d,#0 ; ADC d,d,#0), inverted for AC_CC; no flags written */
     dp_imm(e, DP_ORR, 0, hr(d), PC, 0);
@@ -391,12 +392,25 @@ void be_get_carry(Emit *e, int d, int ac)
     if (ac == AC_CC) dp_imm(e, DP_EOR, 0, hr(d), hr(d), 1);
 }
 
+B86_HOT void be_udiv(Emit *e, int d, int a, int b) { put32(e, 0xFBB0u | (uint32_t)hr(a), 0xF0F0u | (uint32_t)hr(d) << 8 | (uint32_t)hr(b)); }
+B86_HOT void be_mls(Emit *e, int d, int a, int b, int acc) { put32(e, 0xFB00u | (uint32_t)hr(a), (uint32_t)hr(acc) << 12 | (uint32_t)hr(d) << 8 | 0x10u | (uint32_t)hr(b)); }
+B86_HOT void be_call_light(Emit *e, void *fn, int va, uint32_t imm)
+{
+    if (hr(va) != LR) mov(e, LR, hr(va));                          /* stash before r1 is reused */
+    put32(e, 0xE92Du, 0x000Fu);                                  /* PUSH {r0-r3} */
+    mov(e, 1, LR);
+    imm32(e, 2, imm);
+    mov(e, 0, R_CTX);
+    call_abs(e, fn);
+    put32(e, 0xE8BDu, 0x000Fu);                                  /* POP {r0-r3} */
+}
+
 /* ---- NZCV producers ------------------------------------------------------------ */
 
-static uint32_t mask_sh(uint32_t imm, int sh) { return (imm & (sh == 16 ? 0xFFFFu : 0xFFu)) << sh; }
-int be_imm_ok_sh(uint32_t imm, int sh) { uint32_t enc; return modimm(mask_sh(imm, sh), &enc); }
+B86_HOT static uint32_t mask_sh(uint32_t imm, int sh) { return (imm & (sh == 16 ? 0xFFFFu : 0xFFu)) << sh; }
+B86_HOT int be_imm_ok_sh(uint32_t imm, int sh) { uint32_t enc; return modimm(mask_sh(imm, sh), &enc); }
 
-int be_addsub_sh(Emit *e, int sub, int x, int d, int a, int b, int sh)
+B86_HOT int be_addsub_sh(Emit *e, int sub, int x, int d, int a, int b, int sh)
 {
     shift_imm(e, 0, hr(x), hr(a), 0, (unsigned)sh);
     dp_reg(e, sub ? DP_SUB : DP_ADD, 1, hr(x), hr(x), hr(b), 0, sh);
@@ -404,7 +418,7 @@ int be_addsub_sh(Emit *e, int sub, int x, int d, int a, int b, int sh)
     return sub ? FM_SUB : FM_ADD;
 }
 
-int be_addsubi_sh(Emit *e, int sub, int x, int d, int a, uint32_t imm, int sh, int tmp)
+B86_HOT int be_addsubi_sh(Emit *e, int sub, int x, int d, int a, uint32_t imm, int sh, int tmp)
 {
     uint32_t v = mask_sh(imm, sh), enc;
     shift_imm(e, 0, hr(x), hr(a), 0, (unsigned)sh);
@@ -414,14 +428,14 @@ int be_addsubi_sh(Emit *e, int sub, int x, int d, int a, uint32_t imm, int sh, i
     return sub ? FM_SUB : FM_ADD;
 }
 
-int be_cmp_sh(Emit *e, int x, int a, int b, int sh)
+B86_HOT int be_cmp_sh(Emit *e, int x, int a, int b, int sh)
 {
     shift_imm(e, 0, hr(x), hr(a), 0, (unsigned)sh);
     dp_reg(e, DP_SUB, 1, PC, hr(x), hr(b), 0, sh);
     return FM_SUB;
 }
 
-int be_cmpi_sh(Emit *e, int x, int a, uint32_t imm, int sh, int tmp)
+B86_HOT int be_cmpi_sh(Emit *e, int x, int a, uint32_t imm, int sh, int tmp)
 {
     uint32_t v = mask_sh(imm, sh), enc;
     shift_imm(e, 0, hr(x), hr(a), 0, (unsigned)sh);
@@ -430,7 +444,7 @@ int be_cmpi_sh(Emit *e, int x, int a, uint32_t imm, int sh, int tmp)
     return FM_SUB;
 }
 
-int be_neg_sh(Emit *e, int x, int d, int a, int sh)
+B86_HOT int be_neg_sh(Emit *e, int x, int d, int a, int sh)
 {
     shift_imm(e, 0, hr(x), hr(a), 0, (unsigned)sh);
     dp_imm(e, DP_RSB, 1, hr(x), hr(x), 0);
@@ -438,9 +452,9 @@ int be_neg_sh(Emit *e, int x, int d, int a, int sh)
     return FM_SUB;
 }
 
-void be_test_nz(Emit *e, int x, int r, int sh) { shift_imm(e, 1, hr(x), hr(r), 0, (unsigned)sh); }   /* LSLS */
+B86_HOT void be_test_nz(Emit *e, int x, int r, int sh) { shift_imm(e, 1, hr(x), hr(r), 0, (unsigned)sh); }   /* LSLS */
 
-int be_test_res(Emit *e, int x, int r, int sh)
+B86_HOT int be_test_res(Emit *e, int x, int r, int sh)
 {
     shift_imm(e, 0, hr(x), hr(r), 0, (unsigned)sh);
     cmp_imm0(e, hr(x));
@@ -449,7 +463,7 @@ int be_test_res(Emit *e, int x, int r, int sh)
 
 /* ---- memory ----------------------------------------------------------------------- */
 
-static int segreg(Emit *e, int seg)
+B86_HOT static int segreg(Emit *e, int seg)
 {
     if (seg == B86_DS) return R_DS;
     if (seg == B86_SS) return R_SS;
@@ -457,7 +471,7 @@ static int segreg(Emit *e, int seg)
     return LR;
 }
 
-void be_ea(Emit *e, int d, int seg, int b1, int b2, int32_t disp)
+B86_HOT void be_ea(Emit *e, int d, int seg, int b1, int b2, int32_t disp)
 {
     int dd = hr(d);
     int sr = segreg(e, seg);
@@ -473,7 +487,7 @@ void be_ea(Emit *e, int d, int seg, int b1, int b2, int32_t disp)
     dp_reg(e, DP_ADD, 0, dd, sr, dd, 0, 0);
 }
 
-void be_ea_off(Emit *e, int d, int b1, int b2, int32_t disp)
+B86_HOT void be_ea_off(Emit *e, int d, int b1, int b2, int32_t disp)
 {
     int dd = hr(d);
     if (b1 < 0 && b2 < 0) { movw(e, dd, (uint32_t)disp); return; }
@@ -482,9 +496,9 @@ void be_ea_off(Emit *e, int d, int b1, int b2, int32_t disp)
     if (disp) opi_raw(e, AOP_ADD, dd, dd, (uint32_t)disp);
 }
 
-void be_load(Emit *e, int w16, int d, int addr) { ldst(e, w16 ? LDRH : LDRB, hr(d), hr(addr), 0); }
+B86_HOT void be_load(Emit *e, int w16, int d, int addr) { ldst(e, w16 ? LDRH : LDRB, hr(d), hr(addr), 0); }
 
-void be_store(Emit *e, int w16, int v, int addr, int check, uint16_t next_ip)
+B86_HOT void be_store(Emit *e, int w16, int v, int addr, int check, uint16_t next_ip)
 {
     ldst(e, w16 ? STRH : STRB, hr(v), hr(addr), 0);
     if (!check) return;
@@ -501,7 +515,7 @@ void be_store(Emit *e, int w16, int v, int addr, int check, uint16_t next_ip)
     e->nslow++;
 }
 
-void be_set_seg(Emit *e, int s, int v)
+B86_HOT void be_set_seg(Emit *e, int s, int v)
 {
     put32(e, 0xFA1Fu, 0xF080u | LR << 8 | (uint32_t)hr(v));     /* UXTH lr, v */
     ldst(e, STRW, LR, R_CTX, OFF(seg[s]));
@@ -512,20 +526,20 @@ void be_set_seg(Emit *e, int s, int v)
     else if (s == B86_SS) mov(e, R_SS, R12);
 }
 
-void be_ldctx(Emit *e, int d, unsigned off) { ldst(e, LDRW, hr(d), R_CTX, off); }
-void be_stctx(Emit *e, int v, unsigned off) { ldst(e, STRW, hr(v), R_CTX, off); }
-void be_stctx_imm(Emit *e, uint32_t imm, unsigned off) { imm32(e, LR, imm); ldst(e, STRW, LR, R_CTX, off); }
+B86_HOT void be_ldctx(Emit *e, int d, unsigned off) { ldst(e, LDRW, hr(d), R_CTX, off); }
+B86_HOT void be_stctx(Emit *e, int v, unsigned off) { ldst(e, STRW, hr(v), R_CTX, off); }
+B86_HOT void be_stctx_imm(Emit *e, uint32_t imm, unsigned off) { imm32(e, LR, imm); ldst(e, STRW, LR, R_CTX, off); }
 
 /* ---- control flow -------------------------------------------------------------------- */
 
-uint8_t *be_jcc(Emit *e, int ac) { return emit_bcc(e, ac, NULL); }
-uint8_t *be_jmp(Emit *e) { return emit_b(e, NULL); }
-uint8_t *be_cbz(Emit *e, int r) { cmp_imm0(e, hr(r)); return emit_bcc(e, AC_EQ, NULL); }
-uint8_t *be_cbnz(Emit *e, int r) { cmp_imm0(e, hr(r)); return emit_bcc(e, AC_NE, NULL); }
-uint8_t *be_cbz16(Emit *e, int r) { shift_imm(e, 1, LR, hr(r), 0, 16); return emit_bcc(e, AC_EQ, NULL); }
-uint8_t *be_cbnz16(Emit *e, int r) { shift_imm(e, 1, LR, hr(r), 0, 16); return emit_bcc(e, AC_NE, NULL); }
+B86_HOT uint8_t *be_jcc(Emit *e, int ac) { return emit_bcc(e, ac, NULL); }
+B86_HOT uint8_t *be_jmp(Emit *e) { return emit_b(e, NULL); }
+B86_HOT uint8_t *be_cbz(Emit *e, int r) { cmp_imm0(e, hr(r)); return emit_bcc(e, AC_EQ, NULL); }
+B86_HOT uint8_t *be_cbnz(Emit *e, int r) { cmp_imm0(e, hr(r)); return emit_bcc(e, AC_NE, NULL); }
+B86_HOT uint8_t *be_cbz16(Emit *e, int r) { shift_imm(e, 1, LR, hr(r), 0, 16); return emit_bcc(e, AC_EQ, NULL); }
+B86_HOT uint8_t *be_cbnz16(Emit *e, int r) { shift_imm(e, 1, LR, hr(r), 0, 16); return emit_bcc(e, AC_NE, NULL); }
 
-void be_exit_chain(Emit *e, uint16_t target_ip, int poll)
+B86_HOT void be_exit_chain(Emit *e, uint16_t target_ip, int poll)
 {
     uint8_t *irq = NULL;
     be_count(e, e->retire);
@@ -552,8 +566,8 @@ void be_exit_chain(Emit *e, uint16_t target_ip, int poll)
     }
 }
 
-void be_exit_ip_reg(Emit *e, int r) { be_count(e, e->retire); retire_mark(e, e->retire); mov(e, R12, hr(r)); emit_b(e, e->x_lookup); }
-void be_exit_ip_imm(Emit *e, uint16_t ip, int reason)
+B86_HOT void be_exit_ip_reg(Emit *e, int r) { be_count(e, e->retire); retire_mark(e, e->retire); mov(e, R12, hr(r)); emit_b(e, e->x_lookup); }
+B86_HOT void be_exit_ip_imm(Emit *e, uint16_t ip, int reason)
 {
     be_count(e, e->retire);
     retire_mark(e, e->retire);
@@ -561,11 +575,11 @@ void be_exit_ip_imm(Emit *e, uint16_t ip, int reason)
     movw(e, LR, (uint32_t)reason);
     emit_b(e, e->x_ipexit);
 }
-void be_exit_dyn(Emit *e) { be_count(e, e->retire); retire_mark(e, e->retire); emit_b(e, e->x_dynexit); }
+B86_HOT void be_exit_dyn(Emit *e) { be_count(e, e->retire); retire_mark(e, e->retire); emit_b(e, e->x_dynexit); }
 
 /* +0 MOVW lr,#ip  +4 CMP r12,lr  +8 BNE miss  +12 LDR lr,[irq]  +16 CMP lr,#0
    +20 BNE irq  +24 B hit */
-void be_ret_cache(Emit *e, uint8_t **site, uint8_t **bne, uint8_t **birq, uint8_t **bhit)
+B86_HOT void be_ret_cache(Emit *e, uint8_t **site, uint8_t **bne, uint8_t **birq, uint8_t **bhit)
 {
     be_count(e, e->retire);
     *site = e->p;
@@ -577,9 +591,9 @@ void be_ret_cache(Emit *e, uint8_t **site, uint8_t **bne, uint8_t **birq, uint8_
     *birq = emit_bcc(e, AC_NE, NULL);
     *bhit = emit_b(e, NULL);
 }
-uint8_t *be_ret_hit_branch(uint8_t *site) { return site + 24; }
-void be_exit_irq_ip(Emit *e) { retire_mark(e, e->retire); emit_b(e, e->x_irq); }
-void be_ret_fill(Emit *e, uint16_t ret_ip, uint8_t *site)
+B86_HOT uint8_t *be_ret_hit_branch(uint8_t *site) { return site + 24; }
+B86_HOT void be_exit_irq_ip(Emit *e) { retire_mark(e, e->retire); emit_b(e, e->x_irq); }
+B86_HOT void be_ret_fill(Emit *e, uint16_t ret_ip, uint8_t *site)
 {
     retire_mark(e, e->retire);
     movw(e, LR, ret_ip);
@@ -589,7 +603,7 @@ void be_ret_fill(Emit *e, uint16_t ret_ip, uint8_t *site)
 }
 
 /* plain layout: core, +28 hop: B lookup, +32 irqhop: B irq, +36 fill */
-void be_exit_ret(Emit *e, uint16_t ret_ip)
+B86_HOT void be_exit_ret(Emit *e, uint16_t ret_ip)
 {
     uint8_t *site, *bne, *birq, *b;
     retire_mark(e, e->retire);
@@ -602,7 +616,7 @@ void be_exit_ret(Emit *e, uint16_t ret_ip)
     be_ret_fill(e, ret_ip, site);
 }
 
-void be_patch_ret(uint8_t *site, uint16_t ip, uint8_t *target, uint8_t *miss)
+B86_HOT void be_patch_ret(uint8_t *site, uint16_t ip, uint8_t *target, uint8_t *miss)
 {
     uint32_t v = ip;
     uint32_t h1 = 0xF240u | (v >> 11 & 1) << 10 | (v >> 12), h2 = (v >> 8 & 7) << 12 | (uint32_t)LR << 8 | (v & 0xFF);
@@ -614,12 +628,12 @@ void be_patch_ret(uint8_t *site, uint16_t ip, uint8_t *target, uint8_t *miss)
 
 /* ---- helper calls ------------------------------------------------------------------------ */
 
-void be_call_step(Emit *e, uint16_t ip, uint16_t next)
+B86_HOT void be_call_step(Emit *e, uint16_t ip, uint16_t next)
 {
     be_call_helper(e, (void *)b86h_step, (uint32_t)ip | (uint32_t)next << 16);
 }
 
-void be_call_helper(Emit *e, void *fn, uint32_t arg)
+B86_HOT void be_call_helper(Emit *e, void *fn, uint32_t arg)
 {
     retire_mark(e, e->retire);
     emit_bl(e, e->x_step);
@@ -629,7 +643,7 @@ void be_call_helper(Emit *e, void *fn, uint32_t arg)
     put_word(e, (uint32_t)(uintptr_t)fn);
 }
 
-void be_call_cond(Emit *e, int cc)
+B86_HOT void be_call_cond(Emit *e, int cc)
 {
     put32(e, 0xE92Du, 0x000Fu);                                  /* PUSH {r0-r3} */
     mov(e, 0, R_CTX);
@@ -639,7 +653,7 @@ void be_call_cond(Emit *e, int cc)
     put32(e, 0xE8BDu, 0x000Fu);                                  /* POP {r0-r3} */
 }
 
-void be_call_flags(Emit *e)
+B86_HOT void be_call_flags(Emit *e)
 {
     put32(e, 0xE92Du, 0x000Fu);
     mov(e, 0, R_CTX);
@@ -647,7 +661,7 @@ void be_call_flags(Emit *e)
     put32(e, 0xE8BDu, 0x000Fu);
 }
 
-void be_finish_block(Emit *e)
+B86_HOT void be_finish_block(Emit *e)
 {
     for (int i = 0; i < e->nslow; ++i) {
         be_bind(e, e->slow[i].site, e->p);

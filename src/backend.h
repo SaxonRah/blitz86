@@ -89,6 +89,11 @@ void be_sbfx(Emit *e, int d, int s, unsigned lsb, unsigned w);
 void be_bfi(Emit *e, int d, int s, unsigned lsb, unsigned w);
 void be_sxtb(Emit *e, int d, int s);
 void be_mul(Emit *e, int d, int a, int b);                 /* 32-bit low product */
+void be_udiv(Emit *e, int d, int a, int b);                /* d = a / b (unsigned 32) */
+void be_mls(Emit *e, int d, int a, int b, int acc);        /* d = acc - a*b */
+/* Light C call fn(ctx, va, imm): guest registers preserved, no GPR sync
+   (fn must not touch guest registers). Clobbers V_T0, V_T1, NZCV. */
+void be_call_light(Emit *e, void *fn, int va, uint32_t imm);
 /* d = a <<|>>|>>> cnt (type 0 LSL, 1 LSR, 2 ASR) with 8086 unmasked-count
    semantics for values held zero/sign-extended in 32 bits; cnt bits 8+ are
    ignored. */
@@ -162,6 +167,8 @@ uint32_t b86h_step(B86Cpu *c, uint32_t ip_next, uint32_t blk); /* ip | next<<16 
 uint32_t b86h_cond(B86Cpu *c, uint32_t cc);
 void     b86h_flags(B86Cpu *c);
 uint32_t b86h_smc(B86Cpu *c, uint8_t *host, uint32_t lenflags, uint32_t blk); /* len | noexit<<8 */
+void     b86h_rot1(B86Cpu *c, uint32_t a_res, uint32_t kind);   /* CF/OF after ROL/ROR by 1 */
+void     b86h_mulflags(B86Cpu *c, uint32_t lo_hi, uint32_t kind); /* flags after MUL/IMUL */
 uint32_t b86h_rep(B86Cpu *c, uint32_t ip_next, uint32_t blk);    /* REP MOVS/STOS */
 
 #endif

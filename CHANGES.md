@@ -1,5 +1,50 @@
 # Changes
 
+## 2026-10-08 (h) — measurement release
+
+RP2350 result of (g): active 4.73 s (3.98 MIPS; interpreter 7.93 s, 2.37),
+native 4.48 s (translate 272 ms), sync 38 ms, XIP misses 10.2M.
+
+* `B86JitStats`: runtime C round trips by kind (`rt_step`, `rt_cond`,
+  `rt_flags`, `rt_light`, `rt_smc`, `rt_rep`) and `translate_misses`
+  (`-DB86_MISSES=fn`). On the DOS session: flags 934K, light 525K, step 50K,
+  cond 26K, smc 4K, rep 446.
+
+## 2026-10-08 (g) — helper executions on real DOS code: 2.54M -> 50K
+
+RP2350 result of (f): active 6.90 s (interpreter 7.93 s), native 6.46 s of
+which translate 285 ms, sync 259 ms. A histogram of interpreter-helper
+executions on the DOS2TEST+MDSTRESS session showed 2,544,569 round trips
+(ROL/ROR r16,1 1.18M; PUSHF/POPF/SAHF/LAHF ~263K each; MUL r16 with live
+flags 131K; DIV r16 132K), each also reading JIT state from PSRAM.
+
+* Native ROL/ROR r,1 (CF/OF through a light C call only when live).
+* Native PUSHF/POPF/SAHF/LAHF.
+* Native MUL/IMUL with live flags (light call for CF/OF/SF/ZF/PF).
+* Native DIV r/m16 via UDIV + MLS; divide-by-zero/overflow go to the
+  interpreter, which raises INT 0.
+* `be_udiv`, `be_mls`, `be_call_light` backend primitives.
+* JIT state `J` and a per-block dead map now in normal (SRAM) heap; only the
+  big tables use B86_CALLOC.
+* `-DB86_HELPER_HISTO`: per-opcode helper execution histogram.
+
+## 2026-10-08 (f) — first hardware DOS run follow-up
+
+RP2350 result of (e): DOS2TEST 25/25, MDSTRESS 0xA298, blitz86 retired
+18,845,294 of 18,873,065 instructions, but active time 9.56 s vs 7.93 s for
+the interpreter, with XIP/QMI misses up from 3.98M to 18.87M (1.0 per guest
+instruction). Causes and fixes:
+
+* Code-hook (`cpu->code_hook`) reports every translated byte range, so an
+  embedder can filter its own writes byte-exactly (blitzBUS feeds
+  microDOS's TRBYTES bitmaps). DOS-session page syncs 6,513 -> 399.
+* Dispatcher resolves re-entries from the SRAM fast table before touching
+  the (PSRAM) block map/table: about half of all dispatches.
+* `B86_HOT` / `-DB86_RAM_FUNCS=1`: all translator, dispatcher, helper and
+  interpreter code goes to `.time_critical.blitz86` (RAM on the Pico SDK)
+  instead of executing from flash through the XIP cache shared with PSRAM.
+* `B86JitStats.translate_us` / `fast_dispatches` (`-DB86_NOW=fn`).
+
 ## 2026-10-08 (e) — DOS owner mode support + compact Thumb-2
 
 blitz86 now runs MS-DOS 2.0 inside microDOS (blitzBUS live backend):

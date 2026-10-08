@@ -22,13 +22,13 @@ const uint8_t b86_parity[256] = {
 /* State helpers                                                            */
 /* ------------------------------------------------------------------------ */
 
-void b86_set_seg(B86Cpu *c, int s, uint16_t v)
+B86_HOT void b86_set_seg(B86Cpu *c, int s, uint16_t v)
 {
     c->seg[s] = v;
     c->segp[s] = c->mem + ((uint32_t)v << 4);
 }
 
-void b86_init(B86Cpu *c, uint8_t *mem)
+B86_HOT void b86_init(B86Cpu *c, uint8_t *mem)
 {
     memset(c, 0, sizeof *c);
     c->mem = mem;
@@ -38,7 +38,7 @@ void b86_init(B86Cpu *c, uint8_t *mem)
     for (int s = 0; s < 4; ++s) b86_set_seg(c, s, 0);
 }
 
-static uint32_t lazy_eval(uint32_t k, uint32_t a0, uint32_t r0, uint32_t b0, uint32_t f)
+B86_HOT static uint32_t lazy_eval(uint32_t k, uint32_t a0, uint32_t r0, uint32_t b0, uint32_t f)
 {
     int w16 = (k == LZ_ADD16 || k == LZ_SUB16 || k == LZ_LOG16 ||
                k == LZ_INC16 || k == LZ_DEC16 || k == LZ_SHL16 || k == LZ_SHR16 || k == LZ_SAR16 ||
@@ -86,7 +86,7 @@ static uint32_t lazy_eval(uint32_t k, uint32_t a0, uint32_t r0, uint32_t b0, uin
     return f;
 }
 
-void b86_flags_materialize(B86Cpu *c)
+B86_HOT void b86_flags_materialize(B86Cpu *c)
 {
     if (c->lz_kind != LZ_NONE) c->flags = lazy_eval(c->lz_kind, c->lz_a, c->lz_res, c->lz_b, c->flags);
     if (c->lz_ikind != LZ_NONE) c->flags = lazy_eval(c->lz_ikind, c->lz_ia, c->lz_ires, 0, c->flags);
@@ -94,13 +94,13 @@ void b86_flags_materialize(B86Cpu *c)
     c->lz_ikind = LZ_NONE;
 }
 
-uint16_t b86_get_flags(B86Cpu *c)
+B86_HOT uint16_t b86_get_flags(B86Cpu *c)
 {
     b86_flags_materialize(c);
     return (uint16_t)((c->flags & 0x0FD5u) | 0xF002u);
 }
 
-void b86_set_flags(B86Cpu *c, uint16_t f)
+B86_HOT void b86_set_flags(B86Cpu *c, uint16_t f)
 {
     c->lz_kind = LZ_NONE;
     c->lz_ikind = LZ_NONE;
@@ -111,33 +111,33 @@ void b86_set_flags(B86Cpu *c, uint16_t f)
 /* Memory                                                                   */
 /* ------------------------------------------------------------------------ */
 
-static inline uint32_t lin(const B86Cpu *c, int s, uint32_t off)
+B86_HOT static inline uint32_t lin(const B86Cpu *c, int s, uint32_t off)
 {
     return ((c->seg[s] << 4) + (off & 0xFFFFu)) & c->amask;
 }
 
-static inline void smc(B86Cpu *c, uint32_t a, uint32_t n)
+B86_HOT static inline void smc(B86Cpu *c, uint32_t a, uint32_t n)
 {
     if (c->codemap && (c->codemap[a >> B86_LINE_SHIFT] |
                        c->codemap[(a + n - 1) >> B86_LINE_SHIFT]) && c->smc_hook)
         c->smc_hook(c, a, n);
 }
 
-static inline uint8_t rd8(B86Cpu *c, int s, uint32_t off) { return c->mem[lin(c, s, off)]; }
-static inline void wr8(B86Cpu *c, int s, uint32_t off, uint8_t v)
+B86_HOT static inline uint8_t rd8(B86Cpu *c, int s, uint32_t off) { return c->mem[lin(c, s, off)]; }
+B86_HOT static inline void wr8(B86Cpu *c, int s, uint32_t off, uint8_t v)
 {
     uint32_t a = lin(c, s, off);
     c->mem[a] = v;
     smc(c, a, 1);
 }
-static inline uint16_t rd16(B86Cpu *c, int s, uint32_t off)
+B86_HOT static inline uint16_t rd16(B86Cpu *c, int s, uint32_t off)
 {
     if (c->exact_wrap)
         return (uint16_t)(rd8(c, s, off) | (rd8(c, s, off + 1) << 8));
     uint32_t a = lin(c, s, off);
     return (uint16_t)(c->mem[a] | (c->mem[a + 1] << 8));
 }
-static inline void wr16(B86Cpu *c, int s, uint32_t off, uint16_t v)
+B86_HOT static inline void wr16(B86Cpu *c, int s, uint32_t off, uint16_t v)
 {
     if (c->exact_wrap) { wr8(c, s, off, (uint8_t)v); wr8(c, s, off + 1, (uint8_t)(v >> 8)); return; }
     uint32_t a = lin(c, s, off);
@@ -161,10 +161,10 @@ typedef struct {
     uint16_t ea_off;
 } St;
 
-static inline uint8_t f8(St *s) { uint8_t v = rd8(s->c, B86_CS, s->ip); s->ip++; return v; }
-static inline uint16_t f16(St *s) { uint16_t lo = f8(s); return (uint16_t)(lo | (f8(s) << 8)); }
+B86_HOT static inline uint8_t f8(St *s) { uint8_t v = rd8(s->c, B86_CS, s->ip); s->ip++; return v; }
+B86_HOT static inline uint16_t f16(St *s) { uint16_t lo = f8(s); return (uint16_t)(lo | (f8(s) << 8)); }
 
-static void modrm(St *s)
+B86_HOT static void modrm(St *s)
 {
     uint8_t m = f8(s);
     s->mod = m >> 6; s->reg = (m >> 3) & 7; s->rm = m & 7;
@@ -192,37 +192,37 @@ static void modrm(St *s)
     s->ea_seg = s->seg >= 0 ? s->seg : dseg;
 }
 
-static inline uint8_t g8(B86Cpu *c, int r) { return (uint8_t)(r < 4 ? c->r[r] : c->r[r - 4] >> 8); }
-static inline void p8(B86Cpu *c, int r, uint8_t v)
+B86_HOT static inline uint8_t g8(B86Cpu *c, int r) { return (uint8_t)(r < 4 ? c->r[r] : c->r[r - 4] >> 8); }
+B86_HOT static inline void p8(B86Cpu *c, int r, uint8_t v)
 {
     if (r < 4) c->r[r] = (c->r[r] & 0xFF00u) | v;
     else c->r[r - 4] = (c->r[r - 4] & 0x00FFu) | ((uint32_t)v << 8);
 }
-static inline uint16_t g16(B86Cpu *c, int r) { return (uint16_t)c->r[r]; }
-static inline void p16(B86Cpu *c, int r, uint16_t v) { c->r[r] = v; }
+B86_HOT static inline uint16_t g16(B86Cpu *c, int r) { return (uint16_t)c->r[r]; }
+B86_HOT static inline void p16(B86Cpu *c, int r, uint16_t v) { c->r[r] = v; }
 
-static inline uint32_t rm_get(St *s, int w)
+B86_HOT static inline uint32_t rm_get(St *s, int w)
 {
     if (s->mod == 3) return w ? g16(s->c, s->rm) : g8(s->c, s->rm);
     return w ? rd16(s->c, s->ea_seg, s->ea_off) : rd8(s->c, s->ea_seg, s->ea_off);
 }
-static inline void rm_put(St *s, int w, uint32_t v)
+B86_HOT static inline void rm_put(St *s, int w, uint32_t v)
 {
     if (s->mod == 3) { if (w) p16(s->c, s->rm, (uint16_t)v); else p8(s->c, s->rm, (uint8_t)v); return; }
     if (w) wr16(s->c, s->ea_seg, s->ea_off, (uint16_t)v); else wr8(s->c, s->ea_seg, s->ea_off, (uint8_t)v);
 }
-static inline uint32_t reg_get(St *s, int w) { return w ? g16(s->c, s->reg) : g8(s->c, s->reg); }
-static inline void reg_put(St *s, int w, uint32_t v)
+B86_HOT static inline uint32_t reg_get(St *s, int w) { return w ? g16(s->c, s->reg) : g8(s->c, s->reg); }
+B86_HOT static inline void reg_put(St *s, int w, uint32_t v)
 {
     if (w) p16(s->c, s->reg, (uint16_t)v); else p8(s->c, s->reg, (uint8_t)v);
 }
 
-static inline void push(B86Cpu *c, uint16_t v)
+B86_HOT static inline void push(B86Cpu *c, uint16_t v)
 {
     c->r[B86_SP] = (uint16_t)(c->r[B86_SP] - 2);
     wr16(c, B86_SS, c->r[B86_SP], v);
 }
-static inline uint16_t pop(B86Cpu *c)
+B86_HOT static inline uint16_t pop(B86Cpu *c)
 {
     uint16_t v = rd16(c, B86_SS, c->r[B86_SP]);
     c->r[B86_SP] = (uint16_t)(c->r[B86_SP] + 2);
@@ -234,9 +234,9 @@ static inline uint16_t pop(B86Cpu *c)
 /* ------------------------------------------------------------------------ */
 
 #define FL (c->flags)
-static inline void setf(B86Cpu *c, uint32_t bit, int on) { if (on) FL |= bit; else FL &= ~bit; }
+B86_HOT static inline void setf(B86Cpu *c, uint32_t bit, int on) { if (on) FL |= bit; else FL &= ~bit; }
 
-static inline void szp(B86Cpu *c, int w, uint32_t r)
+B86_HOT static inline void szp(B86Cpu *c, int w, uint32_t r)
 {
     uint32_t m = w ? 0xFFFFu : 0xFFu;
     r &= m;
@@ -246,7 +246,7 @@ static inline void szp(B86Cpu *c, int w, uint32_t r)
     FL |= b86_parity[r & 0xFF];
 }
 
-static uint32_t add_f(B86Cpu *c, int w, uint32_t a, uint32_t b, uint32_t cin)
+B86_HOT static uint32_t add_f(B86Cpu *c, int w, uint32_t a, uint32_t b, uint32_t cin)
 {
     uint32_t m = w ? 0xFFFFu : 0xFFu, sb = w ? 0x8000u : 0x80u;
     uint32_t r = a + b + cin;
@@ -257,7 +257,7 @@ static uint32_t add_f(B86Cpu *c, int w, uint32_t a, uint32_t b, uint32_t cin)
     szp(c, w, r);
     return r;
 }
-static uint32_t sub_f(B86Cpu *c, int w, uint32_t a, uint32_t b, uint32_t cin)
+B86_HOT static uint32_t sub_f(B86Cpu *c, int w, uint32_t a, uint32_t b, uint32_t cin)
 {
     uint32_t m = w ? 0xFFFFu : 0xFFu, sb = w ? 0x8000u : 0x80u;
     uint32_t r = a - b - cin;
@@ -268,7 +268,7 @@ static uint32_t sub_f(B86Cpu *c, int w, uint32_t a, uint32_t b, uint32_t cin)
     szp(c, w, r);
     return r;
 }
-static uint32_t log_f(B86Cpu *c, int w, uint32_t r)
+B86_HOT static uint32_t log_f(B86Cpu *c, int w, uint32_t r)
 {
     FL &= ~(uint32_t)(B86_CF | B86_OF | B86_AF);
     szp(c, w, r);
@@ -277,7 +277,7 @@ static uint32_t log_f(B86Cpu *c, int w, uint32_t r)
 
 /* op: 0 ADD 1 OR 2 ADC 3 SBB 4 AND 5 SUB 6 XOR 7 CMP. Returns result; CMP
    result is not written by callers. */
-static uint32_t alu(B86Cpu *c, int op, int w, uint32_t a, uint32_t b)
+B86_HOT static uint32_t alu(B86Cpu *c, int op, int w, uint32_t a, uint32_t b)
 {
     switch (op) {
     case 0: return add_f(c, w, a, b, 0);
@@ -290,7 +290,7 @@ static uint32_t alu(B86Cpu *c, int op, int w, uint32_t a, uint32_t b)
     }
 }
 
-static uint32_t incdec(B86Cpu *c, int w, uint32_t a, int dec)
+B86_HOT static uint32_t incdec(B86Cpu *c, int w, uint32_t a, int dec)
 {
     uint32_t cf = FL & B86_CF;
     uint32_t r = dec ? sub_f(c, w, a, 1, 0) : add_f(c, w, a, 1, 0);
@@ -299,7 +299,7 @@ static uint32_t incdec(B86Cpu *c, int w, uint32_t a, int dec)
 }
 
 /* Shifts/rotates, 8086 semantics: count is not masked. */
-static uint32_t shift(B86Cpu *c, int op, int w, uint32_t v, unsigned n)
+B86_HOT static uint32_t shift(B86Cpu *c, int op, int w, uint32_t v, unsigned n)
 {
     uint32_t m = w ? 0xFFFFu : 0xFFu, sb = w ? 0x8000u : 0x80u;
     unsigned bits = w ? 16 : 8;
@@ -342,7 +342,7 @@ static uint32_t shift(B86Cpu *c, int op, int w, uint32_t v, unsigned n)
     return v;
 }
 
-static int cond(B86Cpu *c, int cc)
+B86_HOT static int cond(B86Cpu *c, int cc)
 {
     uint32_t f = FL;
     int r;
@@ -359,7 +359,7 @@ static int cond(B86Cpu *c, int cc)
     return (cc & 1) ? !r : r;
 }
 
-void b86_interrupt(B86Cpu *c, uint8_t v)
+B86_HOT void b86_interrupt(B86Cpu *c, uint8_t v)
 {
     b86_flags_materialize(c);
     if (c->int_hook && c->int_hook(c, v)) return;
@@ -376,7 +376,7 @@ void b86_interrupt(B86Cpu *c, uint8_t v)
 /* String instructions                                                      */
 /* ------------------------------------------------------------------------ */
 
-static void string_op(St *s, uint8_t op)
+B86_HOT static void string_op(St *s, uint8_t op)
 {
     B86Cpu *c = s->c;
     int w = op & 1;
@@ -428,7 +428,7 @@ static void string_op(St *s, uint8_t op)
 /* MUL / DIV                                                                */
 /* ------------------------------------------------------------------------ */
 
-static int group3(St *s, int w)
+B86_HOT static int group3(St *s, int w)
 {
     B86Cpu *c = s->c;
     uint32_t v = rm_get(s, w);
@@ -503,7 +503,7 @@ static int group3(St *s, int w)
 /* BCD                                                                      */
 /* ------------------------------------------------------------------------ */
 
-static void daa_das(B86Cpu *c, int sub)
+B86_HOT static void daa_das(B86Cpu *c, int sub)
 {
     uint8_t al = g8(c, 0), old = al;
     int oaf = (FL & B86_AF) != 0, ocf = (FL & B86_CF) != 0, af = 0, cf = 0;
@@ -514,7 +514,7 @@ static void daa_das(B86Cpu *c, int sub)
     szp(c, 0, al);
 }
 
-static void aaa_aas(B86Cpu *c, int sub)
+B86_HOT static void aaa_aas(B86Cpu *c, int sub)
 {
     uint8_t al = g8(c, 0), ah = g8(c, 4);
     if ((al & 0x0F) > 9 || (FL & B86_AF)) {
@@ -529,7 +529,7 @@ static void aaa_aas(B86Cpu *c, int sub)
 /* The step function                                                        */
 /* ------------------------------------------------------------------------ */
 
-int b86_step(B86Cpu *c)
+B86_HOT int b86_step(B86Cpu *c)
 {
     St st, *s = &st;
     b86_flags_materialize(c);
@@ -724,7 +724,7 @@ int b86_step(B86Cpu *c)
     return B86_OK;
 }
 
-int b86_run_interp(B86Cpu *c, uint64_t max)
+B86_HOT int b86_run_interp(B86Cpu *c, uint64_t max)
 {
     for (uint64_t i = 0; i < max; ++i) {
         int r = b86_step(c);

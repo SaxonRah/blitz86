@@ -14,6 +14,14 @@
 extern "C" {
 #endif
 
+/* Place blitz86 code in RAM where flash executes through a shared cache
+   (RP2350: the 16 KiB XIP cache also fronts PSRAM guest memory). */
+#if defined(B86_RAM_FUNCS) && B86_RAM_FUNCS
+#define B86_HOT __attribute__((section(".time_critical.blitz86")))
+#else
+#define B86_HOT
+#endif
+
 /* Guest memory: 1 MiB + the 64 KiB HMA (FFFF:0010..FFFF:FFFF) + slack so a
    word access at the very top never runs off the end. With A20 enabled
    (the JIT's model) seg*16+off is never wrapped, so every segment is a flat
@@ -57,6 +65,8 @@ typedef void    (*B86Out8)(struct B86Cpu *, uint16_t port, uint8_t v);
 /* Return nonzero if the host handled the software interrupt (HLE). */
 typedef int     (*B86IntHook)(struct B86Cpu *, uint8_t vector);
 typedef void    (*B86SmcHook)(struct B86Cpu *, uint32_t lin, uint32_t len);
+/* Called for every guest byte range a new translation depends on. */
+typedef void    (*B86CodeHook)(struct B86Cpu *, uint32_t lin, uint32_t len);
 
 typedef struct B86Cpu {
     /* --- hot block: generated code touches these ------------------------ */
@@ -95,6 +105,7 @@ typedef struct B86Cpu {
     B86Out8 out8;
     B86IntHook int_hook;
     B86SmcHook smc_hook;    /* called by the interpreter for stores to code */
+    B86CodeHook code_hook;  /* optional: translated ranges (embedder write filters) */
     void *user;
     struct B86Jit *jit;
 
@@ -119,6 +130,11 @@ typedef struct B86JitStats {
     uint64_t blocks, guest_insns, host_bytes, helper_insns;
     uint64_t chains, lookups, flushes, smc_hits, smc_invalidations;
     uint64_t dispatches;
+    uint64_t translate_us;  /* time in translation (needs -DB86_NOW=fn returning us) */
+    uint64_t fast_dispatches; /* dispatcher entries resolved by the SRAM fast table */
+    /* runtime C round trips from translated code */
+    uint64_t rt_step, rt_cond, rt_flags, rt_light, rt_smc, rt_rep;
+    uint64_t translate_misses;  /* cache misses while translating (needs -DB86_MISSES=fn) */
 } B86JitStats;
 
 /* Code buffer must be executable (and, on Pico, in SRAM). */
