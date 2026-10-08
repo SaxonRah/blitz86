@@ -2,3 +2,4 @@ build/
 sst/
 *.log
 /build-win
+/logs

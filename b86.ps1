@@ -73,14 +73,20 @@ function NativeBuild {
  Run 'CMake configure VS2022 x64' 'cmake.exe' @('-S',(Join-Path $Repo 'tools\windows'),'-B',$buildDir,'-G','Visual Studio 17 2022','-A','x64')
  Run 'MSVC x64 interpreter build' 'cmake.exe' @('--build',$buildDir,'--config','Release','--target','sst_interp','--parallel','4')
 }
-function Vectors([string]$which) {
+function EnsureVectors([string]$which) {
  $target=Join-Path $Repo ('sst\' + $which + '.bin')
- if (Test-Path $target) { return }
- throw "Missing $target. Run '.\b86.bat deps' once to download and convert 8086 vectors."
+ if ((Test-Path -LiteralPath $target) -and (Get-Item -LiteralPath $target).Length -gt 0) { return }
+ Log "Missing $target - preparing physical-8086 vectors automatically"
+ Need 'tools\sst_convert.py'
+ $py=PythonExe
+ Run 'fetch and convert silicon vectors' $py @((Join-Path $PSScriptRoot 'fetch_sst_win.py'),$Repo)
+ if (!(Test-Path -LiteralPath $target) -or (Get-Item -LiteralPath $target).Length -le 0) {
+  throw "Vector generation did not create $target"
+ }
 }
 function WindowsTest([string]$which) {
+ EnsureVectors $which
  NativeBuild
- Vectors $which
  Run "Windows physical-8086 vectors ($which)" (Join-Path $Repo 'build-win\Release\sst_interp.exe') @("sst\$which.bin")
 }
 function ArmBuild {
@@ -175,6 +181,8 @@ try {
   all {
    Doctor
    if(!$NoClean){foreach($f in @('build-win','build-arm-win')){Remove-Item -LiteralPath (Join-Path $Repo $f) -Recurse -Force -ErrorAction SilentlyContinue}}
+   EnsureVectors 'quick'
+   EnsureVectors 'all'
    NativeBuild; ArmBuild
    WindowsTest 'quick'
    WindowsTest 'all'

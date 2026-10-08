@@ -1,22 +1,17 @@
-# blitz86 Windows-native toolkit v5
+# blitz86 hardware runner v3 — serial re-enumeration
 
-This version replaces the broken nested `cmd.exe /c` MSVC command with the **same Visual Studio 2022 x64 CMake generator already used successfully by microDOS**.
-
-Extract the ZIP into `C:\blitz86_v2`, maintaining the `tools\windows\CMakeLists.txt` subdirectory. Replace all old toolkit files. Do not overwrite blitz86's repository-root Makefile.
+Full replacement `b86_hw.ps1` for `C:\blitz86_v2`. The existing sidecar and Pico firmware do not need to be reinstalled or rebuilt.
 
 ```powershell
 cd C:\blitz86_v2
-.\b86.bat doctor
-.\b86.bat deps
-.\b86.bat all
+Copy-Item "$HOME\Downloads\blitz86_hw_v3\b86_hw.ps1" .\b86_hw.ps1 -Force
+Unblock-File .\b86_hw.ps1
+.\b86_hw.ps1 doctor
+.\b86_hw.ps1 capture -Port COM5
 ```
 
-The build runs `cmake -S tools/windows -B build-win -G "Visual Studio 17 2022" -A x64`, then `cmake --build build-win --config Release --target sst_interp`.
-The actual executable is `build-win\Release\sst_interp.exe`.
-No calls to vcvars64.bat, cmd.exe /c quoting, WSL, Make, or QEMU are used to build the Windows interpreter.
+The `capture` action does NOT reflash. It searches Windows PnP devices and currently available COM ports for Raspberry Pi VID 2E8A, waits up to 40 seconds, and connects even if the device has been assigned a different COM port. It raises DTR/RTS and sends `R` to repeat the test. All output is saved in `C:\blitz86_v2\logs\latest.txt`. The `run` action still flashes and then captures; `run -NoFlash` only captures.
 
-Other actions: `build`, `quick`, `test`, `clean`, `arm-build`, `microdos`, `compare`, `capture`, `flash`. ARM compilation remains optional and requires separately installed Windows ARM toolchains. Firmware flashing requires an existing integrated UF2 and does not build one. ARM JIT execution is not possible within a native Windows x64 interpreter test.
+If capture fails with no ports, check `Get-PnpDevice -PresentOnly | Where-Object {$_.FriendlyName -match 'Pico|RP2350|Serial|USB'}` and Device Manager. It may be a real USB enumeration problem rather than a COM-number issue.
 
-Logs: `logs\latest.txt` and timestamped `logs\b86-*.log`.
-
-This package has NOT been executed with your Visual Studio installation. If your local blitz86_v2 source differs from the public repo or uses POSIX-only functionality, a source-level MSVC compatibility issue may be reported after the generator fix; the log will now include that compiler diagnostic.
+This runner has not been executed against Windows here.
