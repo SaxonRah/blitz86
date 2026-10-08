@@ -11,19 +11,19 @@ Loading into Flash:   [=                             ]  5%
 Loading into Flash:   [===                           ]  11%
 Loading into Flash:   [=====                         ]  17%
 Loading into Flash:   [======                        ]  23%
-Loading into Flash:   [========                      ]  29%
-Loading into Flash:   [==========                    ]  35%
-Loading into Flash:   [============                  ]  41%
+Loading into Flash:   [========                      ]  28%
+Loading into Flash:   [==========                    ]  34%
+Loading into Flash:   [============                  ]  40%
 Loading into Flash:   [=============                 ]  46%
-Loading into Flash:   [===============               ]  52%
-Loading into Flash:   [=================             ]  58%
-Loading into Flash:   [===================           ]  64%
-Loading into Flash:   [=====================         ]  70%
-Loading into Flash:   [======================        ]  76%
-Loading into Flash:   [========================      ]  82%
-Loading into Flash:   [==========================    ]  87%
-Loading into Flash:   [===========================   ]  93%
-Loading into Flash:   [============================= ]  99%
+Loading into Flash:   [===============               ]  51%
+Loading into Flash:   [=================             ]  57%
+Loading into Flash:   [==================            ]  63%
+Loading into Flash:   [====================          ]  69%
+Loading into Flash:   [======================        ]  74%
+Loading into Flash:   [========================      ]  80%
+Loading into Flash:   [=========================     ]  86%
+Loading into Flash:   [===========================   ]  92%
+Loading into Flash:   [============================= ]  97%
 Loading into Flash:   [==============================]  100%
 
 Verifying Flash:      [                              ]  0%
@@ -31,19 +31,19 @@ Verifying Flash:      [=                             ]  5%
 Verifying Flash:      [===                           ]  11%
 Verifying Flash:      [=====                         ]  17%
 Verifying Flash:      [======                        ]  23%
-Verifying Flash:      [========                      ]  29%
-Verifying Flash:      [==========                    ]  35%
-Verifying Flash:      [============                  ]  41%
+Verifying Flash:      [========                      ]  28%
+Verifying Flash:      [==========                    ]  34%
+Verifying Flash:      [============                  ]  40%
 Verifying Flash:      [=============                 ]  46%
-Verifying Flash:      [===============               ]  52%
-Verifying Flash:      [=================             ]  58%
-Verifying Flash:      [===================           ]  64%
-Verifying Flash:      [=====================         ]  70%
-Verifying Flash:      [======================        ]  76%
-Verifying Flash:      [========================      ]  82%
-Verifying Flash:      [==========================    ]  87%
-Verifying Flash:      [===========================   ]  93%
-Verifying Flash:      [============================= ]  99%
+Verifying Flash:      [===============               ]  51%
+Verifying Flash:      [=================             ]  57%
+Verifying Flash:      [==================            ]  63%
+Verifying Flash:      [====================          ]  69%
+Verifying Flash:      [======================        ]  74%
+Verifying Flash:      [========================      ]  80%
+Verifying Flash:      [=========================     ]  86%
+Verifying Flash:      [===========================   ]  92%
+Verifying Flash:      [============================= ]  97%
 Verifying Flash:      [==============================]  100%
 
   OK
@@ -53,9 +53,16 @@ PASS Flash blitz86 test firmware
 Serial scan: COM4 / Pico app CDC: 
 Serial scan: COM4,COM5 / Pico app CDC: COM5
 Capturing COM5 (timeout 90s, DTR enabled)
-[b86-jit] BEGIN Thumb-2 native entry
-[b86-jit] interp result=1 AX=6001 CX=0000 us=16321
-[b86-jit] native result=1 AX=6001 CX=0000 steps=24579 us=22494
+[b86-jit] BEGIN warm median comparison (cold + 7 measured)
+[bench] arch=pico workload=loop engine=blitz86-interp phase=cold result=PASS us=33069 retired=65538
+[bench] arch=pico workload=loop engine=blitz86-jit phase=cold result=PASS us=16965 retired_ref=65538 hash=8faa4fed blocks=2 chains=0 lookups=0
+[bench] arch=pico workload=loop engine=blitz86-jit phase=warm-median-7 result=PASS us=16413 retired_ref=65538 hash=8faa4fed blocks=2 chains=0 lookups=0
+[bench] arch=pico workload=regmix engine=blitz86-interp phase=cold result=PASS us=116946 retired=163845
+[bench] arch=pico workload=regmix engine=blitz86-jit phase=cold result=PASS us=18036 retired_ref=163845 hash=6aa6ee49 blocks=2 chains=0 lookups=0
+[bench] arch=pico workload=regmix engine=blitz86-jit phase=warm-median-7 result=PASS us=17396 retired_ref=163845 hash=6aa6ee49 blocks=2 chains=0 lookups=0
+[bench] arch=pico workload=callmix engine=blitz86-interp phase=cold result=PASS us=96925 retired=163843
+[bench] arch=pico workload=callmix engine=blitz86-jit phase=cold result=PASS us=49573 retired_ref=163843 hash=935c990b blocks=4 chains=0 lookups=0
+[bench] arch=pico workload=callmix engine=blitz86-jit phase=warm-median-7 result=PASS us=48860 retired_ref=163843 hash=935c990b blocks=4 chains=0 lookups=0
 [b86-jit] COMPLETE result=PASS
 [b86-jit] Native Thumb-2 probe verified PASS
 WORKFLOW PASS
