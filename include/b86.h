@@ -140,6 +140,10 @@ typedef struct B86JitStats {
     uint64_t smc_bucket_max_depth;    /* longest page traversal */
     uint64_t smc_bucket_compactions;  /* traversals that unlinked entries */
     uint64_t smc_bucket_unlinks;      /* dead and newly invalidated entries */
+    uint64_t joins;             /* superblocks ended at already-translated code */
+    uint64_t inner_branches;    /* forward Jcc lowered as in-block branches */
+    uint64_t splits;            /* blocks killed so a new entry inside them joins */
+    uint64_t cold_runs, cold_insns;   /* interpreted before an entry became hot */
 } B86JitStats;
 
 /* Code buffer must be executable (and, on Pico, in SRAM). */
@@ -179,6 +183,12 @@ void     b86_jit_set_single_step(struct B86Jit *j, int on);
 void     b86_jit_set_no_fast(struct B86Jit *j, int on);
 void     b86_jit_set_no_chain(struct B86Jit *j, int on);   /* testing */
 void     b86_jit_set_no_spec(struct B86Jit *j, int on);    /* testing */
+void     b86_jit_set_no_join(struct B86Jit *j, int on);    /* testing: no superblock joins */
+/* Translate an entry point only after it has been dispatched n times within
+   a decay window (n <= 255; 0 = translate at once, the default). Until then
+   the dispatcher interprets it. Keeps rarely-run code out of a small code
+   buffer (RP2350). */
+void     b86_jit_set_hot_threshold(struct B86Jit *j, unsigned n);
 /* Testing: exits record cpu->retired (takes effect after a flush). */
 void     b86_jit_set_count_exits(struct B86Jit *j, int on);
 

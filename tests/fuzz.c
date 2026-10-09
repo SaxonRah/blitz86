@@ -377,6 +377,8 @@ int main(int argc, char **argv)
         b86_jit_set_no_chain(j, getenv("FUZZ_NOCHAIN") != NULL);
         b86_jit_set_count_retired(j, 1);
         b86_jit_set_no_spec(j, getenv("FUZZ_NOSPEC") != NULL);
+        b86_jit_set_no_join(j, getenv("FUZZ_NOJOIN") != NULL);
+        if (getenv("FUZZ_HOT")) b86_jit_set_hot_threshold(j, (unsigned)atoi(getenv("FUZZ_HOT")));
         if (getenv("FUZZ_NOFAST")) b86_jit_set_no_fast(j, 1);
         if (getenv("FUZZ_TRACE")) {
             /* lockstep: one JIT block, then interpreter up to the same CS:IP */
@@ -466,5 +468,6 @@ int main(int argc, char **argv)
            (unsigned long long)s->blocks, (unsigned long long)s->guest_insns, (unsigned long long)s->helper_insns,
            (unsigned long long)s->chains, (unsigned long long)s->smc_hits, (unsigned long long)s->smc_invalidations,
            s->guest_insns ? (double)s->host_bytes / (double)s->guest_insns : 0.0);
+    printf("jit: joins %llu  in-block branches %llu  splits %llu\n", (unsigned long long)s->joins, (unsigned long long)s->inner_branches, (unsigned long long)s->splits);
     return bad != 0;
 }

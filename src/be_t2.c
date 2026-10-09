@@ -393,6 +393,7 @@ B86_HOT void be_get_carry(Emit *e, int d, int ac)
 }
 
 B86_HOT void be_udiv(Emit *e, int d, int a, int b) { put32(e, 0xFBB0u | (uint32_t)hr(a), 0xF0F0u | (uint32_t)hr(d) << 8 | (uint32_t)hr(b)); }
+B86_HOT void be_sdiv(Emit *e, int d, int a, int b) { put32(e, 0xFB90u | (uint32_t)hr(a), 0xF0F0u | (uint32_t)hr(d) << 8 | (uint32_t)hr(b)); }
 B86_HOT void be_mls(Emit *e, int d, int a, int b, int acc) { put32(e, 0xFB00u | (uint32_t)hr(a), (uint32_t)hr(acc) << 12 | (uint32_t)hr(d) << 8 | 0x10u | (uint32_t)hr(b)); }
 B86_HOT void be_call_light(Emit *e, void *fn, int va, uint32_t imm)
 {
@@ -453,6 +454,7 @@ B86_HOT int be_neg_sh(Emit *e, int x, int d, int a, int sh)
 }
 
 B86_HOT void be_test_nz(Emit *e, int x, int r, int sh) { shift_imm(e, 1, hr(x), hr(r), 0, (unsigned)sh); }   /* LSLS */
+B86_HOT void be_carry_from_bit(Emit *e, int x, int r, unsigned bit) { shift_imm(e, 1, hr(x), hr(r), 1, bit + 1u); }   /* LSRS: C = last bit out */
 
 B86_HOT int be_test_res(Emit *e, int x, int r, int sh)
 {

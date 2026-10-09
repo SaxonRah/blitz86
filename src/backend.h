@@ -90,6 +90,7 @@ void be_bfi(Emit *e, int d, int s, unsigned lsb, unsigned w);
 void be_sxtb(Emit *e, int d, int s);
 void be_mul(Emit *e, int d, int a, int b);                 /* 32-bit low product */
 void be_udiv(Emit *e, int d, int a, int b);                /* d = a / b (unsigned 32) */
+void be_sdiv(Emit *e, int d, int a, int b);                /* d = a / b (signed 32, toward 0) */
 void be_mls(Emit *e, int d, int a, int b, int acc);        /* d = acc - a*b */
 /* Light C call fn(ctx, va, imm): guest registers preserved, no GPR sync
    (fn must not touch guest registers). Clobbers V_T0, V_T1, NZCV. */
@@ -109,6 +110,7 @@ int  be_test_res(Emit *e, int x, int r, int sh);    /* flags of a logic result *
 void be_test_nz(Emit *e, int x, int r, int sh);     /* N,Z only (C,V garbage); may write x */
 int  be_imm_ok_sh(uint32_t imm, int sh);            /* encodable without tmp   */
 void be_get_carry(Emit *e, int d, int ac);          /* d = (cond ac holds) ? 1 : 0 */
+void be_carry_from_bit(Emit *e, int x, int r, unsigned bit); /* host C = bit `bit` of r (FM_ADD sense); NZV garbage; may write x */
 
 /* Guest memory. EA = segbase + (uint16)(b1 + b2 + disp); b1/b2 may be -1. */
 void be_ea(Emit *e, int d, int seg, int b1, int b2, int32_t disp);

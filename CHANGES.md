@@ -1,5 +1,54 @@
 # Changes
 
+## 2026-10-09 (i) — 3DBENCH: code-cache thrash and interpreter fallbacks
+
+Host reproduction of 3DBENCH 1.0 (blitzBUS bb_live + bb_vga, Thumb-2 under
+qemu, Pico table sizes, 192 KiB code buffer): 20-100 full flushes per 10M
+guest instructions. The benchmark touches only ~5,500 distinct instructions,
+but each cache generation held ~6,900 translated instructions of which only
+~4,000 were distinct, at ~27 bytes of Thumb-2 each; with an unlimited buffer
+the whole program is 2,233 blocks and never flushes. About 8% of benchmark
+instructions also went through the interpreter helper (RCL r16,1 2.8M,
+CMP [mem],r8hi 1.0M, RCR r8,1 1.0M, IDIV, XCHG r8).
+
+Code cache:
+* **Superblock joins**: decoding stops (and chains) at another block's entry
+  or where it re-enters already-translated code (bitmaps `cov`/`ent`, one bit
+  per guest byte, B86_CALLOC; cleared per block at flush).
+* **In-block forward branches**: a forward Jcc whose target is later in the
+  same superblock branches there directly when every skipped instruction is
+  plain native code with no flag definition, NZCV clobber or C call; the
+  fall-through path settles the retired count at the join.
+* **Splits**: a new entry inside a live block kills that block so its
+  retranslation joins there instead of keeping a second copy of the tail.
+* **Tiering** (`b86_jit_set_hot_threshold`, default 0 = off): an entry point
+  is interpreted until it has been dispatched N times in the current cache
+  generation (decayed 4096-slot heat table, reset at flush). blitzBUS uses
+  128. 3DBENCH, 250M insns: flushes 959 -> 6, translate 17.5 s -> 0.22 s,
+  total qemu time 114 s -> 14 s; ~4% of instructions run interpreted
+  (mostly DOS and one-time setup).
+
+Native lowerings:
+* RCL/RCR r,1 (AX..DI, AL..BL): carry-in from NZCV when fused (SHL/RCL
+  chains), NZCV out for fused consumers (RCL: CF/OF, RCR: CF), CF/OF into
+  ctx flags only when needed past them. `be_carry_from_bit` backend
+  primitive; fused carry consumers keep their condition in `cmode`
+  (fuzz seed 103 on AArch64 caught `mode` being overwritten when the
+  consumer is itself a producer).
+* CMP/TEST [mem],AH..BH on Thumb-2 (two scratches): the address register is
+  released at the load; CMP feeding NZCV and a record works in place.
+* IDIV r/m16 via SDIV + MLS (zero divisor / overflow -> interpreter INT 0).
+* XCHG r8,r8. `be_sdiv` backend primitive.
+
+Stats: `joins`, `inner_branches`, `splits`, `cold_runs`, `cold_insns`.
+Test knobs: `b86_jit_set_no_join`, fuzz `FUZZ_NOJOIN`, `FUZZ_HOT=n`.
+Debug: `-DB86_COND_HISTO` records the guest site of every cond/flags C call
+(`b86_cond_ip`, `b86_flags_ip`); `-DB86_HELPER_HISTO` adds `b86_helper_ip`.
+
+Verified (qemu): silicon 585,933/585,933 on both backends; fuzz 0 mismatches
+on both backends incl. tiering and NOSPEC; blitzBUS DOS2TEST 25/25 + MDSTRESS
+0xA298 on both ISAs with tiering on and off.
+
 ## 2026-10-08 (h) — measurement release
 
 RP2350 result of (g): active 4.73 s (3.98 MIPS; interpreter 7.93 s, 2.37),
