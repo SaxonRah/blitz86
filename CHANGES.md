@@ -1,5 +1,100 @@
 # Changes
 
+## 2026-10-09 (n) — translator out of SRAM
+
+* B86_COLD: the translator (analysis, lowering, emit, translate) and the
+  whole Thumb-2 emitter now stay in flash; only the dispatcher, helpers,
+  cold-run decode/interpreter and the code-patching entry points (B86_RT)
+  remain in .time_critical. RAM code: jit.c ~32 KiB -> ~8 KiB, be_t2.c
+  18 KiB -> 0.4 KiB. B86_COLD_RAM=1 restores the old placement.
+* Translator scratch (two Insn[128], 14 KiB of .bss) now comes from
+  B86_CALLOC (blitzBUS: PSRAM arena).
+* b86_map_range failure codes: -2 frame index collides with guest lines,
+  -3 translated code in the range (-1 otherwise).
+
+## 2026-10-09 (m1) — frames may overlap the page-table index range
+
+blitzBUS v44 moved its A000 frame below 0x20020000 (link order changed),
+whose SMC-table index fell in the page-table range [0, 2 KiB) and
+b86_map_range refused it ("A000 window NOT mapped"). That overlap only
+costs a guarded slow-path call on stores to the few lines whose page-table
+byte is nonzero, so it is allowed now; only overlap with guest lines (hot
+code) is refused.
+
+## 2026-10-09 (m) — cheaper paged accesses
+
+v40-v42 on the Pico: paged code was ~25% bigger (33.6 host bytes per guest
+insn vs ~27), the warm part of 3DBENCH no longer fit the code buffer and
+10-15% of instructions ran interpreted in the slow phases (15.1 fps vs 18.8).
+
+* Stack (SS) accesses are not page-translated; SS is cached in r11 again.
+  Embedder rule: never map pages inside the current SS window.
+* Page table now lives in the first 2 KiB of the 32 Ki SMC line table and is
+  reached through r9 (`cpu->pt` points there once the JIT exists;
+  `pt_store` before). Requires the guest buffer's line index >= 0x800
+  (blitzBUS: 0x2800). b86_map_range refuses frames whose SMC-table index
+  range would hit the page table or the guest lines.
+* Translation add is a 16-bit ADD.
+* Host 3DBENCH: 29.9 bytes per guest insn (was 33.6).
+* Tests: paged harnesses place guest memory like the Pico (2 MiB + 640 KiB);
+  FUZZ_MAP maps 0x30000-0x4FFFF (DS/ES, not the stack). Silicon quick set
+  passes; fuzz mismatches only at mapped-range edges (known limit).
+
+## 2026-10-09 (l1) — flushes keep hot entries hot
+
+v40 on the Pico: frame-buffer misses fell ~8x but the score fell (18.8 ->
+12.8): the paged code is larger, the code buffer smaller (160 KiB), so
+flushes rose to ~4 per 8 s, and each flush zeroed the tiering heat, so the
+whole hot set was re-interpreted 128 times per entry (cold-insns 2.6M per
+interval, ~half the time). Now a flush keeps entries that had reached the
+threshold at the threshold (translated on their first dispatch) and only
+resets the rest.
+
+## 2026-10-09 (l) — paged guest memory (-DB86_PAGED, Thumb-2)
+
+* Every guest access goes through `cpu->pt[512]`: host = nominal + delta of
+  the nominal 4 KiB page. Generated code: UBFX/LDR/ADD after each EA (r11 =
+  table; SS is no longer cached in a register). `b86_map_range` /
+  `b86_unmap_range` move page ranges to another buffer (SRAM) and back;
+  `b86_host()` translates for C users. Interpreter, decoder and REP helper
+  (page-sized chunks) honour it. `cpu->rep_page_bytes[]` counts REP store
+  bytes per page for the embedder's choice of pages.
+* SMC line map indexed by UBFX(addr, 6, 15) in a 32 Ki table (hot bytes =
+  fast table + 32 KiB); guest buffer must be 4 KiB aligned with
+  ((mem >> 6) & 0x7FFF) + lines <= 0x8000. Stores into mapped frames hit
+  zero entries when the buffer sits away from SRAM's index range;
+  b86h_smc ignores addresses outside the guest buffer.
+* Code in mapped pages is always interpreted; mapping refuses pages that
+  hold translated code.
+* Known limit (kept): a 16-bit access straddling a mapped range's first or
+  last byte is not exact (frames need one guard byte).
+* Tests: `make paged` builds sst_jit_t2p / fuzz_t2p; `FUZZ_MAP=1` runs each
+  program with 256 KiB of its data segments mapped (interpreter reference
+  mapped too). Silicon quick set passes; fuzz mismatches seen only at
+  range edges (the known limit).
+
+## 2026-10-09 (k1) — wide STOSW now opt-in
+
+(k) froze 3DBENCH on the Pico after the splash screen (host runs were
+fine). Until that is bisected, the 32-bit STOSW fill is built only with
+`-DB86_REP_WIDE`; the default is the (j) byte-pair loop again.
+
+## 2026-10-09 (k) — wide REP STOSW, memory-traffic instrumentation
+
+* REP STOSW fast path fills with 32-bit stores (was two byte stores per
+  word): a quarter of the bus/cache accesses for 3DBENCH's back-buffer
+  clears and span fills.
+* `-DB86_MEMTRACE` calls `b86_memtrace(linear, write)` for every interpreter
+  data access (not instruction fetches); blitzBUS uses it with an XIP cache
+  model to attribute misses to guest memory regions.
+* `-DB86_COND_HISTO` also counts REP bytes by kind and ES segment.
+
+Finding (3DBENCH, 50M benchmark instructions through a 16 KiB / 2-way /
+8-byte-line cache model): 91% of guest-data misses are frame buffers -
+62% the back buffer at 222D:0000 (clears, spans, copy source) and 29% the
+copy into A000 - against 3% stack, 5% data segment. The next step is
+SRAM-backed guest pages for those buffers (see blitzBUS README).
+
 ## 2026-10-09 (j) — fewer C round trips and dispatcher detours
 
 3DBENCH host profile (Thumb-2/qemu, blitzBUS v37 IRQs): per 10M benchmark

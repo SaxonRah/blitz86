@@ -41,14 +41,25 @@
 #ifdef B86_COND_HISTO      /* debug: record the guest site of each cond/flags call */
 #define DBG_SITE(t, d) be_stctx_imm((t)->e, ((t)->cs << 4) + (d)->ip, OFF(retired))
 uint32_t b86_cond_ip[1 << 20], b86_flags_ip[1 << 20], b86_disp_ip[1 << 20], b86_xr[8];
+uint64_t b86_rep_bytes[4]; uint32_t b86_rep_es[65536]; uint32_t b86_cold_ip[1 << 20];
 #else
 #define DBG_SITE(t, d) ((void)0)
 #endif
 #define BIT_GET(m, a) (((m)[(a) >> 3] >> ((a) & 7u)) & 1u)
 #define BIT_SET(m, a) ((m)[(a) >> 3] |= (uint8_t)(1u << ((a) & 7u)))
 #define COVN ((B86_MEM_BYTES + 7u) >> 3)
-#define HEATN 4096u                     /* tiering: cold entry counters */
+/* Paged Thumb-2 indexes the SMC line map with UBFX(addr, 6, 15): a 32 Ki
+   table where guest lines start at ((mem >> 6) & 0x7FFF). Addresses outside
+   the guest buffer (mapped SRAM frames) land elsewhere in the table, which
+   stays zero if the embedder places the buffer so they cannot collide. */
+#define CM_PAGED 32768u
+#ifndef HEAT_BITS
+#define HEAT_BITS 12                    /* tiering: 2^n cold entry counters */
+#endif
+#define HEATN (1u << HEAT_BITS)
+#ifndef HEAT_DECAY
 #define HEAT_DECAY 32768u               /* cold dispatches between halvings */
+#endif
 
 /* Metadata allocator. The block table, block map, SMC buckets and RET
    metadata are only touched by the dispatcher, so an embedder can place them
@@ -105,6 +116,8 @@ typedef struct B86Jit {
     int single_step;            /* testing: never enter a block from the fast table */
     int no_chain;               /* testing: never patch chain exits */
     int hot_external;           /* fast/codemap supplied by the caller */
+    uint8_t *cm_table;          /* codemap allocation (paged: 32 Ki entries)   */
+    void *tv, *tw;              /* translator scratch (Insn[128] each, B86_CALLOC) */
     int no_spec;                /* testing: no RET-specialized continuations */
     int no_join;                /* testing: superblocks never stop at translated code */
     int split_mid;              /* experiment: kill blocks covering a new mid entry */
@@ -178,7 +191,7 @@ static const uint8_t modrm_tab[256] = {
 
 B86_HOT static inline uint8_t fb(B86Cpu *c, uint32_t cs, uint32_t ip)
 {
-    return c->mem[(cs << 4) + (ip & 0xFFFFu)];
+    return *b86_host(c, (cs << 4) + (ip & 0xFFFFu));
 }
 
 /* immediate bytes following modrm/opcode (8086 map) */
@@ -363,7 +376,7 @@ B86_HOT static void classify(Insn *d)
 /* Flag liveness                                                            */
 /* ------------------------------------------------------------------------ */
 
-B86_HOT static int ends_block(const Insn *d)
+B86_COLD static int ends_block(const Insn *d)
 {
     return d->cls == C_JMP || d->cls == C_CALL || d->cls == C_RET ||
            d->cls == C_IND || d->cls == C_END || d->cls == C_HLT;
@@ -383,7 +396,7 @@ typedef struct Guard { uint32_t lo, hi; uint32_t xlo[2], xhi[2]; int nx; } Guard
 
 /* Add [lo,hi) to the guard: merge into a range if the result stays within
    one SMC page span, else open an extra range (at most two). */
-B86_HOT static int guard_add(Guard *g, uint32_t lo, uint32_t hi)
+B86_COLD static int guard_add(Guard *g, uint32_t lo, uint32_t hi)
 {
     uint32_t nlo = lo < g->lo ? lo : g->lo, nhi = hi > g->hi ? hi : g->hi;
     if (nhi - nlo <= 512u) { g->lo = nlo; g->hi = nhi; return 1; }
@@ -398,11 +411,11 @@ B86_HOT static int guard_add(Guard *g, uint32_t lo, uint32_t hi)
 /* Flags live on entry to `ip`. Scans forward (following direct JMP and
    CALL) until every flag is defined. Scanned bytes join the block's guard
    so that modifying them invalidates the block. */
-B86_HOT static uint16_t lookahead_d(J *j, uint32_t cs, uint16_t ip, Guard *g, int depth);
-B86_HOT static uint16_t lookahead(J *j, uint32_t cs, uint16_t ip, Guard *g) { return lookahead_d(j, cs, ip, g, 1); }
+B86_COLD static uint16_t lookahead_d(J *j, uint32_t cs, uint16_t ip, Guard *g, int depth);
+B86_COLD static uint16_t lookahead(J *j, uint32_t cs, uint16_t ip, Guard *g) { return lookahead_d(j, cs, ip, g, 1); }
 /* depth > 0: a conditional branch (Jcc/LOOP/JCXZ) does not end the scan;
    its taken edge is scanned recursively and the fall-through continues. */
-B86_HOT static uint16_t lookahead_d(J *j, uint32_t cs, uint16_t ip, Guard *g, int depth)
+B86_COLD static uint16_t lookahead_d(J *j, uint32_t cs, uint16_t ip, Guard *g, int depth)
 {
     if (j->no_lookahead) return ALLF;
     uint16_t need = 0, defd = 0, res = ALLF;
@@ -438,16 +451,16 @@ B86_HOT static uint16_t lookahead_d(J *j, uint32_t cs, uint16_t ip, Guard *g, in
     return res;
 }
 
-B86_HOT static uint16_t live_before(const Insn *d)
+B86_COLD static uint16_t live_before(const Insn *d)
 {
     uint16_t after = d->live | (d->cls == C_JCC ? d->live_taken : 0);
     return (uint16_t)((after & ~d->fdef) | d->fuse);
 }
 
-B86_HOT static int is_rcx(const Insn *d);
+B86_COLD static int is_rcx(const Insn *d);
 /* NZCV interpretation produced by a producer insn, and which x86 flags it
    represents. Returns 0 if the producer cannot feed NZCV. */
-B86_HOT static int producer_class(const Insn *d, uint8_t *valid)
+B86_COLD static int producer_class(const Insn *d, uint8_t *valid)
 {
     if (d->virt) return 0;
     uint8_t op = d->op;
@@ -473,14 +486,14 @@ B86_HOT static int producer_class(const Insn *d, uint8_t *valid)
     }
 }
 
-B86_HOT static uint8_t flagbits(uint16_t f)
+B86_COLD static uint8_t flagbits(uint16_t f)
 {
     return (uint8_t)(((f & B86_OF) ? 1 : 0) | ((f & B86_SF) ? 2 : 0) |
                      ((f & B86_ZF) ? 4 : 0) | ((f & B86_CF) ? 8 : 0) |
                      ((f & (B86_PF | B86_AF)) ? 0x80 : 0));
 }
 
-B86_HOT static int arm_cond(int mode, int cc)
+B86_COLD static int arm_cond(int mode, int cc)
 {
     static const signed char sub_t[16] = { AC_VS, AC_VC, AC_CC, AC_CS, AC_EQ, AC_NE, AC_LS, AC_HI,
                                            AC_MI, AC_PL, -1, -1, AC_LT, AC_GE, AC_LE, AC_GT };
@@ -489,7 +502,7 @@ B86_HOT static int arm_cond(int mode, int cc)
     return mode == FM_SUB ? sub_t[cc] : mode == FM_ADD ? add_t[cc] : -1;
 }
 
-B86_HOT static int is_mem_dst_producer(const Insn *d)
+B86_COLD static int is_mem_dst_producer(const Insn *d)
 {
     uint8_t op = d->op;
     if (!d->has_modrm || d->mod == 3) return 0;
@@ -502,7 +515,7 @@ B86_HOT static int is_mem_dst_producer(const Insn *d)
 }
 
 /* native lowering performs a checked guest store */
-B86_HOT static int checked_store(const Insn *d)
+B86_COLD static int checked_store(const Insn *d)
 {
     uint8_t op = d->op;
     if (op == 0xA2 || op == 0xA3) return 1;
@@ -519,13 +532,13 @@ B86_HOT static int checked_store(const Insn *d)
     return 0;
 }
 
-B86_HOT static int is_jcc(const Insn *d) { return d->op >= 0x60 && d->op <= 0x7F && d->native; }
+B86_COLD static int is_jcc(const Insn *d) { return d->op >= 0x60 && d->op <= 0x7F && d->native; }
 /* RCL/RCR r,1: native carry consumers (carry-in from NZCV when fused) */
-B86_HOT static int is_rcx(const Insn *d)
+B86_COLD static int is_rcx(const Insn *d)
 {
     return d->native && (d->op == 0xD0 || d->op == 0xD1) && (d->reg == 2 || d->reg == 3) && d->mod == 3;
 }
-B86_HOT static int is_carry_alu(const Insn *d)
+B86_COLD static int is_carry_alu(const Insn *d)
 {
     if (!d->native) return 0;
     if (d->op < 0x40 && (d->op & 7) < 6) return (d->op >> 3) == 2 || (d->op >> 3) == 3;
@@ -533,7 +546,7 @@ B86_HOT static int is_carry_alu(const Insn *d)
     return 0;
 }
 
-B86_HOT static uint16_t live_after(const Insn *d)
+B86_COLD static uint16_t live_after(const Insn *d)
 {
     return (uint16_t)(d->live | (d->cls == C_JCC ? d->live_taken : 0));
 }
@@ -541,7 +554,7 @@ B86_HOT static uint16_t live_after(const Insn *d)
 /* Can instruction m (between a producer and its consumer) destroy NZCV?
    Conservative: any native producer whose flags are live may itself
    become an NZCV producer. */
-B86_HOT static int nz_clobber(const Insn *m)
+B86_COLD static int nz_clobber(const Insn *m)
 {
     if (!m->native || m->nzclob) return 1;
     if (be_store_clobbers_nzcv && checked_store(m)) return 1;
@@ -552,8 +565,8 @@ B86_HOT static int nz_clobber(const Insn *m)
 
 
 /* Guest GPRs an instruction may write (bit per 16-bit register). */
-B86_HOT static uint8_t r8bit(int r) { return (uint8_t)(1u << (r & 3)); }
-B86_HOT static uint8_t wmask(const Insn *d)
+B86_COLD static uint8_t r8bit(int r) { return (uint8_t)(1u << (r & 3)); }
+B86_COLD static uint8_t wmask(const Insn *d)
 {
     uint8_t op = d->op;
     int m3 = d->has_modrm && d->mod == 3;
@@ -610,7 +623,7 @@ B86_HOT static uint8_t wmask(const Insn *d)
 
 /* A producer whose lazy record can be rebuilt from registers at an exit. */
 typedef struct DeferInfo { int kind, w, ra, rb, writes, overlay; uint32_t imm; } DeferInfo;
-B86_HOT static int defer_info(const Insn *d, DeferInfo *o)
+B86_COLD static int defer_info(const Insn *d, DeferInfo *o)
 {
     uint8_t op = d->op;
     int xop = -1, w = op & 1, ra = -1, rb = -1, imm_src = 0, incdec = 0;
@@ -659,7 +672,7 @@ B86_HOT static int defer_info(const Insn *d, DeferInfo *o)
     o->ra = o->ra; (void)logic;
     return 1;
 }
-B86_HOT static uint8_t defer_regs(const DeferInfo *o)
+B86_COLD static uint8_t defer_regs(const DeferInfo *o)
 {
     return (uint8_t)((1u << o->ra) | (o->rb >= 0 ? (1u << o->rb) : 0u));
 }
@@ -667,7 +680,7 @@ B86_HOT static uint8_t defer_regs(const DeferInfo *o)
 /* Lowerings that call into C and fold the lazy records into the flags
    word (clearing the INC/DEC overlay). A full record rebuilt at a later exit
    would override flags defined after it, so no deferral across these. */
-B86_HOT static int materializes(const Insn *d)
+B86_COLD static int materializes(const Insn *d)
 {
     uint8_t op = d->op;
     if (!d->native) return 1;
@@ -682,7 +695,7 @@ B86_HOT static int materializes(const Insn *d)
 }
 
 /* CALL's push uses check mode 2 (no exit), so it is not an exit point. */
-B86_HOT static int smc_exit_store(const Insn *d)
+B86_COLD static int smc_exit_store(const Insn *d)
 {
     if (d->op == 0xE8 || (d->op == 0xFF && d->reg == 2)) return 0;
     return 1;
@@ -695,8 +708,8 @@ B86_HOT static int smc_exit_store(const Insn *d)
    helper, no C call): then flag state, pending records and deferred-record
    registers are identical on both paths, and the only difference is the
    retired count, which the fall-through path settles at the join. */
-B86_HOT static int checked_store(const Insn *d);
-B86_HOT static int simple_between(const Insn *x)
+B86_COLD static int checked_store(const Insn *d);
+B86_COLD static int simple_between(const Insn *x)
 {
     if (x->cls != C_SEQ || !x->native || x->fdef || x->virt || x->rep) return 0;
     if (!x->nzclob) return 1;
@@ -706,7 +719,7 @@ B86_HOT static int simple_between(const Insn *x)
     return checked_store(x) && x->has_modrm && x->mod != 3 &&
            (x->op == 0x88 || x->op == 0x89 || x->op == 0xC6 || x->op == 0xC7 || x->op == 0x8C);
 }
-B86_HOT static void plan_joins(Insn *v, int npre, int n)
+B86_COLD static void plan_joins(Insn *v, int npre, int n)
 {
     for (int q = npre; q < n; ++q) v[q].ijoin = 0;
     for (int q = npre; q < n; ++q) {
@@ -719,7 +732,7 @@ B86_HOT static void plan_joins(Insn *v, int npre, int n)
     }
 }
 
-B86_HOT static void analyze(J *j, uint32_t cs, Insn *v, int n, uint16_t live_out, Guard *g)
+B86_COLD static void analyze(J *j, uint32_t cs, Insn *v, int n, uint16_t live_out, Guard *g)
 {
     uint16_t live = live_out;
     for (int i = n - 1; i >= 0; --i) {
@@ -866,8 +879,8 @@ static void emit_deferred(Tx *t, int k, uint16_t live);
 
 /* Backward conditional exit laid out inline: `skip` is the branch taken when
    the condition FAILS. Taken path = records + poll + one patchable B. */
-B86_HOT static void emit_synth_cf(Tx *t, int cf);
-B86_HOT static void emit_back_exit(Tx *t, uint8_t *skip, uint16_t target)
+B86_COLD static void emit_synth_cf(Tx *t, int cf);
+B86_COLD static void emit_back_exit(Tx *t, uint8_t *skip, uint16_t target)
 {
     if (t->v[t->cur].synth) emit_synth_cf(t, (t->v[t->cur].op & 15) == 2);
     else emit_deferred(t, t->cur, t->v[t->cur].live_taken);
@@ -875,7 +888,7 @@ B86_HOT static void emit_back_exit(Tx *t, uint8_t *skip, uint16_t target)
     be_bind(t->e, skip, t->e->p);
 }
 
-B86_HOT static void add_side(Tx *t, uint8_t *site, uint16_t target, uint16_t from)
+B86_COLD static void add_side(Tx *t, uint8_t *site, uint16_t target, uint16_t from)
 {
     if (t->nside >= 64) { t->fail = 1; return; }
     t->side[t->nside].site = site;
@@ -889,7 +902,7 @@ B86_HOT static void add_side(Tx *t, uint8_t *site, uint16_t target, uint16_t fro
 
 /* Rebuild deferred lazy records on an exit path: flags state after
    instruction k, `live` = flags needed past the exit. */
-B86_HOT static void emit_record(Tx *t, const DeferInfo *o, int clear_overlay)
+B86_COLD static void emit_record(Tx *t, const DeferInfo *o, int clear_overlay)
 {
     Emit *e = t->e;
     unsigned ok = o->overlay ? OFF(lz_ikind) : OFF(lz_kind);
@@ -915,7 +928,7 @@ B86_HOT static void emit_record(Tx *t, const DeferInfo *o, int clear_overlay)
     }
 }
 
-B86_HOT static void deferred_pq(Tx *t, int k, uint16_t live, int *P, int *Q, int *pa, int *qa)
+B86_COLD static void deferred_pq(Tx *t, int k, uint16_t live, int *P, int *Q, int *pa, int *qa)
 {
     Insn *v = t->v;
     DeferInfo o;
@@ -929,7 +942,7 @@ B86_HOT static void deferred_pq(Tx *t, int k, uint16_t live, int *P, int *Q, int
     *qa = *Q >= 0 && v[*Q].defer && (live & v[*Q].fdef) && defer_info(&v[*Q], &o);
 }
 
-B86_HOT static void emit_synth_cf(Tx *t, int cf)
+B86_COLD static void emit_synth_cf(Tx *t, int cf)
 {
     Emit *e = t->e;
     be_stctx_imm(e, LZ_NONE, OFF(lz_kind));
@@ -939,7 +952,7 @@ B86_HOT static void emit_synth_cf(Tx *t, int cf)
     be_stctx(e, V_T0, OFF(flags));
 }
 
-B86_HOT static void emit_end_synth(Tx *t, int ac)
+B86_COLD static void emit_end_synth(Tx *t, int ac)
 {
     Emit *e = t->e;
     be_get_carry(e, V_T0, ac);
@@ -950,7 +963,7 @@ B86_HOT static void emit_end_synth(Tx *t, int ac)
     be_stctx(e, V_T1, OFF(flags));
 }
 
-B86_HOT static void emit_deferred(Tx *t, int k, uint16_t live)
+B86_COLD static void emit_deferred(Tx *t, int k, uint16_t live)
 {
     Insn *v = t->v;
     int P = -1, Q = -1;
@@ -971,7 +984,7 @@ B86_HOT static void emit_deferred(Tx *t, int k, uint16_t live)
    is common after CMC/STC/CLC, POPF, helpers and synthesized exits.
    Clobbers V_T0/V_T1 and NZCV. Leaves t->inc_pending alone (an INC/DEC
    overlay may still be pending on the fast path; it never changes CF). */
-B86_HOT static void flags_if_lazy(Tx *t, Insn *d, int with_overlay)
+B86_COLD static void flags_if_lazy(Tx *t, Insn *d, int with_overlay)
 {
     Emit *e = t->e;
     be_ldctx(e, V_T0, OFF(lz_kind));
@@ -983,7 +996,7 @@ B86_HOT static void flags_if_lazy(Tx *t, Insn *d, int with_overlay)
 }
 
 /* EA of modrm memory operand into V_T0 */
-B86_HOT static void ea_modrm(Tx *t, const Insn *d)
+B86_COLD static void ea_modrm(Tx *t, const Insn *d)
 {
     static const signed char b1[8] = { B86_BX, B86_BX, B86_BP, B86_BP, B86_SI, B86_DI, B86_BP, B86_BX };
     static const signed char b2[8] = { B86_SI, B86_DI, B86_SI, B86_DI, -1, -1, -1, -1 };
@@ -994,7 +1007,7 @@ B86_HOT static void ea_modrm(Tx *t, const Insn *d)
     be_ea(t->e, V_T0, seg, base1, base2, d->disp);
 }
 
-B86_HOT static void ea_off(Tx *t, const Insn *d, int dst)
+B86_COLD static void ea_off(Tx *t, const Insn *d, int dst)
 {
     static const signed char b1[8] = { B86_BX, B86_BX, B86_BP, B86_BP, B86_SI, B86_DI, B86_BP, B86_BX };
     static const signed char b2[8] = { B86_SI, B86_DI, B86_SI, B86_DI, -1, -1, -1, -1 };
@@ -1004,13 +1017,13 @@ B86_HOT static void ea_off(Tx *t, const Insn *d, int dst)
 }
 
 /* get byte register r8 (0..7) as a vreg holding it in low bits */
-B86_HOT static int get8(Tx *t, int r8, int tmp)
+B86_COLD static int get8(Tx *t, int r8, int tmp)
 {
     if (r8 < 4) return r8;
     be_ubfx(t->e, tmp, r8 - 4, 8, 8);
     return tmp;
 }
-B86_HOT static void put8(Tx *t, int r8, int v)
+B86_COLD static void put8(Tx *t, int r8, int v)
 {
     if (r8 < 4) be_bfi(t->e, r8, v, 0, 8);
     else be_bfi(t->e, r8 - 4, v, 8, 8);
@@ -1019,7 +1032,7 @@ B86_HOT static void put8(Tx *t, int r8, int v)
 enum { O_R16, O_R8, O_MEM, O_IMM };
 typedef struct { int k, r; uint32_t imm; } Op;
 
-B86_HOT static int lz_kind(int xop, int w, int incdec)
+B86_COLD static int lz_kind(int xop, int w, int incdec)
 {
     if (xop == 2) return w ? LZ_ADC16 : LZ_ADC8;
     if (xop == 3) return w ? LZ_SBB16 : LZ_SBB8;
@@ -1035,14 +1048,14 @@ B86_HOT static int lz_kind(int xop, int w, int incdec)
    is emitted unless the whole instruction can be lowered (a partial lazy
    record followed by a helper fallback would corrupt the flags). */
 typedef struct Pool { int busy[11]; } Pool;
-B86_HOT static int pick(Pool *p)
+B86_COLD static int pick(Pool *p)
 {
     int lim = be_has_t2 ? V_T2 : V_T1;
     for (int r = V_T0; r <= lim; ++r) if (!p->busy[r]) { p->busy[r] = 1; return r; }
     return -1;
 }
 
-B86_HOT static int emit_alu(Tx *t, Insn *d, int xop, int w, Op dst, Op src, int incdec)
+B86_COLD static int emit_alu(Tx *t, Insn *d, int xop, int w, Op dst, Op src, int incdec)
 {
     Emit *e = t->e;
     int sh = w ? 16 : 24;
@@ -1180,14 +1193,14 @@ B86_HOT static int emit_alu(Tx *t, Insn *d, int xop, int w, Op dst, Op src, int 
 
 /* PUSH is SMC-checked like any store: a stack that grows into code must
    invalidate it (seed 51187). mode 2 = invalidate but continue (CALL). */
-B86_HOT static void emit_push(Tx *t, int v, uint16_t next, int mode)
+B86_COLD static void emit_push(Tx *t, int v, uint16_t next, int mode)
 {
     be_opi(t->e, AOP_SUB, B86_SP, B86_SP, 2);
-    be_ea(t->e, V_T0, B86_SS, B86_SP, -1, 0);
+    be_ea(t->e, V_T0, B86_SS, B86_SP, -1, 0);         /* SS: untranslated, T1 kept */
     be_store(t->e, 1, v, V_T0, mode, next);
 }
 
-B86_HOT static void emit_pop_to(Tx *t, int dst)
+B86_COLD static void emit_pop_to(Tx *t, int dst)
 {
     be_ea(t->e, V_T0, B86_SS, B86_SP, -1, 0);
     if (dst == B86_SP) { be_load(t->e, 1, B86_SP, V_T0); return; }
@@ -1196,7 +1209,7 @@ B86_HOT static void emit_pop_to(Tx *t, int dst)
 }
 
 /* reg += (DF ? -n : n), n = 1 or 2; uses `tmp` */
-B86_HOT static void step_index(Tx *t, int reg, int w, int tmp)
+B86_COLD static void step_index(Tx *t, int reg, int w, int tmp)
 {
     be_ldctx(t->e, tmp, OFF(flags));
     be_ubfx(t->e, tmp, tmp, 10, 1);                /* DF */
@@ -1205,7 +1218,7 @@ B86_HOT static void step_index(Tx *t, int reg, int w, int tmp)
 }
 
 /* LODS / STOS / MOVS without REP natively; REP MOVS/STOS via bulk helper */
-B86_HOT static int emit_string(Tx *t, Insn *d)
+B86_COLD static int emit_string(Tx *t, Insn *d)
 {
     Emit *e = t->e;
     uint8_t op = d->op;
@@ -1246,17 +1259,17 @@ B86_HOT static int emit_string(Tx *t, Insn *d)
     }
 }
 
-B86_HOT static Op op_rm(const Insn *d, int w)
+B86_COLD static Op op_rm(const Insn *d, int w)
 {
     Op o = { O_MEM, 0, 0 };
     if (d->mod == 3) { o.k = w ? O_R16 : O_R8; o.r = d->rm; }
     return o;
 }
-B86_HOT static Op op_reg(const Insn *d, int w) { Op o = { w ? O_R16 : O_R8, d->reg, 0 }; return o; }
-B86_HOT static Op op_imm(uint32_t v) { Op o = { O_IMM, 0, v }; return o; }
+B86_COLD static Op op_reg(const Insn *d, int w) { Op o = { w ? O_R16 : O_R8, d->reg, 0 }; return o; }
+B86_COLD static Op op_imm(uint32_t v) { Op o = { O_IMM, 0, v }; return o; }
 
 /* Load a r/m operand (w) into vreg dst (low bits valid). */
-B86_HOT static void load_rm(Tx *t, const Insn *d, int w, int dst)
+B86_COLD static void load_rm(Tx *t, const Insn *d, int w, int dst)
 {
     if (d->mod == 3) {
         if (w) be_mov(t->e, dst, d->rm);
@@ -1269,7 +1282,7 @@ B86_HOT static void load_rm(Tx *t, const Insn *d, int w, int dst)
 }
 
 /* Lower one instruction natively. Returns 0 to request the helper. */
-B86_HOT static int lower(Tx *t, Insn *d)
+B86_COLD static int lower(Tx *t, Insn *d)
 {
     Emit *e = t->e;
     uint8_t op = d->op;
@@ -1862,7 +1875,12 @@ B86_HOT void b86_jit_flush(J *j)
     }
     j->nblk = 0;
     j->nrm = 0;
-    if (j->heat) memset(j->heat, 0, HEATN);    /* a new generation earns its heat again */
+    /* A new generation: entries that were hot stay hot (retranslated on
+       first dispatch); lukewarm ones start over. Zeroing everything made
+       every flush re-interpret the whole hot set hot_threshold times. */
+    if (j->heat)
+        for (uint32_t i = 0; i < HEATN; ++i)
+            j->heat[i] = (j->hot_threshold && j->heat[i] >= j->hot_threshold) ? (uint8_t)j->hot_threshold : 0;
     j->heat_ticks = 0;
     j->e.p = j->code_start;
     j->flush_gen++;
@@ -1949,7 +1967,7 @@ static Block *translate_ex(J *j, uint32_t cs, uint16_t ip, const Insn *pre, int 
    its retranslation stops (joins) here instead of keeping a second copy of
    the tail. Costs one retranslation; keeps each guest instruction in the
    cache about once, which is what lets a whole program's hot code fit. */
-B86_HOT static void split_at(J *j, uint32_t a)
+B86_COLD static void split_at(J *j, uint32_t a)
 {
     uint32_t p1 = a >> PG_SHIFT, p0 = p1 ? p1 - 1 : 0;
     for (uint32_t p = p0; p <= p1 && p < NPG; ++p) {
@@ -1963,12 +1981,12 @@ B86_HOT static void split_at(J *j, uint32_t a)
         }
     }
 }
-B86_HOT static Block *translate(J *j, uint32_t cs, uint16_t ip) { return translate_ex(j, cs, ip, NULL, 0); }
+B86_COLD static Block *translate(J *j, uint32_t cs, uint16_t ip) { return translate_ex(j, cs, ip, NULL, 0); }
 
-B86_HOT static Block *translate_ex(J *j, uint32_t cs, uint16_t ip, const Insn *pre, int npre)
+B86_COLD static Block *translate_ex(J *j, uint32_t cs, uint16_t ip, const Insn *pre, int npre)
 {
     B86Cpu *c = j->cpu;
-    static Insn v[128];
+    Insn *v = (Insn *)j->tv;                  /* B86_CALLOC'd: off the SRAM .bss */
     int n = npre;
     for (int i = 0; i < npre; ++i) v[i] = pre[i];
     uint32_t base = cs << 4;
@@ -1995,6 +2013,7 @@ B86_HOT static Block *translate_ex(J *j, uint32_t cs, uint16_t ip, const Insn *p
             if (cv && !prev_cov) { j->st.joins++; break; }
             prev_cov = cv;
         }
+        if (n > npre && b86_page_mapped(j->cpu, base + pc)) break;
         Insn *d = &v[n];
         decode(c, cs, pc, d);
         classify(d);
@@ -2020,7 +2039,7 @@ B86_HOT static Block *translate_ex(J *j, uint32_t cs, uint16_t ip, const Insn *p
             int body = k + 1, U = body <= 6 ? 4 : body <= 12 ? 2 : 1;
             while (U > 1 && n + (U - 1) * body > 120) U--;
             if (U > 1) {
-                static Insn w[128];
+                Insn *w = (Insn *)j->tw;
                 int m = 0;
                 for (int u = 0; u < U - 1; ++u)
                     for (int i = 0; i <= k; ++i) {
@@ -2207,6 +2226,43 @@ B86_HOT uint32_t b86h_step(B86Cpu *c, uint32_t ip_next, uint32_t blk)
 /* REP MOVS / REP STOS in bulk. Same results as the interpreter: element-
    wise forward/backward semantics, 16-bit SI/DI wrap, A20-on addressing.
    Falls back to the interpreter for anything unusual. */
+#ifdef B86_PAGED
+B86_HOT static inline uint8_t *tr_host(const B86Cpu *c, uint8_t *nominal)
+{
+    return nominal + c->pt[((uintptr_t)nominal >> 12) & 511u];
+}
+/* REP STOS/MOVS over nominal ranges that touch a mapped page: page-sized
+   chunks, each translated. Returns 0 (caller's flat path) if none mapped. */
+B86_HOT static int rep_paged(B86Cpu *c, uint8_t *dst, uint8_t *src, uint32_t span, int w)
+{
+    int any = 0;
+    for (uintptr_t p = (uintptr_t)dst >> 12; p <= ((uintptr_t)dst + span - 1) >> 12; ++p) any |= c->pt[p & 511u] != 0;
+    if (src) for (uintptr_t p = (uintptr_t)src >> 12; p <= ((uintptr_t)src + span - 1) >> 12; ++p) any |= c->pt[p & 511u] != 0;
+    if (!any) return 0;
+    if (src && dst > src && dst < src + span) {          /* overlap: element-exact */
+        uint32_t sz = w ? 2u : 1u;
+        for (uint32_t i = 0; i < span; i += sz) {
+            uint8_t lo = *tr_host(c, src + i), hi = w ? *tr_host(c, src + i + 1) : 0;
+            *tr_host(c, dst + i) = lo;
+            if (w) *tr_host(c, dst + i + 1) = hi;
+        }
+        return 1;
+    }
+    uint8_t lo = (uint8_t)c->r[B86_AX], hi = (uint8_t)(c->r[B86_AX] >> 8);
+    for (uint32_t done = 0; done < span; ) {
+        uint32_t lim = span - done, r;
+        r = 4096u - (uint32_t)(((uintptr_t)dst + done) & 4095u); if (r < lim) lim = r;
+        if (src) { r = 4096u - (uint32_t)(((uintptr_t)src + done) & 4095u); if (r < lim) lim = r; }
+        uint8_t *hd = tr_host(c, dst + done);
+        if (src) memmove(hd, tr_host(c, src + done), lim);
+        else if (!w) memset(hd, lo, lim);
+        else for (uint32_t k = 0; k < lim; ++k) hd[k] = ((done + k) & 1u) ? hi : lo;
+        done += lim;
+    }
+    return 1;
+}
+#endif
+
 B86_HOT uint32_t b86h_rep(B86Cpu *c, uint32_t ip_next, uint32_t blk)
 {
     J *j = c->jit;
@@ -2216,7 +2272,7 @@ B86_HOT uint32_t b86h_rep(B86Cpu *c, uint32_t ip_next, uint32_t blk)
     int sseg = B86_DS;
     uint8_t op;
     for (uint16_t p = ip;; ++p) {
-        op = c->mem[(cs << 4) + p];
+        op = *b86_host(c, (cs << 4) + p);
         if (op == 0x26 || op == 0x2E || op == 0x36 || op == 0x3E) sseg = (op >> 3) & 3;
         else if (op != 0xF2 && op != 0xF3 && op != 0xF0 && op != 0xF1) break;
     }
@@ -2226,9 +2282,22 @@ B86_HOT uint32_t b86h_rep(B86Cpu *c, uint32_t ip_next, uint32_t blk)
     int back = (c->flags & B86_DF) != 0;
     uint16_t si = (uint16_t)c->r[B86_SI], di = (uint16_t)c->r[B86_DI];
     uint32_t span = n * sz;
+#ifdef B86_COND_HISTO
+    { extern uint64_t b86_rep_bytes[4]; extern uint32_t b86_rep_es[65536];
+      b86_rep_bytes[(movs ? 2 : 0) + w] += span; b86_rep_es[c->seg[B86_ES]] += span; }
+#endif
     /* fast path: forward, no 16-bit wrap of SI/DI during the run */
     if (!back && n && (uint32_t)di + span <= 0x10000u && (!movs || (uint32_t)si + span <= 0x10000u)) {
         uint8_t *dst = c->segp[B86_ES] + di;
+#ifdef B86_PAGED
+        {
+            uint32_t pg = (uint32_t)(dst - c->mem) >> 12;
+            if (pg < (B86_MEM_BYTES >> 12)) c->rep_page_bytes[pg] += span;
+        }
+        if (rep_paged(c, dst, movs ? c->segp[sseg] + si : NULL, span, w)) {
+            if (movs) si = (uint16_t)(si + span);
+        } else
+#endif
         if (movs) {
             uint8_t *src = c->segp[sseg] + si;
             if (dst > src && dst < src + span) {          /* overlap: element-exact */
@@ -2237,8 +2306,24 @@ B86_HOT uint32_t b86h_rep(B86Cpu *c, uint32_t ip_next, uint32_t blk)
             } else memmove(dst, src, span);
             si = (uint16_t)(si + span);
         } else if (!w) memset(dst, (int)(c->r[B86_AX] & 0xFF), span);
+#ifndef B86_REP_WIDE
         else { uint8_t lo = (uint8_t)c->r[B86_AX], hi = (uint8_t)(c->r[B86_AX] >> 8);
                for (uint32_t i = 0; i < n; ++i) { dst[2 * i] = lo; dst[2 * i + 1] = hi; } }
+#else
+        else {                                     /* STOSW: 32-bit stores (2 words each) */
+            uint32_t ax = c->r[B86_AX] & 0xFFFFu, i = 0;
+            uint8_t lo = (uint8_t)ax, hi = (uint8_t)(ax >> 8);
+            if (((uintptr_t)dst & 1u) == 0) {
+                if (((uintptr_t)dst & 2u) && n) { *(uint16_t *)dst = (uint16_t)ax; i = 1; }
+                uint32_t pat = ax | (ax << 16);
+                uint32_t *d32 = (uint32_t *)(dst + 2 * i);
+                uint32_t pairs = (n - i) / 2u;
+                for (uint32_t k = 0; k < pairs; ++k) d32[k] = pat;
+                i += 2u * pairs;
+            }
+            for (; i < n; ++i) { dst[2 * i] = lo; dst[2 * i + 1] = hi; }
+        }
+#endif
         di = (uint16_t)(di + span);
         c->r[B86_CX] = 0; c->r[B86_SI] = si; c->r[B86_DI] = di;
         c->ip = ip_next >> 16;
@@ -2311,6 +2396,7 @@ B86_HOT uint32_t b86h_smc(B86Cpu *c, uint8_t *host, uint32_t lenflags, uint32_t 
 {
     J *j = c->jit;
     uint32_t lin = (uint32_t)(host - c->mem);
+    if (host < c->mem || lin >= B86_MEM_BYTES) return 0;   /* a mapped frame: never holds code */
     j->st.smc_hits++;
     j->st.rt_smc++;
     invalidate(j, lin, lin + (lenflags & 0xFFu));
@@ -2322,9 +2408,56 @@ B86_HOT uint32_t b86h_smc(B86Cpu *c, uint8_t *host, uint32_t lenflags, uint32_t 
 /* Public API                                                               */
 /* ------------------------------------------------------------------------ */
 
+#ifdef B86_PAGED
+B86_HOT int b86_page_mapped(const B86Cpu *c, uint32_t lin)
+{
+    return c->pt[((uintptr_t)(c->mem + lin) >> 12) & 511u] != 0;
+}
+int b86_map_range(B86Cpu *c, uint32_t lin, uint32_t len, uint8_t *frame)
+{
+    if (!be_paged || ((uintptr_t)c->mem & 4095u) || (lin & 4095u) || (len & 4095u) || !len ||
+        lin + len > B86_MEM_BYTES || !frame)
+        return -1;
+    if (c->jit && c->jit->cm_table) {
+        /* stores into the frame index the SMC table with UBFX(addr, 6, 15):
+           those entries must be neither the page table nor guest lines */
+        uint32_t base = (uint32_t)(((uintptr_t)c->mem >> B86_LINE_SHIFT) & (CM_PAGED - 1u));
+        for (uint32_t a = 0; a < len + 64u; a += 64u) {
+            uint32_t i = (uint32_t)(((uintptr_t)(frame + a) >> B86_LINE_SHIFT) & (CM_PAGED - 1u));
+            /* page-table bytes [0, 2 KiB) are mostly zero; an occasional
+               nonzero byte only sends a store to the (guarded) slow path */
+            if (i >= base && i < base + B86_LINES) return -2;   /* frame collides with guest lines */
+        }
+    }
+    if (c->jit && c->jit->cm_table) c->pt = (int32_t *)(void *)c->jit->cm_table;
+    for (uint32_t a = lin; a < lin + len; a += 4096u) if (b86_page_mapped(c, a)) return -1;
+    J *j = c->jit;
+    if (j && j->codemap)
+        for (uint32_t l = lin >> B86_LINE_SHIFT; l < (lin + len) >> B86_LINE_SHIFT; ++l)
+            if (j->codemap[l]) return -3;        /* translated code lives there */
+    memcpy(frame, c->mem + lin, len);
+    for (uint32_t a = 0; a < len; a += 4096u)
+        c->pt[((uintptr_t)(c->mem + lin + a) >> 12) & 511u] = (int32_t)((intptr_t)(frame + a) - (intptr_t)(c->mem + lin + a));
+    return 0;
+}
+void b86_unmap_range(B86Cpu *c, uint32_t lin, uint32_t len)
+{
+    for (uint32_t a = lin & ~4095u; a < lin + len && a < B86_MEM_BYTES; a += 4096u) {
+        uint32_t i = (uint32_t)(((uintptr_t)(c->mem + a) >> 12) & 511u);
+        if (!c->pt[i]) continue;
+        memcpy(c->mem + a, c->mem + a + c->pt[i], 4096u);
+        c->pt[i] = 0;
+    }
+}
+#else
+B86_HOT int b86_page_mapped(const B86Cpu *c, uint32_t lin) { (void)c; (void)lin; return 0; }
+int b86_map_range(B86Cpu *c, uint32_t lin, uint32_t len, uint8_t *frame) { (void)c; (void)lin; (void)len; (void)frame; return -1; }
+void b86_unmap_range(B86Cpu *c, uint32_t lin, uint32_t len) { (void)c; (void)lin; (void)len; }
+#endif
+
 B86_HOT size_t b86_jit_hot_bytes(void)
 {
-    return B86_FASTN * sizeof(B86Fast) + ((B86_LINES + 15u) & ~15u);
+    return B86_FASTN * sizeof(B86Fast) + (be_paged ? CM_PAGED : ((B86_LINES + 15u) & ~15u));
 }
 
 void b86_jit_destroy(J *j);
@@ -2346,6 +2479,8 @@ B86_HOT J *b86_jit_create_ex(B86Cpu *c, void *code, size_t size, void *hot, size
     J *j = calloc(1, sizeof *j);                 /* small, hot: normal (SRAM) heap */
     if (!j) return NULL;
     j->dead = calloc(MAXB, 1);
+    j->tv = B86_CALLOC(128, sizeof(Insn));
+    j->tw = B86_CALLOC(128, sizeof(Insn));
     j->cpu = c;
     j->buf = code;
     j->buf_end = (uint8_t *)code + size;
@@ -2360,16 +2495,35 @@ B86_HOT J *b86_jit_create_ex(B86Cpu *c, void *code, size_t size, void *hot, size
     if (hot && hot_size >= b86_jit_hot_bytes()) {
         memset(hot, 0, b86_jit_hot_bytes());
         j->fast = (B86Fast *)hot;
-        j->codemap = (uint8_t *)hot + B86_FASTN * sizeof(B86Fast);
+        j->cm_table = (uint8_t *)hot + B86_FASTN * sizeof(B86Fast);
         j->hot_external = 1;
     } else {
         j->fast = B86_CALLOC(B86_FASTN, sizeof *j->fast);
-        j->codemap = B86_CALLOC(B86_LINES, 1);
+        j->cm_table = B86_CALLOC(be_paged ? CM_PAGED : B86_LINES, 1);
     }
-    if (!j->dead || !j->blk || !j->map || !j->pg_head || !j->rm || !j->cov || !j->ent || !j->heat_key || !j->heat || !j->fast || !j->codemap) { b86_jit_destroy(j); return NULL; }
+    j->codemap = j->cm_table;
+    if (be_paged && j->cm_table) {
+        uint32_t base = (uint32_t)(((uintptr_t)c->mem >> B86_LINE_SHIFT) & (CM_PAGED - 1u));
+        if (((uintptr_t)c->mem & 4095u) || base + B86_LINES > CM_PAGED) {   /* layout the table cannot index */
+            if (!j->hot_external) B86_FREE(j->cm_table);
+            j->cm_table = NULL;
+        }
+        if (base < 0x800u && j->cm_table) {        /* page table lives in table bytes [0, 2 KiB) */
+            if (!j->hot_external) B86_FREE(j->cm_table);
+            j->cm_table = NULL;
+        }
+        j->codemap = j->cm_table ? j->cm_table + base : NULL;
+    }
+    if (!j->dead || !j->tv || !j->tw || !j->blk || !j->map || !j->pg_head || !j->rm || !j->cov || !j->ent || !j->heat_key || !j->heat || !j->fast || !j->codemap) { b86_jit_destroy(j); return NULL; }
     c->jit = j;
     c->codemap = j->codemap;
-    c->codemap_host = j->codemap - ((uintptr_t)c->mem >> B86_LINE_SHIFT);
+    c->codemap_host = be_paged ? j->cm_table : j->codemap - ((uintptr_t)c->mem >> B86_LINE_SHIFT);
+#ifdef B86_PAGED
+    if (be_paged) {                               /* move any existing mappings into the shared table */
+        memcpy(j->cm_table, c->pt, 512u * sizeof(int32_t));
+        c->pt = (int32_t *)(void *)j->cm_table;
+    }
+#endif
     c->fast = j->fast;
     c->smc_hook = smc_hook;
     j->e.base = j->buf;
@@ -2389,8 +2543,9 @@ B86_HOT void b86_jit_destroy(J *j)
     if (j->cpu) { j->cpu->jit = NULL; j->cpu->codemap = NULL; j->cpu->smc_hook = NULL; }
     B86_FREE(j->blk); B86_FREE(j->map); B86_FREE(j->pg_head); B86_FREE(j->rm);
     B86_FREE(j->cov); B86_FREE(j->ent); B86_FREE(j->heat_key); B86_FREE(j->heat);
-    if (!j->hot_external) { B86_FREE(j->fast); B86_FREE(j->codemap); }
+    if (!j->hot_external) { B86_FREE(j->fast); B86_FREE(j->cm_table); }
     free(j->dead);
+    B86_FREE(j->tv); B86_FREE(j->tw);
     free(j);
 }
 
@@ -2446,16 +2601,16 @@ B86_HOT void b86_jit_set_single_step(J *j, int on)
    per frame (setup, per-object code, DOS itself) then never occupies the
    code buffer, which is what keeps a program's hot loops resident instead of
    flushing the whole cache every frame. */
-B86_HOT static int cold_run(J *j, B86Cpu *c, uint32_t key)
+B86_HOT static int cold_run(J *j, B86Cpu *c, uint32_t key, int force)
 {
-    uint32_t h = (key * 2654435761u) >> 20;
+    uint32_t h = (key * 2654435761u) >> (32 - HEAT_BITS);
     if (j->heat_key[h] != key) { j->heat_key[h] = key; j->heat[h] = 0; }
     if (++j->heat_ticks >= HEAT_DECAY) {
         j->heat_ticks = 0;
         for (uint32_t i = 0; i < HEATN; ++i) j->heat[i] >>= 1;
     }
     if (j->heat[h] < 255) j->heat[h]++;
-    if (j->heat[h] >= j->hot_threshold) return 0;
+    if (!force && j->heat[h] >= j->hot_threshold) return 0;
     /* interpret one straight-line run: stop after a control transfer, at a
        translated entry, at the trap segment, or when the host wants control */
     uint32_t steps = 0;
@@ -2476,6 +2631,9 @@ B86_HOT static int cold_run(J *j, B86Cpu *c, uint32_t key)
         if (BIT_GET(j->ent, (c->seg[B86_CS] << 4) + (c->ip & 0xFFFFu))) break;
     }
     if (j->e.count_ret) c->icnt += steps;
+#ifdef B86_COND_HISTO
+    { extern uint32_t b86_cold_ip[1 << 20]; b86_cold_ip[((key >> 16) * 16u + (key & 0xFFFFu)) & 0xFFFFFu] += steps; }
+#endif
     j->st.cold_insns += steps;
     j->st.cold_runs++;
     return 1;
@@ -2483,6 +2641,9 @@ B86_HOT static int cold_run(J *j, B86Cpu *c, uint32_t key)
 
 B86_HOT int b86_jit_run(B86Cpu *c, uint64_t max_dispatch)
 {
+#ifdef B86_PAGED
+    if (be_paged && c->jit && c->jit->cm_table) c->pt = (int32_t *)(void *)c->jit->cm_table;   /* struct copies */
+#endif
     J *j = c->jit;
     uint64_t n = 0;
     uint8_t *patch_site = NULL, *rf_site = NULL;
@@ -2510,7 +2671,12 @@ B86_HOT int b86_jit_run(B86Cpu *c, uint64_t max_dispatch)
 #ifdef B86_MISSES
                 uint64_t m0 = B86_MISSES();
 #endif
-                if (j->hot_threshold && !j->single_step && cold_run(j, c, key)) {
+                if (!j->single_step && b86_page_mapped(c, ((key >> 16) << 4) + (key & 0xFFFFu))) {
+                    cold_run(j, c, key, 1);       /* code in a mapped page: never translated */
+                    patch_site = NULL; rf_site = NULL;
+                    continue;
+                }
+                if (j->hot_threshold && !j->single_step && cold_run(j, c, key, 0)) {
                     patch_site = NULL; rf_site = NULL;
                     continue;
                 }

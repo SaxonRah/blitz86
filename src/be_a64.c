@@ -13,6 +13,7 @@
 #include <string.h>
 
 const int be_has_t2 = 1;
+const int be_paged = 0;
 const int be_store_clobbers_nzcv = 0;
 const int be_logic_mode = FM_ADD;      /* CMN wzr, r, LSL #sh: C=0 V=0 */
 

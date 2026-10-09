@@ -13,6 +13,11 @@
  *   fuzz [iterations] [seed]
  */
 #include "b86.h"
+#ifdef B86_PAGED
+#define B86_GUEST_ALIGN __attribute__((aligned(0x200000)))  /* paged codemap layout */
+#else
+#define B86_GUEST_ALIGN __attribute__((aligned(64)))
+#endif
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,8 +33,18 @@
 #define SSEG    0x5000u
 #define XSEG    0x6000u
 
-static uint8_t memA[B86_MEM_BYTES] __attribute__((aligned(64)));
-static uint8_t memB[B86_MEM_BYTES] __attribute__((aligned(64)));
+#ifdef B86_PAGED   /* Pico layout: 640 KiB into a 2 MiB window (SMC table / page table) */
+static uint8_t memA_raw[0xA0000u + B86_MEM_BYTES] B86_GUEST_ALIGN;
+#define memA (memA_raw + 0xA0000u)
+#else
+static uint8_t memA[B86_MEM_BYTES] B86_GUEST_ALIGN;
+#endif
+#ifdef B86_PAGED   /* Pico layout: 640 KiB into a 2 MiB window (SMC table / page table) */
+static uint8_t memB_raw[0xA0000u + B86_MEM_BYTES] B86_GUEST_ALIGN;
+#define memB (memB_raw + 0xA0000u)
+#else
+static uint8_t memB[B86_MEM_BYTES] B86_GUEST_ALIGN;
+#endif
 static uint8_t init_img[B86_MEM_BYTES];
 
 static uint64_t rs;
@@ -363,7 +378,10 @@ int main(int argc, char **argv)
         /* interpreter */
         memcpy(memA, init_img, B86_MEM_BYTES);
         init_cpu(&a, memA, seed);
+        static uint8_t aframe[0x20000 + 1] __attribute__((aligned(4096)));
+        int amap = getenv("FUZZ_MAP") && b86_map_range(&a, 0x30000, 0x20000, aframe) == 0;
         int ra = b86_run_interp(&a, 3000000);
+        if (amap) b86_unmap_range(&a, 0x30000, 0x20000);
         if (ra != B86_HALT) { skipped++; continue; }
         total_insns += a.icount;
         /* translator */
@@ -388,6 +406,8 @@ int main(int argc, char **argv)
             b86_jit_set_no_fast(j, 1);
             b86_jit_set_count_exits(j, 1);
             b86_jit_flush(j);
+            { static uint8_t tframe_raw[0x200000] __attribute__((aligned(0x200000))); uint8_t *tframe = tframe_raw + 0x20000u;
+              if (getenv("FUZZ_MAP")) b86_map_range(&tmp, 0x30000, 0x20000, tframe); }
             long blkn;
             uint64_t ref_steps = 0;
             for (blkn = 0; blkn < 400000; ++blkn) {
@@ -405,11 +425,11 @@ int main(int argc, char **argv)
                 int diff = ref.seg[B86_CS] != tmp.seg[B86_CS] || (uint16_t)ref.ip != (uint16_t)tmp.ip;
                 for (int i = 0; i < 8; ++i) if ((uint16_t)ref.r[i] != (uint16_t)tmp.r[i]) diff = 1;
                 long md = -1;
-                for (long k = 0; k < (long)B86_MEM_BYTES; ++k) if (snap[k] != memB[k]) { md = k; diff = 1; break; }
+                for (long k = 0; k < (long)B86_MEM_BYTES; ++k) if (snap[k] != *b86_host(&tmp, (uint32_t)k)) { md = k; diff = 1; break; }
                 if (diff) {
                     printf("diverge in block %04X:%04X -> %04X (ref %04X, %d steps):", cs0, ip0, (uint16_t)tmp.ip, (uint16_t)ref.ip, steps);
                     for (int i = 0; i < 8; ++i) if ((uint16_t)ref.r[i] != (uint16_t)tmp.r[i]) printf(" r%d %04X/%04X", i, (uint16_t)ref.r[i], (uint16_t)tmp.r[i]);
-                    if (md >= 0) printf(" mem[%05lX] %02X/%02X", md, snap[md], memB[md]);
+                    if (md >= 0) printf(" mem[%05lX] %02X/%02X", md, snap[md], *b86_host(&tmp, (uint32_t)md));
                     printf("\n  bytes:");
                     for (int k = 0; k < 48; ++k) printf(" %02X", cur[k]);
                     printf("\n  entry regs:");
@@ -440,8 +460,15 @@ int main(int argc, char **argv)
         }
         alarm_cpu = &tmp; alarm(getenv("FUZZ_ALARM") ? (unsigned)atoi(getenv("FUZZ_ALARM")) : 20u);
         tmp.icnt = 0;
+        /* FUZZ_MAP (B86_PAGED): run with the data/extra segments' 128 KiB
+           moved to a separate frame; unmapped (copied back) before comparing */
+        static uint8_t frame_raw[0x200000] __attribute__((aligned(0x200000)));
+        uint8_t *frame = frame_raw + 0x20000u;   /* SMC-table index 0x800.. : clear of page table and guest lines */
+        int mapped = getenv("FUZZ_MAP") && b86_map_range(&tmp, 0x30000, 0x20000, frame) == 0;
+        if (getenv("FUZZ_MAP") && !mapped && it == 0) printf("FUZZ_MAP: map failed\n");
         int rb = b86_jit_run(&tmp, ~0ull);
         alarm(0); alarm_cpu = NULL;
+        if (mapped) b86_unmap_range(&tmp, 0x30000, 0x20000);
         b = tmp;
         int ok = rb == B86_HALT;
         if ((uint32_t)a.icount != b.icnt) { ok = 0; printf("seed %llu: retired count %u != %llu\n", (unsigned long long)seed, b.icnt, (unsigned long long)a.icount); }

@@ -11,9 +11,23 @@
  * frontend knows (be_store_clobbers_nzcv). Exit reason travels in r12.
  */
 #include "backend.h"
+/* The emitter only runs while translating: keep it in flash (B86_COLD).
+   Code-buffer patching (chains, RET cache, kill) is rare after warm-up. */
+#if defined(B86_RAM_FUNCS) && B86_RAM_FUNCS
+#define B86_RT __attribute__((section(".time_critical.blitz86")))   /* used by the dispatcher */
+#else
+#define B86_RT
+#endif
+#undef B86_HOT
+#define B86_HOT B86_COLD
 #include <string.h>
 
 const int be_has_t2 = 0;
+#ifdef B86_PAGED
+const int be_paged = 1;
+#else
+const int be_paged = 0;
+#endif
 const int be_store_clobbers_nzcv = 1;
 const int be_logic_mode = FM_SUB;      /* LSL x,r,#sh ; CMP x,#0 : C=1 V=0 */
 
@@ -98,7 +112,7 @@ B86_HOT static void ldst(Emit *e, uint32_t h1, int t, int n, unsigned off) { put
 B86_HOT static void cmp_imm0(Emit *e, int n) { dp_imm(e, DP_SUB, 1, PC, n, 0); }
 
 /* ---- branches ------------------------------------------------------------ */
-B86_HOT static void enc_b(uint8_t *site, uint8_t *target)
+B86_RT static void enc_b(uint8_t *site, uint8_t *target)
 {
     int32_t off = (int32_t)(target - (site + 4));
     uint32_t S = (uint32_t)(off >> 24) & 1, I1 = (uint32_t)(off >> 23) & 1, I2 = (uint32_t)(off >> 22) & 1;
@@ -118,7 +132,7 @@ static void emit_bl(Emit *e, uint8_t *target)
 }
 B86_HOT static void put_word(Emit *e, uint32_t v) { put16(e, v & 0xFFFF); put16(e, v >> 16); }
 
-B86_HOT static void enc_bcc(uint8_t *site, uint8_t *target, uint32_t cond)
+B86_RT static void enc_bcc(uint8_t *site, uint8_t *target, uint32_t cond)
 {
     int32_t off = (int32_t)(target - (site + 4));
     if (off < -(1 << 20) || off >= (1 << 20)) __builtin_trap();
@@ -149,7 +163,7 @@ B86_HOT void be_bind(Emit *e, uint8_t *site, uint8_t *target)
     else enc_bcc(site, target, (h1 >> 6) & 0xF);
 }
 
-B86_HOT void be_flush_icache(void *start, size_t len)
+B86_RT void be_flush_icache(void *start, size_t len)
 {
 #if defined(__linux__)
     __builtin___clear_cache((char *)start, (char *)start + len);
@@ -158,9 +172,9 @@ B86_HOT void be_flush_icache(void *start, size_t len)
     __asm__ volatile("dsb 0xF\n\tisb 0xF" ::: "memory");
 #endif
 }
-B86_HOT void be_patch_branch(uint8_t *site, uint8_t *target) { enc_b(site, target); be_flush_icache(site, 4); }
-B86_HOT void be_kill_entry(uint8_t *entry, uint8_t *stub) { be_patch_branch(entry, stub); }
-B86_HOT uintptr_t be_code_ptr(uint8_t *p) { return (uintptr_t)p | 1u; }
+B86_RT void be_patch_branch(uint8_t *site, uint8_t *target) { enc_b(site, target); be_flush_icache(site, 4); }
+B86_RT void be_kill_entry(uint8_t *entry, uint8_t *stub) { be_patch_branch(entry, stub); }
+B86_RT uintptr_t be_code_ptr(uint8_t *p) { return (uintptr_t)p | 1u; }
 
 /* ---- runtime -------------------------------------------------------------- */
 
@@ -473,6 +487,19 @@ B86_HOT static int segreg(Emit *e, int seg)
     return LR;
 }
 
+/* B86_PAGED: dd (nominal host address) += pt[(dd >> 12) & 511]. Clobbers lr. */
+B86_HOT static void ea_translate(Emit *e, int dd)
+{
+#ifdef B86_PAGED
+    /* page table = first 2 KiB of the SMC line table (r9) */
+    bitfield(e, 0xF3C0u, LR, dd, 12, 8);                              /* UBFX lr, dd, #12, #9 */
+    put32(e, 0xF850u | R_CM, (uint32_t)LR << 12 | 2u << 4 | LR);      /* LDR lr, [r9, lr, LSL #2] */
+    put16(e, 0x4400u | (uint32_t)(dd & 8) << 4 | (uint32_t)LR << 3 | (uint32_t)(dd & 7));   /* ADD dd, lr (16-bit) */
+#else
+    (void)e; (void)dd;
+#endif
+}
+
 B86_HOT void be_ea(Emit *e, int d, int seg, int b1, int b2, int32_t disp)
 {
     int dd = hr(d);
@@ -480,6 +507,7 @@ B86_HOT void be_ea(Emit *e, int d, int seg, int b1, int b2, int32_t disp)
     if (b1 < 0 && b2 < 0) {
         movw(e, dd, (uint32_t)disp);
         dp_reg(e, DP_ADD, 0, dd, sr, dd, 0, 0);
+        if (seg != B86_SS) ea_translate(e, dd);     /* stack pages are never mapped */
         return;
     }
     int src = hr(b1);
@@ -487,6 +515,7 @@ B86_HOT void be_ea(Emit *e, int d, int seg, int b1, int b2, int32_t disp)
     if (disp) { opi_raw(e, AOP_ADD, dd, src, (uint32_t)disp); src = dd; }
     put32(e, 0xFA1Fu, 0xF080u | (uint32_t)dd << 8 | (uint32_t)src);   /* UXTH */
     dp_reg(e, DP_ADD, 0, dd, sr, dd, 0, 0);
+    if (seg != B86_SS) ea_translate(e, dd);         /* stack pages are never mapped */
 }
 
 B86_HOT void be_ea_off(Emit *e, int d, int b1, int b2, int32_t disp)
@@ -504,7 +533,11 @@ B86_HOT void be_store(Emit *e, int w16, int v, int addr, int check, uint16_t nex
 {
     ldst(e, w16 ? STRH : STRB, hr(v), hr(addr), 0);
     if (!check) return;
+#ifdef B86_PAGED
+    bitfield(e, 0xF3C0u, LR, hr(addr), 6, 14);                   /* lr = (addr >> 6) & 0x7FFF */
+#else
     shift_imm(e, 0, LR, hr(addr), 1, 6);                         /* lr = addr >> 6 */
+#endif
     put32(e, 0xF810u | R_CM, (uint32_t)LR << 12 | LR);           /* LDRB lr, [r9, lr] */
     cmp_imm0(e, LR);
     if (e->nslow >= 64) { e->overflow = 1; return; }
@@ -593,7 +626,7 @@ B86_HOT void be_ret_cache(Emit *e, uint8_t **site, uint8_t **bne, uint8_t **birq
     *birq = emit_bcc(e, AC_NE, NULL);
     *bhit = emit_b(e, NULL);
 }
-B86_HOT uint8_t *be_ret_hit_branch(uint8_t *site) { return site + 24; }
+B86_RT uint8_t *be_ret_hit_branch(uint8_t *site) { return site + 24; }
 B86_HOT void be_exit_irq_ip(Emit *e) { retire_mark(e, e->retire); emit_b(e, e->x_irq); }
 B86_HOT void be_ret_fill(Emit *e, uint16_t ret_ip, uint8_t *site)
 {
@@ -618,7 +651,7 @@ B86_HOT void be_exit_ret(Emit *e, uint16_t ret_ip)
     be_ret_fill(e, ret_ip, site);
 }
 
-B86_HOT void be_patch_ret(uint8_t *site, uint16_t ip, uint8_t *target, uint8_t *miss)
+B86_RT void be_patch_ret(uint8_t *site, uint16_t ip, uint8_t *target, uint8_t *miss)
 {
     uint32_t v = ip;
     uint32_t h1 = 0xF240u | (v >> 11 & 1) << 10 | (v >> 12), h2 = (v >> 8 & 7) << 12 | (uint32_t)LR << 8 | (v & 0xFF);

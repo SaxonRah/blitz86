@@ -35,6 +35,9 @@ B86_HOT void b86_init(B86Cpu *c, uint8_t *mem)
     c->amask = 0x1FFFFFu;
     c->flags = 0xF002u;
     c->trap_cs = 0xFFFFFFFFu;
+#ifdef B86_PAGED
+    c->pt = c->pt_store;
+#endif
     for (int s = 0; s < 4; ++s) b86_set_seg(c, s, 0);
 }
 
@@ -123,11 +126,18 @@ B86_HOT static inline void smc(B86Cpu *c, uint32_t a, uint32_t n)
         c->smc_hook(c, a, n);
 }
 
-B86_HOT static inline uint8_t rd8(B86Cpu *c, int s, uint32_t off) { return c->mem[lin(c, s, off)]; }
+#ifdef B86_MEMTRACE
+extern void b86_memtrace(uint32_t a, int write);
+#define MT(a, w) b86_memtrace((a), (w))
+#else
+#define MT(a, w) ((void)0)
+#endif
+B86_HOT static inline uint8_t rd8(B86Cpu *c, int s, uint32_t off) { uint32_t a = lin(c, s, off); if (s != B86_CS) MT(a, 0); return *b86_host(c, a); }
 B86_HOT static inline void wr8(B86Cpu *c, int s, uint32_t off, uint8_t v)
 {
     uint32_t a = lin(c, s, off);
-    c->mem[a] = v;
+    MT(a, 1);
+    *b86_host(c, a) = v;
     smc(c, a, 1);
 }
 B86_HOT static inline uint16_t rd16(B86Cpu *c, int s, uint32_t off)
@@ -135,14 +145,16 @@ B86_HOT static inline uint16_t rd16(B86Cpu *c, int s, uint32_t off)
     if (c->exact_wrap)
         return (uint16_t)(rd8(c, s, off) | (rd8(c, s, off + 1) << 8));
     uint32_t a = lin(c, s, off);
-    return (uint16_t)(c->mem[a] | (c->mem[a + 1] << 8));
+    if (s != B86_CS) MT(a, 0);
+    return (uint16_t)(*b86_host(c, a) | (*b86_host(c, a + 1) << 8));
 }
 B86_HOT static inline void wr16(B86Cpu *c, int s, uint32_t off, uint16_t v)
 {
     if (c->exact_wrap) { wr8(c, s, off, (uint8_t)v); wr8(c, s, off + 1, (uint8_t)(v >> 8)); return; }
     uint32_t a = lin(c, s, off);
-    c->mem[a] = (uint8_t)v;
-    c->mem[a + 1] = (uint8_t)(v >> 8);
+    MT(a, 1);
+    *b86_host(c, a) = (uint8_t)v;
+    *b86_host(c, a + 1) = (uint8_t)(v >> 8);
     smc(c, a, 2);
 }
 
@@ -368,8 +380,8 @@ B86_HOT void b86_interrupt(B86Cpu *c, uint8_t v)
     push(c, (uint16_t)c->seg[B86_CS]);
     push(c, (uint16_t)c->ip);
     uint32_t vec = (uint32_t)v * 4u;
-    c->ip = c->mem[vec] | (c->mem[vec + 1] << 8);
-    b86_set_seg(c, B86_CS, (uint16_t)(c->mem[vec + 2] | (c->mem[vec + 3] << 8)));
+    c->ip = *b86_host(c, vec) | (*b86_host(c, vec + 1) << 8);
+    b86_set_seg(c, B86_CS, (uint16_t)(*b86_host(c, vec + 2) | (*b86_host(c, vec + 3) << 8)));
 }
 
 /* ------------------------------------------------------------------------ */

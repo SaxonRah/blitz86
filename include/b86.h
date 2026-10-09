@@ -21,6 +21,13 @@ extern "C" {
 #else
 #define B86_HOT
 #endif
+/* Translator / emitter code: runs only while translating, so it stays in
+   flash (B86_COLD_RAM=1 puts it back in RAM). */
+#if defined(B86_RAM_FUNCS) && B86_RAM_FUNCS && defined(B86_COLD_RAM) && B86_COLD_RAM
+#define B86_COLD B86_HOT
+#else
+#define B86_COLD
+#endif
 
 /* Guest memory: 1 MiB + the 64 KiB HMA (FFFF:0010..FFFF:FFFF) + slack so a
    word access at the very top never runs off the end. With A20 enabled
@@ -110,7 +117,32 @@ typedef struct B86Cpu {
     struct B86Jit *jit;
 
     uint64_t icount;        /* instructions retired by the interpreter      */
+#ifdef B86_PAGED
+    /* Page deltas (Thumb-2 + C paths; -DB86_PAGED). A guest access to the
+       nominal host address h = mem + linear really goes to h + pt[(h >> 12) & 511].
+       0 for normal pages; nonzero for 4 KiB pages moved elsewhere (SRAM)
+       with b86_map_range. `pt` points at pt_store, or (JIT) at the first
+       2 KiB of the SMC line table, which generated code reaches through r9.
+       Stack (SS) accesses in generated code are NOT translated: the embedder
+       must never map pages inside the current SS window. */
+    int32_t *pt;
+    int32_t pt_store[512];
+    /* bytes stored by REP STOS/MOVS per 4 KiB guest page since the embedder
+       last cleared it: a cheap signal for which pages to move to SRAM */
+    uint32_t rep_page_bytes[B86_MEM_BYTES >> 12];
+#endif
 } B86Cpu;
+
+/* Host pointer for a guest linear address (honours mapped pages). */
+#ifdef B86_PAGED
+static inline uint8_t *b86_host(const B86Cpu *c, uint32_t lin)
+{
+    uint8_t *p = c->mem + lin;
+    return p + c->pt[((uintptr_t)p >> 12) & 511u];
+}
+#else
+static inline uint8_t *b86_host(const B86Cpu *c, uint32_t lin) { return c->mem + lin; }
+#endif
 
 /* ---- core / interpreter --------------------------------------------------- */
 void     b86_init(B86Cpu *c, uint8_t *mem);           /* mem: B86_MEM_BYTES  */
@@ -126,6 +158,17 @@ extern const uint8_t b86_parity[256];
 static inline uint16_t b86_r16(const B86Cpu *c, int r) { return (uint16_t)c->r[r]; }
 
 /* ---- JIT -------------------------------------------------------------------- */
+/* Paged guest memory (-DB86_PAGED, Thumb-2 backend). Move the 4 KiB pages
+   [lin, lin+len) to `frame` (len bytes, contiguous: consecutive pages stay
+   consecutive, so accesses straddling two pages *inside* the range are
+   exact; a 16-bit access straddling the range's first or last byte is not).
+   The guest buffer must be 4 KiB aligned. Copies the current contents in.
+   Fails: -1 unsupported/misaligned/already mapped, -2 the frame's SMC-table
+   index range collides with guest lines, -3 the range holds translated code. Code in mapped pages is always
+   interpreted (stores there are not SMC-checked). Unmap copies back. */
+int      b86_map_range(B86Cpu *c, uint32_t lin, uint32_t len, uint8_t *frame);
+void     b86_unmap_range(B86Cpu *c, uint32_t lin, uint32_t len);
+int      b86_page_mapped(const B86Cpu *c, uint32_t lin);
 typedef struct B86JitStats {
     uint64_t blocks, guest_insns, host_bytes, helper_insns;
     uint64_t chains, lookups, flushes, smc_hits, smc_invalidations;

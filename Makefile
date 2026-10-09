@@ -17,7 +17,7 @@ QA64    ?= qemu-aarch64
 QT2     ?= qemu-arm
 B        = build
 
-all: $(B)/sst_interp $(B)/sst_jit_a64 $(B)/sst_jit_t2 $(B)/fuzz_a64 $(B)/fuzz_t2 $(B)/bench_a64 $(B)/bench_t2 \
+all: $(B)/sst_jit_t2p $(B)/fuzz_t2p $(B)/sst_interp $(B)/sst_jit_a64 $(B)/sst_jit_t2 $(B)/fuzz_a64 $(B)/fuzz_t2 $(B)/bench_a64 $(B)/bench_t2 \
      $(B)/hwbench_a64 $(B)/hwbench_t2
 
 $(B):
@@ -31,6 +31,12 @@ $(B)/%_a64: tests/%.c $(CORE) src/be_a64.c src/backend.h include/b86.h | $(B)
 
 $(B)/%_t2: tests/%.c $(CORE) src/be_t2.c src/backend.h include/b86.h | $(B)
 	$(T2CC) $(CFLAGS) $(INC) -o $@ $(CORE) src/be_t2.c $<
+
+# Paged guest memory (B86_PAGED) on Thumb-2: the RP2350 build's addressing.
+$(B)/%_t2p: tests/%.c $(CORE) src/be_t2.c src/backend.h include/b86.h | $(B)
+	$(T2CC) $(CFLAGS) -DB86_PAGED $(INC) -o $@ $(CORE) src/be_t2.c $<
+
+paged: $(B)/sst_jit_t2p $(B)/fuzz_t2p
 
 sst:
 	tools/fetch_sst.sh $(SST)

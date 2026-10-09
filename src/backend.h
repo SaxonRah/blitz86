@@ -9,7 +9,9 @@
  *   V_T0, V_T1   scratch. V_T2 exists only if be_has_t2 (AArch64).
  *
  * Clobber rules (the frontend relies on these):
- *   - be_ea: dst must be V_T0; may clobber V_T1 for ES/CS (uncached bases).
+ *   - be_ea: dst must be V_T0; may clobber V_T1 for ES/CS (uncached bases),
+ *     and for every segment except SS when be_paged (page-delta lookup;
+ *     stack accesses are not translated).
  *   - be_store with check: may clobber V_T1 (Thumb-2 SMC-check temp) and
  *     NZCV when be_store_clobbers_nzcv. Without check: clobbers nothing.
  *   - be_cbz16 / be_cbnz16: may clobber V_T1 and NZCV.
@@ -55,6 +57,7 @@ typedef struct Emit {
 
 extern const int be_has_t2;
 extern const int be_store_clobbers_nzcv;
+extern const int be_paged;          /* generated code honours cpu->pt (B86_PAGED) */
 extern const int be_logic_mode;             /* FM_* produced by be_test_res */
 
 /* Direct-mapped table the shared lookup stub probes for indirect jumps. */

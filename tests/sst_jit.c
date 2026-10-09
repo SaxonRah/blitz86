@@ -4,11 +4,21 @@
    reproduce) are detected by running the interpreter in JIT semantics first
    and are counted separately. */
 #include "b86.h"
+#ifdef B86_PAGED
+#define B86_GUEST_ALIGN __attribute__((aligned(0x200000)))  /* paged codemap layout */
+#else
+#define B86_GUEST_ALIGN __attribute__((aligned(64)))
+#endif
 #include "sst.h"
 #include <string.h>
 #include <sys/mman.h>
 
-static uint8_t mem[B86_MEM_BYTES] __attribute__((aligned(64)));
+#ifdef B86_PAGED   /* Pico layout: 640 KiB into a 2 MiB window (SMC table / page table) */
+static uint8_t mem_raw[0xA0000u + B86_MEM_BYTES] B86_GUEST_ALIGN;
+#define mem (mem_raw + 0xA0000u)
+#else
+static uint8_t mem[B86_MEM_BYTES] B86_GUEST_ALIGN;
+#endif
 
 static void setup(B86Cpu *c, const SstVec *t)
 {
