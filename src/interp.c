@@ -252,43 +252,46 @@ B86_HOT static inline uint16_t pop(B86Cpu *c)
 #define FL (c->flags)
 B86_HOT static inline void setf(B86Cpu *c, uint32_t bit, int on) { if (on) FL |= bit; else FL &= ~bit; }
 
+/* (p) branch-light flag computation: all six arithmetic flags in one
+   expression (CF 0x001, PF 0x004, AF 0x010, ZF 0x040, SF 0x080, OF 0x800) */
+B86_HOT static inline uint32_t zsp_bits(int w, uint32_t r)    /* r already masked */
+{
+    uint32_t sf = (w ? (r >> 8) : r) & 0x80u;                /* SF is bit 7 */
+    return (r ? 0u : (uint32_t)B86_ZF) | sf | b86_parity[r & 0xFFu];
+}
 B86_HOT static inline void szp(B86Cpu *c, int w, uint32_t r)
 {
-    uint32_t m = w ? 0xFFFFu : 0xFFu;
-    r &= m;
-    FL &= ~(uint32_t)(B86_SF | B86_ZF | B86_PF);
-    if (!r) FL |= B86_ZF;
-    if (r & (w ? 0x8000u : 0x80u)) FL |= B86_SF;
-    FL |= b86_parity[r & 0xFF];
+    r &= w ? 0xFFFFu : 0xFFu;
+    FL = (FL & ~(uint32_t)(B86_SF | B86_ZF | B86_PF)) | zsp_bits(w, r);
 }
 
 B86_HOT static uint32_t add_f(B86Cpu *c, int w, uint32_t a, uint32_t b, uint32_t cin)
 {
-    uint32_t m = w ? 0xFFFFu : 0xFFu, sb = w ? 0x8000u : 0x80u;
-    uint32_t r = a + b + cin;
-    setf(c, B86_CF, (r & ~m) != 0);
-    r &= m;
-    setf(c, B86_OF, ((a ^ r) & (b ^ r) & sb) != 0);
-    setf(c, B86_AF, ((a ^ b ^ r) & 0x10u) != 0);
-    szp(c, w, r);
+    uint32_t m = w ? 0xFFFFu : 0xFFu;                        /* OF: sign bit 7/15 -> bit 11 */
+    uint32_t full = a + b + cin, r = full & m;
+    uint32_t f = (full > m ? (uint32_t)B86_CF : 0u)
+               | ((w ? (((a ^ r) & (b ^ r)) >> 4) : (((a ^ r) & (b ^ r)) << 4)) & (uint32_t)B86_OF)
+               | ((a ^ b ^ r) & (uint32_t)B86_AF)
+               | zsp_bits(w, r);
+    FL = (FL & ~(uint32_t)B86_ARITH) | f;
     return r;
 }
 B86_HOT static uint32_t sub_f(B86Cpu *c, int w, uint32_t a, uint32_t b, uint32_t cin)
 {
-    uint32_t m = w ? 0xFFFFu : 0xFFu, sb = w ? 0x8000u : 0x80u;
-    uint32_t r = a - b - cin;
-    setf(c, B86_CF, (r & ~m) != 0);
-    r &= m;
-    setf(c, B86_OF, ((a ^ b) & (a ^ r) & sb) != 0);
-    setf(c, B86_AF, ((a ^ b ^ r) & 0x10u) != 0);
-    szp(c, w, r);
+    uint32_t m = w ? 0xFFFFu : 0xFFu;
+    uint32_t full = a - b - cin, r = full & m;
+    uint32_t f = ((full & ~m) ? (uint32_t)B86_CF : 0u)
+               | ((w ? (((a ^ b) & (a ^ r)) >> 4) : (((a ^ b) & (a ^ r)) << 4)) & (uint32_t)B86_OF)
+               | ((a ^ b ^ r) & (uint32_t)B86_AF)
+               | zsp_bits(w, r);
+    FL = (FL & ~(uint32_t)B86_ARITH) | f;
     return r;
 }
 B86_HOT static uint32_t log_f(B86Cpu *c, int w, uint32_t r)
 {
-    FL &= ~(uint32_t)(B86_CF | B86_OF | B86_AF);
-    szp(c, w, r);
-    return r & (w ? 0xFFFFu : 0xFFu);
+    r &= w ? 0xFFFFu : 0xFFu;
+    FL = (FL & ~(uint32_t)B86_ARITH) | zsp_bits(w, r);
+    return r;
 }
 
 /* op: 0 ADD 1 OR 2 ADC 3 SBB 4 AND 5 SUB 6 XOR 7 CMP. Returns result; CMP
@@ -558,6 +561,7 @@ B86_HOT int b86_step(B86Cpu *c)
         if (op == 0xF0 || op == 0xF1) continue;
         break;
     }
+    c->step_op = op; c->step_oip = (uint16_t)(s->ip - 1u);   /* for cold runs (jit.c) */
     c->icount++;
     int w = op & 1;
 

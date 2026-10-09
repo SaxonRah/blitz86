@@ -2611,7 +2611,7 @@ static const uint8_t cold_ctl[256] = {
     [0xF0 ... 0xF3] = 4, [0xF4] = 1,
 };
 
-B86_HOT static int cold_run(J *j, B86Cpu *c, uint32_t key, int force)
+B86_HOT static inline unsigned heat_bump(J *j, uint32_t key)
 {
     uint32_t h = (key * 2654435761u) >> (32 - HEAT_BITS);
     if (j->heat_key[h] != key) { j->heat_key[h] = key; j->heat[h] = 0; }
@@ -2620,7 +2620,12 @@ B86_HOT static int cold_run(J *j, B86Cpu *c, uint32_t key, int force)
         for (uint32_t i = 0; i < HEATN; ++i) j->heat[i] >>= 1;
     }
     if (j->heat[h] < 255) j->heat[h]++;
-    if (!force && j->heat[h] >= j->hot_threshold) return 0;
+    return j->heat[h];
+}
+
+B86_HOT static int cold_run(J *j, B86Cpu *c, uint32_t key, int force)
+{
+    if (heat_bump(j, key) >= j->hot_threshold && !force) return 0;
     /* interpret one straight-line run: stop after a control transfer, at a
        translated entry, at the trap segment, or when the host wants control */
     uint32_t steps = 0;
@@ -2632,26 +2637,43 @@ B86_HOT static int cold_run(J *j, B86Cpu *c, uint32_t key, int force)
 #endif
         /* (o) cheap control classification from the opcode bytes instead of
            a full decode()+classify() per interpreted instruction */
-        uint16_t p = ip0;
-        uint8_t op = fb(c, cs, p);
-        while ((cold_ctl[op] & 4) && (uint16_t)(p - ip0) < 4u) op = fb(c, cs, ++p);   /* prefixes */
+        {   /* (p) REP MOVS/STOS: never interpret (byte loop over up to 64 KiB);
+               end the run before it, or report it hot so it is translated and
+               runs through the bulk REP helper */
+            uint8_t b0 = fb(c, cs, ip0), rp = 0;
+            uint16_t q = ip0;
+            for (int n = 0; n < 3 && (cold_ctl[b0] & 4); ++n) { if (b0 >= 0xF2) rp = b0; b0 = fb(c, cs, ++q); }
+            if (rp && (b0 == 0xA4 || b0 == 0xA5 || b0 == 0xAA || b0 == 0xAB) && !force) {
+                if (!steps) return 0;
+                break;
+            }
+        }
+        int r = b86_step(c);
+        steps++;
+        /* the step reports its opcode and where it sat (after prefixes) */
+        uint8_t op = c->step_op;
+        uint16_t p = c->step_oip;
         unsigned k = cold_ctl[op] & 3u;
         if (op == 0xFF || op == 0x8E) {
             uint8_t reg = (fb(c, cs, (uint16_t)(p + 1)) >> 3) & 7;
             k = op == 0xFF ? (reg >= 2 && reg <= 5) : ((reg & 3) == B86_CS);
         }
         uint16_t jnext = (uint16_t)(p + 2);           /* short Jcc/LOOP/JCXZ */
-        int r = b86_step(c);
-        steps++;
         if (r == B86_HALT) { c->irq |= 0x80000000u; break; }
         /* keep going through a not-taken branch: stopping there would make
            every fall-through a dispatch target, heat it, and translate it
            as its own entry (fragmenting superblocks at each Jcc) */
-        if (c->irq || steps >= 64u) break;
+        if (c->irq || steps >= 256u) break;
         if (c->seg[B86_CS] != cs || c->seg[B86_CS] == c->trap_cs) break;
-        if (k == 1 || (k == 2 && (uint16_t)c->ip != jnext)) break;
         if ((uint16_t)c->ip < ip0 && k == 0) break;   /* wrapped the segment */
         if (BIT_GET(j->ent, (c->seg[B86_CS] << 4) + (c->ip & 0xFFFFu))) break;
+        /* (p) follow taken transfers inside the cold run instead of going
+           back through the dispatcher each time; the target earns heat as
+           a dispatch would, and the run ends when it turns hot */
+        if (k == 1 || (k == 2 && (uint16_t)c->ip != jnext)) {
+            if (force) break;
+            if (heat_bump(j, (cs << 16) | (c->ip & 0xFFFFu)) >= j->hot_threshold) break;
+        }
     }
     if (j->e.count_ret) c->icnt += steps;
 #ifdef B86_COND_HISTO

@@ -1,5 +1,23 @@
 # Changes
 
+## 2026-10-09 (p) — cold runs follow taken branches; cheaper interpreter flags
+
+Pico (o): 30.3 fps. The slow phases still interpret 4-5% of instructions.
+
+* Cold runs no longer return to the dispatcher at every taken branch: they
+  follow it, bump the target's heat exactly as a dispatch would, and stop
+  when the target turns hot, reaches translated code, or after 256 steps.
+* b86_step reports its opcode and the opcode's IP (step_op/step_oip), so the
+  cold loop classifies control flow without refetching bytes.
+* REP MOVS/STOS are never interpreted: a cold run stops before one, and a
+  run starting at one reports it hot so it is translated (bulk REP helper).
+* ADD/SUB/logic flags are computed branch-light (one expression for all six).
+* Tried and dropped: lazy flags inside the interpreter (cold runs are short
+  and nearly every producer is consumed by the next Jcc, so evaluating the
+  record cost more than computing flags eagerly).
+* Host instructions per interpreted instruction (all-cold bench, vs (o)):
+  regmix 235 -> 215, cmpbr 222 -> 189, memrmw 263 -> 238, stack 177 -> 166.
+
 ## 2026-10-09 (o) — cheaper cold (interpreted) instructions
 
 Pico v46: 25.8 fps; slow phases spend ~4.5-6.5% of instructions in the

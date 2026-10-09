@@ -117,6 +117,8 @@ typedef struct B86Cpu {
     struct B86Jit *jit;
 
     uint64_t icount;        /* instructions retired by the interpreter      */
+    uint16_t step_oip;      /* last b86_step: IP of its opcode byte (after prefixes) */
+    uint8_t  step_op;       /* last b86_step: the opcode                    */
 #ifdef B86_PAGED
     /* Page deltas (Thumb-2 + C paths; -DB86_PAGED). A guest access to the
        nominal host address h = mem + linear really goes to h + pt[(h >> 12) & 511].
