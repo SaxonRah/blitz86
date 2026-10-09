@@ -1,5 +1,49 @@
 # Changes
 
+## 2026-10-09 (j) — fewer C round trips and dispatcher detours
+
+3DBENCH host profile (Thumb-2/qemu, blitzBUS v37 IRQs): per 10M benchmark
+instructions, C-level dispatches 300-340K -> 10-60K, flag materialization
+calls ~350K -> 130-230K, condition calls 40-80K -> ~10K; qemu native time for
+a 300M-instruction run 17.4 s -> 10.4 s.
+
+* **Block splitting removed** (left as an off-by-default experiment,
+  `split_mid`). Killing the block that covered a new mid entry freed no code
+  space in the generation, cost a retranslation, and left every branch
+  already chained to the killed block detouring through its dead stub into
+  the C dispatcher until the next flush: that was most of 3DBENCH's 300K
+  dispatches per 10M instructions.
+* **Cold runs continue through not-taken branches.** Stopping the
+  interpreter at every Jcc made each fall-through a dispatch target that
+  heated up and became its own entry, cutting hot loops into chained pieces.
+* **Flags without C calls:**
+  - `flags_if_lazy`: CF consumers (ADC/SBB, RCL/RCR, CMC/CLC/STC) only call
+    the materializer when a record is pending (`lz_kind`, plus `lz_ikind`
+    where OF matters).
+  - CMC/CLC/STC are NZCV producers (C = CF) and CMC a fusable carry consumer;
+    CMC reads only CF (was ALLF).
+  - Taken JB/JAE exits whose target needs only CF store the known CF directly
+    (`synth`); block-end exits that need only CF take it from NZCV
+    (`endsynth`). Both leave `lz_kind = LZ_NONE` for the next block's fast path.
+  - SHR/SAR by 1 produce C for fused consumers.
+  - JE/JNE/JS/JNS that cannot fuse (a Thumb-2 store check clobbered NZCV)
+    test the in-block producer's `lz_res` inline (`zsrc`).
+  - Lookahead follows the taken edge of one conditional branch instead of
+    assuming everything is live there.
+  - `materializes()` only forces an earlier producer's record inline when
+    that producer's flags outlive the materializing instruction.
+* **In-block forward branches** may skip plain stores (MOV r/m) too: the
+  store's NZCV clobber cannot matter after the join, because pass A never
+  fuses across it on the fall-through path.
+
+Debug: `-DB86_COND_HISTO` also records C-dispatch targets (`b86_disp_ip`)
+and block exit reasons (`b86_xr`).
+
+Verified (qemu): silicon 585,933/585,933 on both backends; fuzz 0 mismatches
+(Thumb-2 and AArch64, incl. tiering and NOSPEC); blitzBUS v37/v38 DOS2TEST
+25/25 + MDSTRESS 0xA298 on both ISAs, tiering on and off; 3DBENCH reaches
+its score screen.
+
 ## 2026-10-09 (i) — 3DBENCH: code-cache thrash and interpreter fallbacks
 
 Host reproduction of 3DBENCH 1.0 (blitzBUS bb_live + bb_vga, Thumb-2 under

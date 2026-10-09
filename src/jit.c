@@ -14,6 +14,7 @@
  */
 #include "backend.h"
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #ifdef B86_DEBUG_DUMP
 #include <stdio.h>
@@ -34,9 +35,12 @@
 #define ALLF        ((uint16_t)B86_ARITH)
 
 #define OFF(f) ((unsigned)offsetof(B86Cpu, f))
+#ifdef B86_COND_HISTO
+#include <stdio.h>
+#endif
 #ifdef B86_COND_HISTO      /* debug: record the guest site of each cond/flags call */
 #define DBG_SITE(t, d) be_stctx_imm((t)->e, ((t)->cs << 4) + (d)->ip, OFF(retired))
-uint32_t b86_cond_ip[1 << 20], b86_flags_ip[1 << 20];
+uint32_t b86_cond_ip[1 << 20], b86_flags_ip[1 << 20], b86_disp_ip[1 << 20], b86_xr[8];
 #else
 #define DBG_SITE(t, d) ((void)0)
 #endif
@@ -103,6 +107,7 @@ typedef struct B86Jit {
     int hot_external;           /* fast/codemap supplied by the caller */
     int no_spec;                /* testing: no RET-specialized continuations */
     int no_join;                /* testing: superblocks never stop at translated code */
+    int split_mid;              /* experiment: kill blocks covering a new mid entry */
     uint8_t *cov;               /* bit per guest byte: start of a translated insn (this generation) */
     uint8_t *ent;               /* bit per guest byte: a block entry (this generation) */
     uint32_t *heat_key;         /* cold entries: CS:IP tag per slot      */
@@ -142,6 +147,12 @@ typedef struct Insn {
                                            registers); 2: marker, record already in ctx */
     uint8_t valid;                      /* x86 flags representable in NZCV */
     uint8_t ijoin;                      /* forward Jcc: index of its in-block target (0: exit) */
+    uint8_t zsrc;                       /* non-fused JE/JNE/JS/JNS: producer index + 1 whose
+                                           inline record's lz_res gives ZF/SF directly */
+    uint8_t endsynth;                   /* last insn: block-end exit needs only CF; it is
+                                           read from NZCV (ARM cond endsynth-1) */
+    uint8_t synth;                      /* fused JB/JAE whose exit needs only CF: the
+                                           exit writes the known CF instead of records */
     uint8_t cmode;                      /* fused carry consumer: ARM condition for CF
                                            (mode is reused when it also produces NZCV) */
 } Insn;
@@ -257,8 +268,8 @@ B86_HOT static void classify(Insn *d)
     case 0x9D: d->fuse = 0; d->fdef = ALLF; d->native = 1; d->nzclob = 1; return;
     case 0x9E: d->fuse = 0; d->fdef = ALLF & ~B86_OF; d->native = 1; d->nzclob = 1; return;
     case 0x9F: d->fuse = ALLF & ~B86_OF; d->native = 1; d->nzclob = 1; return;
-    case 0xF5: case 0xF8: case 0xF9:   /* inline after materializing: reads the ctx record */
-        d->fuse = ALLF; d->fdef = B86_CF; d->native = 1; d->nzclob = 1; return;
+    case 0xF5: case 0xF8: case 0xF9:   /* CF via ctx flags; materializes() keeps older records inline */
+        d->fuse = op == 0xF5 ? B86_CF : 0; d->fdef = B86_CF; d->native = 1; d->nzclob = 1; return;
     case 0xFA: case 0xFB: case 0xFC: case 0xFD: d->fuse = 0; d->native = 1; return;
     case 0xD6: d->fuse = B86_CF; return;
     case 0xD5: d->fuse = 0; d->fdef = ALLF; return;
@@ -387,7 +398,11 @@ B86_HOT static int guard_add(Guard *g, uint32_t lo, uint32_t hi)
 /* Flags live on entry to `ip`. Scans forward (following direct JMP and
    CALL) until every flag is defined. Scanned bytes join the block's guard
    so that modifying them invalidates the block. */
-B86_HOT static uint16_t lookahead(J *j, uint32_t cs, uint16_t ip, Guard *g)
+B86_HOT static uint16_t lookahead_d(J *j, uint32_t cs, uint16_t ip, Guard *g, int depth);
+B86_HOT static uint16_t lookahead(J *j, uint32_t cs, uint16_t ip, Guard *g) { return lookahead_d(j, cs, ip, g, 1); }
+/* depth > 0: a conditional branch (Jcc/LOOP/JCXZ) does not end the scan;
+   its taken edge is scanned recursively and the fall-through continues. */
+B86_HOT static uint16_t lookahead_d(J *j, uint32_t cs, uint16_t ip, Guard *g, int depth)
 {
     if (j->no_lookahead) return ALLF;
     uint16_t need = 0, defd = 0, res = ALLF;
@@ -403,6 +418,12 @@ B86_HOT static uint16_t lookahead(J *j, uint32_t cs, uint16_t ip, Guard *g)
         if ((d.cls == C_JMP || d.cls == C_CALL) && follows < 2) {
             if (!guard_add(&t, (cs << 4) + seg, (cs << 4) + d.next)) return ALLF;
             p = seg = d.target; follows++;
+            continue;
+        }
+        if (d.cls == C_JCC && depth > 0 && (uint16_t)(ALLF & ~defd)) {
+            uint16_t tk = lookahead_d(j, cs, d.target, &t, depth - 1);   /* adds its bytes to t */
+            need |= tk & ~defd;
+            p = d.next;
             continue;
         }
         if (d.cls == C_JCC || ends_block(&d)) { res = (uint16_t)(need | (ALLF & ~defd)); p = d.next; done = 1; break; }
@@ -439,7 +460,9 @@ B86_HOT static int producer_class(const Insn *d, uint8_t *valid)
     else if ((op >= 0x40 && op <= 0x47) || ((op == 0xFE || op == 0xFF) && d->reg == 0)) { *valid = 0x7; return FM_ADD; }
     else if ((op >= 0x48 && op <= 0x4F) || ((op == 0xFE || op == 0xFF) && d->reg == 1)) { *valid = 0x7; return FM_SUB; }
     if ((op == 0xD0 || op == 0xD1) && d->reg == 4) { *valid = 0xF; return FM_ADD; }  /* ADDS x,x,x */
+    if ((op == 0xD0 || op == 0xD1) && (d->reg == 5 || d->reg == 7)) { *valid = 0x8; return FM_ADD; }  /* SHR/SAR 1: C = bit 0 */
     if (is_rcx(d)) { *valid = d->reg == 2 ? 0x9 : 0x8; return FM_ADD; }  /* RCL: CF,OF  RCR: CF */
+    if ((op == 0xF5 || op == 0xF8 || op == 0xF9) && d->native) { *valid = 0x8; return FM_ADD; }  /* CMC/CLC/STC */
     if (xop < 0) return 0;
     *valid = 0xF; /* bit0 OF bit1 SF bit2 ZF bit3 CF */
     switch (xop) {
@@ -672,9 +695,16 @@ B86_HOT static int smc_exit_store(const Insn *d)
    helper, no C call): then flag state, pending records and deferred-record
    registers are identical on both paths, and the only difference is the
    retired count, which the fall-through path settles at the join. */
+B86_HOT static int checked_store(const Insn *d);
 B86_HOT static int simple_between(const Insn *x)
 {
-    return x->cls == C_SEQ && x->native && !x->fdef && !x->nzclob && !x->virt && !x->rep;
+    if (x->cls != C_SEQ || !x->native || x->fdef || x->virt || x->rep) return 0;
+    if (!x->nzclob) return 1;
+    /* A plain store only clobbers NZCV through its SMC check (Thumb-2).
+       Pass A already refuses to fuse across it on the fall-through path, so
+       no consumer after the join relies on NZCV from before the branch. */
+    return checked_store(x) && x->has_modrm && x->mod != 3 &&
+           (x->op == 0x88 || x->op == 0x89 || x->op == 0xC6 || x->op == 0xC7 || x->op == 0x8C);
 }
 B86_HOT static void plan_joins(Insn *v, int npre, int n)
 {
@@ -704,7 +734,7 @@ B86_HOT static void analyze(J *j, uint32_t cs, Insn *v, int n, uint16_t live_out
     /* Pass A: fuse each native Jcc with its producer through NZCV. */
     for (int q = 0; q < n; ++q) {
         Insn *c = &v[q];
-        int carry = is_carry_alu(c) || is_rcx(c);
+        int carry = is_carry_alu(c) || is_rcx(c) || (c->op == 0xF5 && c->native);
         if (!is_jcc(c) && !carry) continue;
         uint16_t use = carry ? B86_CF : cc_use[(c->op & 15) >> 1];
         int p = -1;
@@ -723,6 +753,61 @@ B86_HOT static void analyze(J *j, uint32_t cs, Insn *v, int n, uint16_t live_out
         if (is_mem_dst_producer(pr) && be_store_clobbers_nzcv) continue;
         c->fused = 1; c->mode = (uint8_t)ac; c->cmode = (uint8_t)ac; c->prod = (uint8_t)p;
         pr->arm = 1; pr->mode = (uint8_t)mode; pr->armneed |= use;
+    }
+    /* JE/JNE/JS/JNS that could not fuse (typically: a checked store on
+       Thumb-2 clobbered NZCV) read ZF/SF straight from the in-block
+       producer's record result instead of materializing flags in C. */
+    for (int q = 0; q < n; ++q) {
+        Insn *c = &v[q];
+        int cc = c->op & 15;
+        if (!is_jcc(c) || c->fused || !(cc == 4 || cc == 5 || cc == 8 || cc == 9)) continue;
+        uint16_t use = (cc < 8) ? B86_ZF : B86_SF;
+        for (int m = q - 1; m >= 0; --m) {
+            if (!(v[m].fdef & use)) {
+                /* helpers (and CL shifts) may write a record of their own */
+                if (!v[m].native || (v[m].nfd & use) || v[m].virt) break;
+                continue;
+            }
+            const Insn *p = &v[m];
+            int o = p->op;
+            int ok = p->native && !p->virt &&
+                     ((o < 0x40 && (o & 7) < 6) || (o >= 0x80 && o <= 0x85) || o == 0xA8 || o == 0xA9 ||
+                      ((o == 0xD0 || o == 0xD1) && (p->reg == 4 || p->reg == 5 || p->reg == 7)) ||
+                     ((o == 0xF6 || o == 0xF7) && p->reg < 2));          /* TEST r/m, imm */
+            if (ok) c->zsrc = (uint8_t)(m + 1);
+            break;
+        }
+    }
+    /* A taken JB (JAE) means CF = 1 (0). When nothing but CF is live at that
+       exit, the exit stores CF into ctx flags directly (no record, no call). */
+    for (int q = 0; q < n; ++q) {
+        Insn *c = &v[q];
+        if (is_jcc(c) && c->fused && !c->ijoin && ((c->op & 15) == 2 || (c->op & 15) == 3) &&
+            c->live_taken == B86_CF) c->synth = 1;
+    }
+    /* Same at the block-end exit (fall-through or JMP): if only CF is live
+       there and its producer can hold it in NZCV up to the exit, the exit
+       stores it into ctx flags instead of the producer writing a record. */
+    {
+        Insn *last = &v[n - 1];
+        int k = -1;
+        if (!ends_block(last)) k = n - 1;
+        else if (last->op == 0xE9 || last->op == 0xEB) k = n - 2;
+        if (k >= 0 && last->live == B86_CF) {
+            int p = -1;
+            for (int m = k; m >= 0; --m) {
+                if (v[m].fdef & B86_CF) { p = m; break; }
+                if (nz_clobber(&v[m])) break;
+            }
+            uint8_t valid = 0;
+            int mode = (p >= 0 && v[p].native && !v[p].virt) ? producer_class(&v[p], &valid) : 0;
+            int ac = mode ? arm_cond(mode, 2) : -1;
+            if (ac >= 0 && (valid & 0x8) && (v[p].fdef & B86_CF) &&
+                !(is_mem_dst_producer(&v[p]) && be_store_clobbers_nzcv) && !is_carry_alu(&v[p])) {
+                v[p].arm = 1; v[p].mode = (uint8_t)mode; v[p].armneed |= B86_CF;
+                last->endsynth = (uint8_t)(ac + 1);
+            }
+        }
     }
     for (int i = 0; i < n; ++i) v[i].wm = v[i].virt ? 0 : wmask(&v[i]);
     /* Pass B: lazy record unless every reader is a fused consumer. A record
@@ -746,12 +831,12 @@ B86_HOT static void analyze(J *j, uint32_t cs, Insn *v, int n, uint16_t live_out
             touched |= q->wm;
             if (q->native && checked_store(q) && smc_exit_store(q) && (live_after(q) & rem)) mid = 1;
             if ((q->fuse & rem) && !(q->fused && q->prod == i)) mid = 1;
-            if (q->cls == C_JCC && !q->ijoin && (q->live_taken & rem)) { exits = 1; if (touched & need) can = 0; }
+            if (q->cls == C_JCC && !q->ijoin && !q->synth && (q->live_taken & rem)) { exits = 1; if (touched & need) can = 0; }
             if (!q->native && (live_before(q) & rem)) mid = 1;
-            if (materializes(q)) mid = 1;
+            if (materializes(q) && (rem & ~q->fdef)) mid = 1;   /* q folds records; p's flags outlive it */
             rem &= (uint16_t)~q->fdef;
         }
-        if (rem && (v[n - 1].live & rem)) { exits = 1; if (touched & need) can = 0; }
+        if (rem && (v[n - 1].live & rem) && !v[n - 1].endsynth) { exits = 1; if (touched & need) can = 0; }
         p->lazy = (uint8_t)(mid || exits);
         p->defer = (uint8_t)(p->lazy && !mid && can);
         if (p->virt == 2) p->lazy = p->defer = 0;    /* already in ctx */
@@ -781,9 +866,11 @@ static void emit_deferred(Tx *t, int k, uint16_t live);
 
 /* Backward conditional exit laid out inline: `skip` is the branch taken when
    the condition FAILS. Taken path = records + poll + one patchable B. */
+B86_HOT static void emit_synth_cf(Tx *t, int cf);
 B86_HOT static void emit_back_exit(Tx *t, uint8_t *skip, uint16_t target)
 {
-    emit_deferred(t, t->cur, t->v[t->cur].live_taken);
+    if (t->v[t->cur].synth) emit_synth_cf(t, (t->v[t->cur].op & 15) == 2);
+    else emit_deferred(t, t->cur, t->v[t->cur].live_taken);
     be_exit_chain(t->e, target, 1);
     be_bind(t->e, skip, t->e->p);
 }
@@ -842,6 +929,27 @@ B86_HOT static void deferred_pq(Tx *t, int k, uint16_t live, int *P, int *Q, int
     *qa = *Q >= 0 && v[*Q].defer && (live & v[*Q].fdef) && defer_info(&v[*Q], &o);
 }
 
+B86_HOT static void emit_synth_cf(Tx *t, int cf)
+{
+    Emit *e = t->e;
+    be_stctx_imm(e, LZ_NONE, OFF(lz_kind));
+    be_ldctx(e, V_T0, OFF(flags));
+    if (cf) be_opi(e, AOP_ORR, V_T0, V_T0, B86_CF);
+    else be_opi(e, AOP_AND, V_T0, V_T0, (uint16_t)~B86_CF);
+    be_stctx(e, V_T0, OFF(flags));
+}
+
+B86_HOT static void emit_end_synth(Tx *t, int ac)
+{
+    Emit *e = t->e;
+    be_get_carry(e, V_T0, ac);
+    be_stctx_imm(e, LZ_NONE, OFF(lz_kind));       /* may clobber T1 */
+    be_ldctx(e, V_T1, OFF(flags));
+    be_opi(e, AOP_AND, V_T1, V_T1, (uint16_t)~B86_CF);
+    be_op(e, AOP_ORR, V_T1, V_T1, V_T0);
+    be_stctx(e, V_T1, OFF(flags));
+}
+
 B86_HOT static void emit_deferred(Tx *t, int k, uint16_t live)
 {
     Insn *v = t->v;
@@ -856,6 +964,22 @@ B86_HOT static void emit_deferred(Tx *t, int k, uint16_t live)
         emit_record(t, &o, Q < 0 && v[P].pendb);
     if (Q >= 0 && v[Q].defer && (live & v[Q].fdef) && defer_info(&v[Q], &o))
         emit_record(t, &o, 0);
+}
+
+/* Make ctx `flags` valid for CF (and, with ikind, for everything) without a
+   C call when nothing is pending: a materialized state (lz_kind == LZ_NONE)
+   is common after CMC/STC/CLC, POPF, helpers and synthesized exits.
+   Clobbers V_T0/V_T1 and NZCV. Leaves t->inc_pending alone (an INC/DEC
+   overlay may still be pending on the fast path; it never changes CF). */
+B86_HOT static void flags_if_lazy(Tx *t, Insn *d, int with_overlay)
+{
+    Emit *e = t->e;
+    be_ldctx(e, V_T0, OFF(lz_kind));
+    if (with_overlay) { be_ldctx(e, V_T1, OFF(lz_ikind)); be_op(e, AOP_ORR, V_T0, V_T0, V_T1); }
+    uint8_t *skip = be_cbz(e, V_T0);
+    (DBG_SITE(t, d), be_call_flags(e));
+    be_bind(e, skip, e->p);
+    (void)d;
 }
 
 /* EA of modrm memory operand into V_T0 */
@@ -980,8 +1104,7 @@ B86_HOT static int emit_alu(Tx *t, Insn *d, int xop, int w, Op dst, Op src, int 
         if (x >= V_T0 && x != res && x != a && x != b) pool.busy[x] = 0;   /* x unused */
         cft = pick(&pool);
         if (cft < 0) return 0;
-        if (!d->fused) (DBG_SITE(t, d), be_call_flags(e));         /* CF from ctx; clobbers temps */
-        if (!d->fused) t->inc_pending = 0;
+        if (!d->fused) flags_if_lazy(t, d, 0);        /* CF from ctx; clobbers temps */
     }
     if (d->arm && logic && res < V_T0) { /* test_res needs a scratch: x */ }
 
@@ -1196,6 +1319,21 @@ B86_HOT static int lower(Tx *t, Insn *d)
         int back = d->target <= d->ip;
         if (d->fused) {
             site = be_jcc(e, back ? (d->mode ^ 1) : d->mode);   /* ARM condition */
+        } else if (d->zsrc) {                    /* ZF/SF from the producer's lz_res */
+            const Insn *p = &t->v[d->zsrc - 1];
+            int bits = (p->op == 0x80 || p->op == 0x82) ? 8 : (p->op & 1) ? 16 : 8;
+            be_ldctx(e, V_T0, OFF(lz_res));
+            int nz;                              /* taken when (tested value != 0) */
+            if (cc == 4 || cc == 5) {
+                if (bits == 8) be_ubfx(e, V_T0, V_T0, 0, 8);
+                nz = cc == 5;
+            } else {
+                be_ubfx(e, V_T0, V_T0, (unsigned)bits - 1u, 1);
+                nz = cc == 8;
+            }
+            if (back) nz = !nz;
+            site = (bits == 16 && (cc == 4 || cc == 5)) ? (nz ? be_cbnz16(e, V_T0) : be_cbz16(e, V_T0))
+                                                        : (nz ? be_cbnz(e, V_T0) : be_cbz(e, V_T0));
         } else {
             DBG_SITE(t, d), be_call_cond(e, cc);
             t->inc_pending = 0;
@@ -1404,13 +1542,13 @@ B86_HOT static int lower(Tx *t, Insn *d)
             /* carry-in -> T0 */
             if (d->fused) {
                 be_get_carry(e, V_T0, d->cmode);
-                if (ctx) {                       /* fold older records first */
+                if (ctx) {                       /* fold older records first (OF must not be overridden) */
                     be_stctx(e, V_T0, OFF(scratch));
-                    (DBG_SITE(t, d), be_call_flags(e)); t->inc_pending = 0;
+                    flags_if_lazy(t, d, 1); t->inc_pending = 0;
                     be_ldctx(e, V_T0, OFF(scratch));
                 }
             } else {
-                (DBG_SITE(t, d), be_call_flags(e)); t->inc_pending = 0;
+                flags_if_lazy(t, d, ctx); if (ctx) t->inc_pending = 0;
                 be_ldctx(e, V_T0, OFF(flags));
                 be_ubfx(e, V_T0, V_T0, 0, 1);
             }
@@ -1476,8 +1614,12 @@ B86_HOT static int lower(Tx *t, Insn *d)
         if (mem) be_load(e, w, V_T1, V_T0);
         else if (!w && d->rm >= 4) be_ubfx(e, V_T1, d->rm - 4, 8, 8);
         if (d->lazy) be_stctx(e, a, OFF(lz_a));
-        if (d->arm) be_addsub_sh(e, 0, x, res, a, a, sh);        /* x = a<<sh; ADDS x,x,x */
+        if (d->arm && d->reg == 4) be_addsub_sh(e, 0, x, res, a, a, sh);   /* x = a<<sh; ADDS x,x,x */
         else if (d->reg == 4) be_lsl(e, res, a, 1);
+        else if (d->arm) {                                       /* SHR/SAR: C = bit 0, then shift */
+            be_carry_from_bit(e, x, a, 0);
+            if (d->reg == 5) be_ubfx(e, res, a, 1, bits - 1); else be_sbfx(e, res, a, 1, bits - 1);
+        }
         else if (d->reg == 5) be_ubfx(e, res, a, 1, bits - 1);
         else be_sbfx(e, res, a, 1, bits - 1);
         if (d->lazy) be_stctx(e, res, OFF(lz_res));
@@ -1497,14 +1639,29 @@ B86_HOT static int lower(Tx *t, Insn *d)
         if (mem) be_store(e, w, V_T1, V_T0, 1, d->next);
         else if (!w) put8(t, d->rm, V_T1);
         return 1; }
-    case 0xF5: case 0xF8: case 0xF9:          /* CMC / CLC / STC */
-        (DBG_SITE(t, d), be_call_flags(e));
-        t->inc_pending = 0;
-        be_ldctx(e, V_T0, OFF(flags));
-        be_opi(e, op == 0xF5 ? AOP_EOR : op == 0xF8 ? AOP_AND : AOP_ORR, V_T0, V_T0,
-               op == 0xF8 ? (uint16_t)~B86_CF : B86_CF);
-        be_stctx(e, V_T0, OFF(flags));
-        return 1;
+    case 0xF5: case 0xF8: case 0xF9: {        /* CMC / CLC / STC */
+        /* new CF -> T0 (CMC: carry-in from NZCV when fused, else ctx) */
+        if (op != 0xF5) be_movi(e, V_T0, op == 0xF9 ? 1u : 0u);
+        else if (d->fused) be_get_carry(e, V_T0, d->cmode);
+        else {
+            flags_if_lazy(t, d, 0);                /* an overlay keeps CF: may stay pending */
+            be_ldctx(e, V_T0, OFF(flags));
+            be_ubfx(e, V_T0, V_T0, 0, 1);
+        }
+        if (op == 0xF5) be_opi(e, AOP_EOR, V_T0, V_T0, 1u);
+        if (d->lazy) {                             /* CF into ctx flags */
+            if (op != 0xF5 || d->fused) {
+                be_stctx(e, V_T0, OFF(scratch));
+                flags_if_lazy(t, d, 0);
+                be_ldctx(e, V_T0, OFF(scratch));
+            }
+            be_ldctx(e, V_T1, OFF(flags));
+            be_opi(e, AOP_AND, V_T1, V_T1, (uint16_t)~B86_CF);
+            be_op(e, AOP_ORR, V_T1, V_T1, V_T0);
+            be_stctx(e, V_T1, OFF(flags));
+        }
+        if (d->arm) be_carry_from_bit(e, V_T1, V_T0, 0);   /* NZCV: C = CF for fused consumers */
+        return 1; }
     case 0xE2: /* LOOP */
         be_opi(e, AOP_SUB, B86_CX, B86_CX, 1);
         if (d->inv) { add_side(t, be_cbz16(e, B86_CX), d->target, d->ip); return 1; }
@@ -1530,7 +1687,7 @@ B86_HOT static int lower(Tx *t, Insn *d)
         be_exit_chain(e, d->target, d->target <= d->ip);
         return 1;
     case 0xE9: case 0xEB:
-        emit_deferred(t, t->cur - 1, d->live);
+        if (d->endsynth) emit_end_synth(t, d->endsynth - 1); else emit_deferred(t, t->cur - 1, d->live);
         be_exit_chain(e, d->target, d->target <= d->ip);
         return 1;
     case 0xC3: case 0xC1: case 0xC2: case 0xC0: {
@@ -1824,7 +1981,11 @@ B86_HOT static Block *translate_ex(J *j, uint32_t cs, uint16_t ip, const Insn *p
        this, paths that merge are translated once per path (3DBENCH: 1.7x
        the code per cache generation and constant flushes). */
     int prev_cov = !j->no_join && BIT_GET(j->cov, base + pc);
-    if (prev_cov && !npre && !BIT_GET(j->ent, base + pc)) split_at(j, base + pc);
+    /* (No splitting: killing the block that covers a new mid entry frees no
+       code space within the generation, costs a retranslation, and leaves
+       every branch already chained to it detouring through the dispatcher
+       via its dead stub. The tail is duplicated once instead.) */
+    if (prev_cov && !npre && !BIT_GET(j->ent, base + pc) && j->split_mid) split_at(j, base + pc);
 
     while ((unsigned)n < maxn + (unsigned)npre) {
         if (n > npre && !j->no_join) {
@@ -1895,7 +2056,7 @@ B86_HOT static Block *translate_ex(J *j, uint32_t cs, uint16_t ip, const Insn *p
        no consumer is ever fused to a producer that did not set NZCV. */
     for (int attempt = 0;; ++attempt) {
         for (int i = 0; i < n; ++i) {
-            v[i].arm = v[i].lazy = v[i].fused = v[i].mode = v[i].prod = v[i].cmode = 0;
+            v[i].arm = v[i].lazy = v[i].fused = v[i].mode = v[i].prod = v[i].cmode = v[i].synth = v[i].endsynth = v[i].zsrc = 0;
             v[i].live = v[i].live_taken = 0;
         }
         Guard g = { glo0, ghi0, {0, 0}, {0, 0}, 0 };
@@ -1945,7 +2106,10 @@ B86_HOT static Block *translate_ex(J *j, uint32_t cs, uint16_t ip, const Insn *p
                 helpers++;
                 if (d->cls != C_SEQ && d->cls != C_JCC) { be_exit_dyn(e); break; }
             }
-            if (i == n - 1 && !ends_block(d)) { emit_deferred(&tx, i, d->live); be_exit_chain(e, d->next, 0); }
+            if (i == n - 1 && !ends_block(d)) {
+                if (d->endsynth) emit_end_synth(&tx, d->endsynth - 1); else emit_deferred(&tx, i, d->live);
+                be_exit_chain(e, d->next, 0);
+            }
         }
         if (demoted && attempt < n) continue;
         j->st.helper_insns += helpers;
@@ -1954,7 +2118,8 @@ B86_HOT static Block *translate_ex(J *j, uint32_t cs, uint16_t ip, const Insn *p
     for (int s = 0; s < tx.nside; ++s) {
         be_bind(e, tx.side[s].site, e->p);
         e->retire = tx.side[s].retire;
-        emit_deferred(&tx, tx.side[s].idx, tx.side[s].live);
+        if (v[tx.side[s].idx].synth) emit_synth_cf(&tx, (v[tx.side[s].idx].op & 15) == 2);
+        else emit_deferred(&tx, tx.side[s].idx, tx.side[s].live);
         be_exit_chain(e, tx.side[s].target, tx.side[s].poll);
     }
     be_finish_block(e);
@@ -2302,8 +2467,12 @@ B86_HOT static int cold_run(J *j, B86Cpu *c, uint32_t key)
         int r = b86_step(c);
         steps++;
         if (r == B86_HALT) { c->irq |= 0x80000000u; break; }
-        if (c->irq || d.cls != C_SEQ || steps >= 64u) break;
+        /* keep going through a not-taken branch: stopping there would make
+           every fall-through a dispatch target, heat it, and translate it
+           as its own entry (fragmenting superblocks at each Jcc) */
+        if (c->irq || steps >= 64u) break;
         if (c->seg[B86_CS] != cs || c->seg[B86_CS] == c->trap_cs) break;
+        if (d.cls != C_SEQ && ((uint16_t)c->ip != d.next || d.cls != C_JCC)) break;
         if (BIT_GET(j->ent, (c->seg[B86_CS] << 4) + (c->ip & 0xFFFFu))) break;
     }
     if (j->e.count_ret) c->icnt += steps;
@@ -2383,7 +2552,13 @@ B86_HOT int b86_jit_run(B86Cpu *c, uint64_t max_dispatch)
         }
         patch_site = NULL;
         j->st.dispatches++;
+#ifdef B86_COND_HISTO
+        { extern uint32_t b86_disp_ip[1 << 20]; b86_disp_ip[((key >> 16) * 16u + (key & 0xFFFFu)) & 0xFFFFFu]++; }
+#endif
         int r = j->enter(c, be_code_ptr(host));
+#ifdef B86_COND_HISTO
+        { extern uint32_t b86_xr[8]; b86_xr[r & 7]++; }
+#endif
         switch (r) {
         case XR_HALT: return B86_HALT;
         case XR_CHAIN:
