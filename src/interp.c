@@ -146,15 +146,19 @@ B86_HOT static inline uint16_t rd16(B86Cpu *c, int s, uint32_t off)
         return (uint16_t)(rd8(c, s, off) | (rd8(c, s, off + 1) << 8));
     uint32_t a = lin(c, s, off);
     if (s != B86_CS) MT(a, 0);
-    return (uint16_t)(*b86_host(c, a) | (*b86_host(c, a + 1) << 8));
+    const uint8_t *h = b86_host(c, a);
+    if ((a & 0xFFFu) != 0xFFFu) return (uint16_t)(h[0] | (h[1] << 8));   /* same 4 KiB page */
+    return (uint16_t)(h[0] | (*b86_host(c, a + 1) << 8));
 }
 B86_HOT static inline void wr16(B86Cpu *c, int s, uint32_t off, uint16_t v)
 {
     if (c->exact_wrap) { wr8(c, s, off, (uint8_t)v); wr8(c, s, off + 1, (uint8_t)(v >> 8)); return; }
     uint32_t a = lin(c, s, off);
     MT(a, 1);
-    *b86_host(c, a) = (uint8_t)v;
-    *b86_host(c, a + 1) = (uint8_t)(v >> 8);
+    uint8_t *h = b86_host(c, a);
+    h[0] = (uint8_t)v;
+    if ((a & 0xFFFu) != 0xFFFu) h[1] = (uint8_t)(v >> 8);              /* same 4 KiB page */
+    else *b86_host(c, a + 1) = (uint8_t)(v >> 8);
     smc(c, a, 2);
 }
 
@@ -544,7 +548,7 @@ B86_HOT static void aaa_aas(B86Cpu *c, int sub)
 B86_HOT int b86_step(B86Cpu *c)
 {
     St st, *s = &st;
-    b86_flags_materialize(c);
+    if (c->lz_kind != LZ_NONE || c->lz_ikind != LZ_NONE) b86_flags_materialize(c);   /* usually none pending */
     s->c = c; s->ip = (uint16_t)c->ip; s->seg = -1; s->rep = 0;
     uint8_t op;
     for (;;) {

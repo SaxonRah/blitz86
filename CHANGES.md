@@ -1,5 +1,20 @@
 # Changes
 
+## 2026-10-09 (o) — cheaper cold (interpreted) instructions
+
+Pico v46: 25.8 fps; slow phases spend ~4.5-6.5% of instructions in the
+interpreter, likely 25-35% of their time.
+
+* cold_run no longer runs a full decode()+classify() per instruction just to
+  decide where a run stops: a 256-entry opcode table (prefixes, Jcc/LOOP,
+  CALL/JMP/RET/INT/IRET/far, POP CS, plus ModRM.reg for FF and 8E) does it.
+* b86_step only calls b86_flags_materialize when a lazy record is pending.
+* Interpreter 16-bit reads/writes translate the page once unless they cross
+  a 4 KiB page.
+* Host instructions per interpreted guest instruction (qemu exec count,
+  all-cold bench): regmix 370 -> 235, memrmw 400 -> 263, stack 303 -> 177
+  (about -35%). An instruction-fetch window was tried and was slower.
+
 ## 2026-10-09 (n) — translator out of SRAM
 
 * B86_COLD: the translator (analysis, lowering, emit, translate) and the

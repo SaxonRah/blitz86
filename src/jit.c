@@ -2601,6 +2601,16 @@ B86_HOT void b86_jit_set_single_step(J *j, int on)
    per frame (setup, per-object code, DOS itself) then never occupies the
    code buffer, which is what keeps a program's hot loops resident instead of
    flushing the whole cache every frame. */
+/* cold-run control classes: 1 ends the run, 2 short conditional branch
+   (continue when not taken), 4 prefix; FF and 8E are decided by ModRM.reg */
+static const uint8_t cold_ctl[256] = {
+    [0x0F] = 1, [0x26] = 4, [0x2E] = 4, [0x36] = 4, [0x3E] = 4,
+    [0x60 ... 0x7F] = 2, [0x9A] = 1,
+    [0xC0 ... 0xC3] = 1, [0xC8 ... 0xCF] = 1,
+    [0xE0 ... 0xE3] = 2, [0xE8 ... 0xEB] = 1,
+    [0xF0 ... 0xF3] = 4, [0xF4] = 1,
+};
+
 B86_HOT static int cold_run(J *j, B86Cpu *c, uint32_t key, int force)
 {
     uint32_t h = (key * 2654435761u) >> (32 - HEAT_BITS);
@@ -2616,9 +2626,21 @@ B86_HOT static int cold_run(J *j, B86Cpu *c, uint32_t key, int force)
     uint32_t steps = 0;
     for (;;) {
         uint32_t cs = c->seg[B86_CS];
-        Insn d;
-        decode(c, cs, (uint16_t)c->ip, &d);
-        classify(&d);
+        uint16_t ip0 = (uint16_t)c->ip;
+#ifdef B86_COLD_OLD
+        { Insn d; decode(c, cs, ip0, &d); classify(&d); }
+#endif
+        /* (o) cheap control classification from the opcode bytes instead of
+           a full decode()+classify() per interpreted instruction */
+        uint16_t p = ip0;
+        uint8_t op = fb(c, cs, p);
+        while ((cold_ctl[op] & 4) && (uint16_t)(p - ip0) < 4u) op = fb(c, cs, ++p);   /* prefixes */
+        unsigned k = cold_ctl[op] & 3u;
+        if (op == 0xFF || op == 0x8E) {
+            uint8_t reg = (fb(c, cs, (uint16_t)(p + 1)) >> 3) & 7;
+            k = op == 0xFF ? (reg >= 2 && reg <= 5) : ((reg & 3) == B86_CS);
+        }
+        uint16_t jnext = (uint16_t)(p + 2);           /* short Jcc/LOOP/JCXZ */
         int r = b86_step(c);
         steps++;
         if (r == B86_HALT) { c->irq |= 0x80000000u; break; }
@@ -2627,7 +2649,8 @@ B86_HOT static int cold_run(J *j, B86Cpu *c, uint32_t key, int force)
            as its own entry (fragmenting superblocks at each Jcc) */
         if (c->irq || steps >= 64u) break;
         if (c->seg[B86_CS] != cs || c->seg[B86_CS] == c->trap_cs) break;
-        if (d.cls != C_SEQ && ((uint16_t)c->ip != d.next || d.cls != C_JCC)) break;
+        if (k == 1 || (k == 2 && (uint16_t)c->ip != jnext)) break;
+        if ((uint16_t)c->ip < ip0 && k == 0) break;   /* wrapped the segment */
         if (BIT_GET(j->ent, (c->seg[B86_CS] << 4) + (c->ip & 0xFFFFu))) break;
     }
     if (j->e.count_ret) c->icnt += steps;

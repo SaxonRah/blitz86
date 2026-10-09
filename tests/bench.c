@@ -82,6 +82,7 @@ int main(int argc, char **argv)
     B86Cpu c;
     setup(&c, k, iters);
     int noref = getenv("BENCH_NOREF") != NULL;   /* for host-instruction counting */
+    if (getenv("BENCH_INTERP")) { b86_run_interp(&c, 100000000); printf("interp guest=%llu\n", (unsigned long long)c.icount); return 0; }
     if (!noref) b86_run_interp(&c, 100000000);
     uint64_t guest = c.icount;
     uint16_t ax = (uint16_t)c.r[0], dx = (uint16_t)c.r[2], si = (uint16_t)c.r[6];
@@ -93,6 +94,7 @@ int main(int argc, char **argv)
         buf = mmap(NULL, sz, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     setup(&c, k, iters);
     struct B86Jit *j = b86_jit_create(&c, buf, sz);
+    if (getenv("BENCH_HOT")) b86_jit_set_hot_threshold(j, (unsigned)atoi(getenv("BENCH_HOT")));
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     int r = b86_jit_run(&c, ~0ull);
