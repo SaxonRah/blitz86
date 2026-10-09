@@ -60,6 +60,8 @@ enum {
     LZ_LOG8, LZ_LOG16, LZ_INC8, LZ_INC16, LZ_DEC8, LZ_DEC16,
     LZ_SHL8, LZ_SHL16, LZ_SHR8, LZ_SHR16, LZ_SAR8, LZ_SAR16,   /* count 1 */
     LZ_ADC8, LZ_ADC16, LZ_SBB8, LZ_SBB16,                       /* explicit lz_b */
+    LZ_SZPC8, LZ_SZPC16,  /* SF/ZF/PF from lz_res, CF/OF bits in lz_b, AF=0
+                             (a shift by 1 followed by RCL/RCR by 1) */
     LZ_COUNT
 };
 

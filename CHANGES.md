@@ -1,5 +1,25 @@
 # Changes
 
+## 2026-10-09 (q) — far fewer flag-helper calls
+
+Pico (p): 33.3 fps. Generated code still called the C flag materializer
+~0.1-1.3M times per 8 s interval. On the host 3DBENCH run: 7.2M calls in
+420M instructions; after (q): 0.45M (-94%), qemu time 12.7 s -> 10.3 s.
+
+* lazy_eval is table-driven and branch-light (all six flags in one go).
+* New record kind LZ_SZPC8/16: SF/ZF/PF from lz_res, CF/OF bits in lz_b.
+  RCL/RCR by 1 right after a lazily recorded shift by 1 (shl ax,1 / rcl
+  dx,1 in 32-bit shift and divide loops) keeps the shift's record for
+  SZP and stores its own CF/OF instead of folding through the helper.
+  When not fused (shl byte [si],1 / rcr al,1: the store's SMC check
+  clobbers NZCV) the carry-in is rebuilt from the shift's record.
+* ADC/SBB right after a lazily recorded ADD/SUB/CMP (add byte [m],al /
+  adc cx,[m]) rebuilds CF from that record with one shifted compare
+  (ADD carries iff res < a, SUB borrows iff res > a) and puts it in ctx
+  flags, instead of folding the record through the helper.
+* tests/flags/shift_rcx.c and add_adc.c: targeted JIT-vs-interpreter tests
+  for these pairs (3000 random states each; both backends: 0 mismatches).
+
 ## 2026-10-09 (p) — cold runs follow taken branches; cheaper interpreter flags
 
 Pico (o): 30.3 fps. The slow phases still interpret 4-5% of instructions.

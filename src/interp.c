@@ -41,52 +41,48 @@ B86_HOT void b86_init(B86Cpu *c, uint8_t *mem)
     for (int s = 0; s < 4; ++s) b86_set_seg(c, s, 0);
 }
 
+/* (q) kind -> class (0 add, 1 sub, 2 logic, 3 shl, 4 shr, 5 sar, 6 inc,
+   7 dec, 8 adc, 9 sbb, 10 szpc) and width */
+static const uint8_t lz_class[LZ_COUNT] = {
+    [LZ_ADD8] = 0, [LZ_ADD16] = 0, [LZ_SUB8] = 1, [LZ_SUB16] = 1,
+    [LZ_LOG8] = 2, [LZ_LOG16] = 2, [LZ_INC8] = 6, [LZ_INC16] = 6, [LZ_DEC8] = 7, [LZ_DEC16] = 7,
+    [LZ_SHL8] = 3, [LZ_SHL16] = 3, [LZ_SHR8] = 4, [LZ_SHR16] = 4, [LZ_SAR8] = 5, [LZ_SAR16] = 5,
+    [LZ_ADC8] = 8, [LZ_ADC16] = 8, [LZ_SBB8] = 9, [LZ_SBB16] = 9, [LZ_SZPC8] = 10, [LZ_SZPC16] = 10,
+};
+static const uint8_t lz_w16[LZ_COUNT] = {
+    [LZ_ADD16] = 1, [LZ_SUB16] = 1, [LZ_LOG16] = 1, [LZ_INC16] = 1, [LZ_DEC16] = 1,
+    [LZ_SHL16] = 1, [LZ_SHR16] = 1, [LZ_SAR16] = 1, [LZ_ADC16] = 1, [LZ_SBB16] = 1, [LZ_SZPC16] = 1,
+};
+
 B86_HOT static uint32_t lazy_eval(uint32_t k, uint32_t a0, uint32_t r0, uint32_t b0, uint32_t f)
 {
-    int w16 = (k == LZ_ADD16 || k == LZ_SUB16 || k == LZ_LOG16 ||
-               k == LZ_INC16 || k == LZ_DEC16 || k == LZ_SHL16 || k == LZ_SHR16 || k == LZ_SAR16 ||
-               k == LZ_ADC16 || k == LZ_SBB16);
+    unsigned cls = lz_class[k], w16 = lz_w16[k];
     uint32_t m = w16 ? 0xFFFFu : 0xFFu, sb = w16 ? 0x8000u : 0x80u;
     uint32_t a = a0 & m, r = r0 & m, b;
-    if (k >= LZ_SHL8 && k <= LZ_SAR16) {          /* shifts by 1 (8086 semantics) */
-        uint32_t cf, of;
-        if (k <= LZ_SHL16) { cf = (a & sb) != 0; of = ((r & sb) != 0) ^ cf; }
-        else if (k <= LZ_SHR16) { cf = a & 1; of = (a & sb) != 0; }
-        else { cf = a & 1; of = 0; }
-        f &= ~(uint32_t)B86_ARITH;
-        if (cf) f |= B86_CF;
-        if (of) f |= B86_OF;
-        if (r == 0) f |= B86_ZF;
-        if (r & sb) f |= B86_SF;
-        return f | b86_parity[r & 0xFFu];
-    }
-    if (k == LZ_ADD8 || k == LZ_ADD16 || k == LZ_INC8 || k == LZ_INC16) b = (r - a) & m;
-    else if (k >= LZ_ADC8) b = b0 & m;
-    else b = (a - r) & m;
-    uint32_t cf = 0, of = 0, af = 0;
-    switch (k) {
-    case LZ_ADD8: case LZ_ADD16: case LZ_INC8: case LZ_INC16: case LZ_ADC8: case LZ_ADC16:
-        cf = ((a & b) | ((a | b) & ~r)) & sb;
-        of = ((a ^ r) & (b ^ r)) & sb;
-        af = (a ^ b ^ r) & 0x10u;
+    uint32_t zsp = (r ? 0u : (uint32_t)B86_ZF) | ((w16 ? (r >> 8) : r) & 0x80u) | b86_parity[r & 0xFFu];
+    uint32_t out;                                   /* CF | AF | OF bits */
+    switch (cls) {
+    case 0: case 6: case 8:                         /* add, inc, adc */
+        b = cls == 8 ? (b0 & m) : ((r - a) & m);
+        out = ((((a & b) | ((a | b) & ~r)) & sb) ? (uint32_t)B86_CF : 0u)
+            | (((a ^ r) & (b ^ r) & sb) ? (uint32_t)B86_OF : 0u)
+            | ((a ^ b ^ r) & (uint32_t)B86_AF);
         break;
-    case LZ_SUB8: case LZ_SUB16: case LZ_DEC8: case LZ_DEC16: case LZ_SBB8: case LZ_SBB16:
-        cf = ((~a & b) | (~(a ^ b) & r)) & sb;
-        of = ((a ^ b) & (a ^ r)) & sb;
-        af = (a ^ b ^ r) & 0x10u;
+    case 1: case 7: case 9:                         /* sub, dec, sbb */
+        b = cls == 9 ? (b0 & m) : ((a - r) & m);
+        out = ((((~a & b) | (~(a ^ b) & r)) & sb) ? (uint32_t)B86_CF : 0u)
+            | (((a ^ b) & (a ^ r) & sb) ? (uint32_t)B86_OF : 0u)
+            | ((a ^ b ^ r) & (uint32_t)B86_AF);
         break;
-    default: break; /* logic: CF = OF = AF = 0 */
+    case 3: { uint32_t cf = (a & sb) != 0;          /* shifts by 1 (8086 semantics) */
+        out = (cf ? (uint32_t)B86_CF : 0u) | ((((r & sb) != 0) ^ cf) ? (uint32_t)B86_OF : 0u); break; }
+    case 4: out = ((a & 1u) ? (uint32_t)B86_CF : 0u) | ((a & sb) ? (uint32_t)B86_OF : 0u); break;
+    case 5: out = (a & 1u) ? (uint32_t)B86_CF : 0u; break;
+    case 10: out = b0 & (uint32_t)(B86_CF | B86_OF); break;
+    default: out = 0; break;                        /* logic */
     }
-    uint32_t keep_cf = f & B86_CF;
-    f &= ~(uint32_t)B86_ARITH;
-    if (k == LZ_INC8 || k == LZ_INC16 || k == LZ_DEC8 || k == LZ_DEC16) f |= keep_cf;
-    else if (cf) f |= B86_CF;
-    if (of) f |= B86_OF;
-    if (af) f |= B86_AF;
-    if (r == 0) f |= B86_ZF;
-    if (r & sb) f |= B86_SF;
-    f |= b86_parity[r & 0xFFu];
-    return f;
+    if (cls == 6 || cls == 7) out = (out & ~(uint32_t)B86_CF) | (f & (uint32_t)B86_CF);   /* INC/DEC keep CF */
+    return (f & ~(uint32_t)B86_ARITH) | out | zsp;
 }
 
 B86_HOT void b86_flags_materialize(B86Cpu *c)

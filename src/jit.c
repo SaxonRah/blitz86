@@ -1117,7 +1117,32 @@ B86_COLD static int emit_alu(Tx *t, Insn *d, int xop, int w, Op dst, Op src, int
         if (x >= V_T0 && x != res && x != a && x != b) pool.busy[x] = 0;   /* x unused */
         cft = pick(&pool);
         if (cft < 0) return 0;
-        if (!d->fused) flags_if_lazy(t, d, 0);        /* CF from ctx; clobbers temps */
+        if (!d->fused) {
+            /* (q) ADD/SUB/CMP right before (e.g. add byte [m],al / adc cx,[m]:
+               the store's SMC check clobbers NZCV, so no fusion): rebuild CF
+               from its record and put it in ctx flags instead of folding the
+               record through the C helper. Unsigned compare of the masked
+               values: ADD carries iff res < a, SUB borrows iff res > a. */
+            const Insn *pv = t->cur > 0 ? &t->v[t->cur - 1] : NULL;
+            int pxop = -1;
+            if (pv && pv->native && pv->lazy && !pv->defer && !t->inc_pending) {
+                if (pv->op < 0x40 && (pv->op & 7) < 6) pxop = pv->op >> 3;
+                else if (pv->op >= 0x80 && pv->op <= 0x83) pxop = pv->reg;
+            }
+            if (pxop == 0 || pxop == 5 || pxop == 7) {
+                int psh = pv->w ? 16 : 24;
+                be_ldctx(e, V_T0, OFF(lz_res));
+                be_ldctx(e, V_T1, OFF(lz_a));
+                if (pxop == 0) be_cmp_sh(e, V_T0, V_T0, V_T1, psh);   /* res - a */
+                else be_cmp_sh(e, V_T1, V_T1, V_T0, psh);            /* a - res */
+                be_get_carry(e, V_T0, AC_CC);
+                be_ldctx(e, V_T1, OFF(flags));
+                be_opi(e, AOP_AND, V_T1, V_T1, (uint16_t)~B86_CF);
+                be_op(e, AOP_ORR, V_T1, V_T1, V_T0);
+                be_stctx(e, V_T1, OFF(flags));
+            } else
+                flags_if_lazy(t, d, 0);                  /* CF from ctx; clobbers temps */
+        }
     }
     if (d->arm && logic && res < V_T0) { /* test_res needs a scratch: x */ }
 
@@ -1552,14 +1577,29 @@ B86_COLD static int lower(Tx *t, Insn *d)
             int r = w ? d->rm : d->rm;           /* rm < 4 for bytes */
             int rcl = d->reg == 2;
             int ctx = d->lazy != 0;              /* CF/OF needed in ctx flags */
+            /* (q) right after a lazily recorded shift by 1 (shl ax,1 / rcl dx,1:
+               32-bit shifts, divide loops): keep the shift's record for
+               SF/ZF/PF and turn it into an SZPC record carrying RCL/RCR's
+               CF/OF, instead of materializing through the C helper */
+            const Insn *pv = t->cur > 0 ? &t->v[t->cur - 1] : NULL;
+            int shrec = pv && pv->native &&
+                        (pv->op == 0xD0 || pv->op == 0xD1) && pv->reg >= 4 && pv->reg != 6 &&
+                        pv->lazy && !pv->defer && !t->inc_pending;
+            int szpc = ctx && shrec && (d->fused ? d->prod == t->cur - 1 : 1);
+            /* not fused (e.g. shl byte [si],1 / rcr al,1: the store's SMC check
+               clobbers NZCV): the carry-in is the shift's CF, rebuilt from its
+               record (SHL: top bit of lz_a; SHR/SAR: bit 0) */
             /* carry-in -> T0 */
             if (d->fused) {
                 be_get_carry(e, V_T0, d->cmode);
-                if (ctx) {                       /* fold older records first (OF must not be overridden) */
+                if (ctx && !szpc) {              /* fold older records first (OF must not be overridden) */
                     be_stctx(e, V_T0, OFF(scratch));
                     flags_if_lazy(t, d, 1); t->inc_pending = 0;
                     be_ldctx(e, V_T0, OFF(scratch));
                 }
+            } else if (shrec) {
+                be_ldctx(e, V_T0, OFF(lz_a));
+                be_ubfx(e, V_T0, V_T0, pv->reg == 4 ? (pv->w ? 15u : 7u) : 0u, 1);
             } else {
                 flags_if_lazy(t, d, ctx); if (ctx) t->inc_pending = 0;
                 be_ldctx(e, V_T0, OFF(flags));
@@ -1588,7 +1628,11 @@ B86_COLD static int lower(Tx *t, Insn *d)
                     be_ubfx(e, V_T1, V_T1, bits - 1, 1);
                 }
             }
-            if (ctx) {                           /* flags = flags & ~(CF|OF) | CF | OF */
+            if (ctx && szpc) {                   /* record: SZP of the shift, CF/OF here */
+                be_op_lsl(e, AOP_ORR, V_T0, V_T0, V_T1, 11);
+                be_stctx(e, V_T0, OFF(lz_b));
+                be_stctx_imm(e, (uint32_t)(LZ_SZPC8 + pv->w), OFF(lz_kind));
+            } else if (ctx) {                    /* flags = flags & ~(CF|OF) | CF | OF */
                 be_op_lsl(e, AOP_ORR, V_T0, V_T0, V_T1, 11);
                 be_ldctx(e, V_T1, OFF(flags));
                 be_opi(e, AOP_AND, V_T1, V_T1, (uint16_t)~(B86_CF | B86_OF));
