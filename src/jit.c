@@ -2550,10 +2550,10 @@ int b86_map_range(B86Cpu *c, uint32_t lin, uint32_t len, uint8_t *frame)
 }
 void b86_unmap_range(B86Cpu *c, uint32_t lin, uint32_t len)
 {
-#if defined(B86_OPT_PAGE_ZERO) && B86_OPT_PAGE_ZERO
-    /* Conservative generation invalidation before restoring any mapped page. */
-    if (c->jit && len) b86_jit_flush(c->jit);
-#endif
+    /* No flush needed here even with B86_OPT_PAGE_ZERO: code compiled while
+       pages were mapped still translates (delta 0 after unmap is correct), and
+       code compiled with no pages mapped never had a translation to lose.
+       (The flush ran inside interrupt hooks, under the block that called them.) */
     for (uint32_t a = lin & ~4095u; a < lin + len && a < B86_MEM_BYTES; a += 4096u) {
         uint32_t i = (uint32_t)(((uintptr_t)(c->mem + a) >> 12) & 511u);
         if (!c->pt[i]) continue;

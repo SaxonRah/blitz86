@@ -1,5 +1,14 @@
 # Changes
 
+## 2026-10-10 (r51) — no cache flush on unmap
+
+B86_OPT_PAGE_ZERO flushed the native cache in b86_unmap_range too. blitzBUS
+unmaps from inside interrupt hooks (microDOS device calls), so the flush
+ran under the block that called the hook. Unmapping never invalidates code
+(blocks compiled while mapped still translate; delta 0 is then correct), so
+the flush is removed. b86_map_range still flushes; blitzBUS v51 now maps only
+between slices.
+
 ## 2026-10-09 (q) — far fewer flag-helper calls
 
 Pico (p): 33.3 fps. Generated code still called the C flag materializer
