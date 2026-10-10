@@ -2532,36 +2532,18 @@ int b86_map_range(B86Cpu *c, uint32_t lin, uint32_t len, uint8_t *frame)
     if (j && j->codemap)
         for (uint32_t l = lin >> B86_LINE_SHIFT; l < (lin + len) >> B86_LINE_SHIFT; ++l)
             if (j->codemap[l]) return -3;        /* translated code lives there */
-#if defined(B86_OPT_PAGE_ZERO) && B86_OPT_PAGE_ZERO
-    /* Any code compiled with the zero-delta assumption must be discarded
-       BEFORE publishing new page-table entries. Caller must not map during
-       live execution of native code (same existing map/unmap contract). */
-    if (j) b86_jit_flush(j);
-#endif
     memcpy(frame, c->mem + lin, len);
-    for (uint32_t a = 0; a < len; a += 4096u) {
-        uint32_t pi = (uint32_t)(((uintptr_t)(c->mem + lin + a) >> 12) & 511u);
-        c->pt[pi] = (int32_t)((intptr_t)(frame + a) - (intptr_t)(c->mem + lin + a));
-#if defined(B86_OPT_PAGE_ZERO) && B86_OPT_PAGE_ZERO
-        if (c->pt[pi]) ++c->pt_active_pages;
-#endif
-    }
+    for (uint32_t a = 0; a < len; a += 4096u)
+        c->pt[((uintptr_t)(c->mem + lin + a) >> 12) & 511u] = (int32_t)((intptr_t)(frame + a) - (intptr_t)(c->mem + lin + a));
     return 0;
 }
 void b86_unmap_range(B86Cpu *c, uint32_t lin, uint32_t len)
 {
-#if defined(B86_OPT_PAGE_ZERO) && B86_OPT_PAGE_ZERO
-    /* Conservative generation invalidation before restoring any mapped page. */
-    if (c->jit && len) b86_jit_flush(c->jit);
-#endif
     for (uint32_t a = lin & ~4095u; a < lin + len && a < B86_MEM_BYTES; a += 4096u) {
         uint32_t i = (uint32_t)(((uintptr_t)(c->mem + a) >> 12) & 511u);
         if (!c->pt[i]) continue;
         memcpy(c->mem + a, c->mem + a + c->pt[i], 4096u);
         c->pt[i] = 0;
-#if defined(B86_OPT_PAGE_ZERO) && B86_OPT_PAGE_ZERO
-        if (c->pt_active_pages) --c->pt_active_pages;
-#endif
     }
 }
 #else
@@ -2639,11 +2621,6 @@ B86_HOT J *b86_jit_create_ex(B86Cpu *c, void *code, size_t size, void *hot, size
         c->pt = (int32_t *)(void *)j->cm_table;
     }
 #endif
-#if defined(B86_PAGED) && defined(B86_OPT_PAGE_ZERO) && B86_OPT_PAGE_ZERO
-    c->pt_active_pages = 0;
-    for (unsigned pi = 0; pi < 512u; ++pi)
-        if (c->pt[pi]) ++c->pt_active_pages;
-#endif
     c->fast = j->fast;
     c->smc_hook = smc_hook;
     j->e.base = j->buf;
@@ -2670,22 +2647,6 @@ B86_HOT void b86_jit_destroy(J *j)
 }
 
 B86_HOT const B86JitStats *b86_jit_stats(J *j) { return &j->st; }
-/* v49: reporter-side only; scan generation-local code layout. */
-int b86_jit_pc_lookup(J *j, uintptr_t pc, uint32_t *key, uint32_t *offset) {
-    if (!j || !key || !offset) return 0;
-    pc &= ~(uintptr_t)1;
-    if (pc < (uintptr_t)j->code_start || pc >= (uintptr_t)j->e.p) return 0;
-    for (uint32_t i=0;i<j->nblk;i++) {
-        Block *b=&j->blk[i];
-        uintptr_t lo=(uintptr_t)b->host;
-        uintptr_t hi=(i+1u<j->nblk)?(uintptr_t)j->blk[i+1u].host:(uintptr_t)j->e.p;
-        if (pc>=lo && pc<hi && !b->dead && !j->dead[i]) {
-            *key=b->key;*offset=(uint32_t)(pc-lo);return 1;
-        }
-    }
-    return 0;
-}
-
 B86_HOT void b86_jit_set_max_block(J *j, unsigned n) { j->max_insns = n; }
 B86_HOT void b86_jit_set_lookahead(J *j, int on) { j->no_lookahead = !on; }
 B86_HOT void b86_jit_set_no_fast(J *j, int on) { j->single_step = on; }

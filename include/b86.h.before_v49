@@ -130,7 +130,6 @@ typedef struct B86Cpu {
        Stack (SS) accesses in generated code are NOT translated: the embedder
        must never map pages inside the current SS window. */
     int32_t *pt;
-    uint32_t pt_active_pages; /* page-delta specialization guard; maintained by map/unmap */
     int32_t pt_store[512];
     /* bytes stored by REP STOS/MOVS per 4 KiB guest page since the embedder
        last cleared it: a cheap signal for which pages to move to SRAM */
@@ -220,8 +219,6 @@ void     b86_jit_set_shadow(struct B86Jit *j, uint8_t *shadow);
    translations whose bytes actually changed. Returns lines that differed. */
 uint32_t b86_jit_sync_external(struct B86Jit *j, uint32_t lin, uint32_t len);
 const B86JitStats *b86_jit_stats(struct B86Jit *j);
-/* v49: map a sampled Thumb-2 PC to the containing live translated block. */
-int b86_jit_pc_lookup(struct B86Jit *j, uintptr_t pc, uint32_t *key, uint32_t *offset);
 /* v48 sampled native dispatch profiler (diagnostic, approximate). */
 void b86_jit_hot_report(struct B86Jit *j);
 

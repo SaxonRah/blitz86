@@ -79,59 +79,6 @@ void *B86_CALLOC(size_t n, size_t size);
 void B86_FREE(void *p);
 #endif
 
-/* v48: sparse sampled native entry timing.  A sample measures the complete
- * native entry, potentially including chained successors. It is NOT a PC
- * interrupt sampler and MUST NOT be interpreted as exclusive block CPU time.
- * Only one in 256 outer dispatches incurs B86_NOW() overhead.
- * Fixed-size table resides in the JIT metadata allocator (PSRAM on Pico).
- */
-#ifdef B86_NOW
-typedef struct B86HotSample {
-    uint32_t key;
-    uint32_t count;
-    uint64_t us;
-    uint32_t max_us;
-} B86HotSample;
-#define B86_HOT_SLOTS 256u
-static uint64_t b86_v48_polls;
-static B86HotSample *b86_v48_samples;
-static void b86_v48_record(uint32_t key, uint64_t delta) {
-    if (!b86_v48_samples) return;
-    unsigned p = (key * 2654435761u) >> 24;
-    /* Direct-mapped replacement: collisions are explicitly identified. */
-    B86HotSample *s = &b86_v48_samples[p];
-    if (!s->count || s->key != key) {
-        s->key = key; s->count = 0; s->us = 0; s->max_us = 0;
-    }
-    s->count++;
-    s->us += delta;
-    if (delta > s->max_us) s->max_us = (uint32_t)(delta > UINT32_MAX ? UINT32_MAX : delta);
-}
-#endif
-B86_HOT void b86_jit_hot_report(struct B86Jit *j) {
-#ifdef B86_NOW
-    (void)j;
-    if (!b86_v48_samples) return;
-    printf("[bb-v48-hot] sampled-dispatches=%llu divisor=256 slots=256 units=us (includes-chained-code)\n", (unsigned long long)(b86_v48_polls >> 8));
-    /* top 12 nonzero entries by cumulative sampled time; no sorting memory */
-    uint8_t selected[B86_HOT_SLOTS] = {0};
-    for (unsigned rank = 0; rank < 12; ++rank) {
-        unsigned best = B86_HOT_SLOTS;
-        for (unsigned i = 0; i < B86_HOT_SLOTS; ++i)
-            if (!selected[i] && b86_v48_samples[i].count &&
-                (best == B86_HOT_SLOTS || b86_v48_samples[i].us > b86_v48_samples[best].us)) best = i;
-        if (best == B86_HOT_SLOTS) break;
-        selected[best] = 1;
-        const B86HotSample *s = &b86_v48_samples[best];
-        printf("[bb-v48-hot-entry] rank=%u cs=%04X ip=%04X samples=%lu total-us=%llu max-us=%lu\n",
-            rank + 1, (unsigned)(s->key >> 16), (unsigned)(s->key & 0xFFFFu),
-            (unsigned long)s->count, (unsigned long long)s->us, (unsigned long)s->max_us);
-    }
-#else
-    (void)j;
-#endif
-}
-
 typedef struct Block {
     uint32_t key;
     uint32_t glo, ghi;          /* guarded linear range [glo, ghi)        */
@@ -2532,36 +2479,18 @@ int b86_map_range(B86Cpu *c, uint32_t lin, uint32_t len, uint8_t *frame)
     if (j && j->codemap)
         for (uint32_t l = lin >> B86_LINE_SHIFT; l < (lin + len) >> B86_LINE_SHIFT; ++l)
             if (j->codemap[l]) return -3;        /* translated code lives there */
-#if defined(B86_OPT_PAGE_ZERO) && B86_OPT_PAGE_ZERO
-    /* Any code compiled with the zero-delta assumption must be discarded
-       BEFORE publishing new page-table entries. Caller must not map during
-       live execution of native code (same existing map/unmap contract). */
-    if (j) b86_jit_flush(j);
-#endif
     memcpy(frame, c->mem + lin, len);
-    for (uint32_t a = 0; a < len; a += 4096u) {
-        uint32_t pi = (uint32_t)(((uintptr_t)(c->mem + lin + a) >> 12) & 511u);
-        c->pt[pi] = (int32_t)((intptr_t)(frame + a) - (intptr_t)(c->mem + lin + a));
-#if defined(B86_OPT_PAGE_ZERO) && B86_OPT_PAGE_ZERO
-        if (c->pt[pi]) ++c->pt_active_pages;
-#endif
-    }
+    for (uint32_t a = 0; a < len; a += 4096u)
+        c->pt[((uintptr_t)(c->mem + lin + a) >> 12) & 511u] = (int32_t)((intptr_t)(frame + a) - (intptr_t)(c->mem + lin + a));
     return 0;
 }
 void b86_unmap_range(B86Cpu *c, uint32_t lin, uint32_t len)
 {
-#if defined(B86_OPT_PAGE_ZERO) && B86_OPT_PAGE_ZERO
-    /* Conservative generation invalidation before restoring any mapped page. */
-    if (c->jit && len) b86_jit_flush(c->jit);
-#endif
     for (uint32_t a = lin & ~4095u; a < lin + len && a < B86_MEM_BYTES; a += 4096u) {
         uint32_t i = (uint32_t)(((uintptr_t)(c->mem + a) >> 12) & 511u);
         if (!c->pt[i]) continue;
         memcpy(c->mem + a, c->mem + a + c->pt[i], 4096u);
         c->pt[i] = 0;
-#if defined(B86_OPT_PAGE_ZERO) && B86_OPT_PAGE_ZERO
-        if (c->pt_active_pages) --c->pt_active_pages;
-#endif
     }
 }
 #else
@@ -2639,11 +2568,6 @@ B86_HOT J *b86_jit_create_ex(B86Cpu *c, void *code, size_t size, void *hot, size
         c->pt = (int32_t *)(void *)j->cm_table;
     }
 #endif
-#if defined(B86_PAGED) && defined(B86_OPT_PAGE_ZERO) && B86_OPT_PAGE_ZERO
-    c->pt_active_pages = 0;
-    for (unsigned pi = 0; pi < 512u; ++pi)
-        if (c->pt[pi]) ++c->pt_active_pages;
-#endif
     c->fast = j->fast;
     c->smc_hook = smc_hook;
     j->e.base = j->buf;
@@ -2670,22 +2594,6 @@ B86_HOT void b86_jit_destroy(J *j)
 }
 
 B86_HOT const B86JitStats *b86_jit_stats(J *j) { return &j->st; }
-/* v49: reporter-side only; scan generation-local code layout. */
-int b86_jit_pc_lookup(J *j, uintptr_t pc, uint32_t *key, uint32_t *offset) {
-    if (!j || !key || !offset) return 0;
-    pc &= ~(uintptr_t)1;
-    if (pc < (uintptr_t)j->code_start || pc >= (uintptr_t)j->e.p) return 0;
-    for (uint32_t i=0;i<j->nblk;i++) {
-        Block *b=&j->blk[i];
-        uintptr_t lo=(uintptr_t)b->host;
-        uintptr_t hi=(i+1u<j->nblk)?(uintptr_t)j->blk[i+1u].host:(uintptr_t)j->e.p;
-        if (pc>=lo && pc<hi && !b->dead && !j->dead[i]) {
-            *key=b->key;*offset=(uint32_t)(pc-lo);return 1;
-        }
-    }
-    return 0;
-}
-
 B86_HOT void b86_jit_set_max_block(J *j, unsigned n) { j->max_insns = n; }
 B86_HOT void b86_jit_set_lookahead(J *j, int on) { j->no_lookahead = !on; }
 B86_HOT void b86_jit_set_no_fast(J *j, int on) { j->single_step = on; }
@@ -2902,18 +2810,7 @@ B86_HOT int b86_jit_run(B86Cpu *c, uint64_t max_dispatch)
 #ifdef B86_COND_HISTO
         { extern uint32_t b86_disp_ip[1 << 20]; b86_disp_ip[((key >> 16) * 16u + (key & 0xFFFFu)) & 0xFFFFFu]++; }
 #endif
-#ifdef B86_NOW
-        uint64_t bb48_start = 0;
-        int bb48_sample = ((++b86_v48_polls & 255u) == 0u);
-        if (bb48_sample) {
-            if (!b86_v48_samples) b86_v48_samples = B86_CALLOC(B86_HOT_SLOTS, sizeof *b86_v48_samples);
-            bb48_start = B86_NOW();
-        }
-#endif
         int r = j->enter(c, be_code_ptr(host));
-#ifdef B86_NOW
-        if (bb48_sample) b86_v48_record(key, B86_NOW() - bb48_start);
-#endif
 #ifdef B86_COND_HISTO
         { extern uint32_t b86_xr[8]; b86_xr[r & 7]++; }
 #endif

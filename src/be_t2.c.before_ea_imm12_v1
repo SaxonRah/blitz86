@@ -22,11 +22,6 @@
 #define B86_HOT B86_COLD
 #include <string.h>
 
-/* Opt-in compact absolute-offset effective address emission. */
-#ifndef B86_EA_IMM12_FAST
-#define B86_EA_IMM12_FAST 0
-#endif
-
 const int be_has_t2 = 0;
 #ifdef B86_PAGED
 const int be_paged = 1;
@@ -496,11 +491,6 @@ B86_HOT static int segreg(Emit *e, int seg)
 B86_HOT static void ea_translate(Emit *e, int dd)
 {
 #ifdef B86_PAGED
-#if defined(B86_OPT_PAGE_ZERO) && B86_OPT_PAGE_ZERO
-    /* Mapping changes flush translated code before modifying page deltas.
-       This is a translation-time guard: no extra instruction per access. */
-    if (e->cpu->pt_active_pages == 0) return;
-#endif
     /* page table = first 2 KiB of the SMC line table (r9) */
     bitfield(e, 0xF3C0u, LR, dd, 12, 8);                              /* UBFX lr, dd, #12, #9 */
     put32(e, 0xF850u | R_CM, (uint32_t)LR << 12 | 2u << 4 | LR);      /* LDR lr, [r9, lr, LSL #2] */
@@ -510,65 +500,14 @@ B86_HOT static void ea_translate(Emit *e, int dd)
 #endif
 }
 
-/* P1b: specialization of proven-invariant CS:absolute addresses only.
- *
- * Native blocks are keyed by CS:IP; CS cannot be modified inside an
- * ordinary instruction stream. A far control transfer ends a block. The
- * numeric 16-bit offset is invariant for this EA and does not depend on
- * runtime GPRs or DS/ES segment registers.
- *
- * A zero page delta can be baked into the code ONLY because the P1
- * map/unmap API flushes the entire native cache before publishing changes.
- * A translated block cannot remain live across such a mapping change.
- * Accesses at the final byte of a page stay on the generic path because
- * the access width is not available to be_ea() and a word could cross it.
- * This optimization deliberately does not speculate about DS or ES.
- */
-#if defined(B86_OPT_CS_CONST) && B86_OPT_CS_CONST
-B86_HOT static int ea_cs_abs_is_direct(const Emit *e, uint32_t off)
-{
-#if defined(B86_PAGED) && defined(B86_OPT_PAGE_ZERO) && B86_OPT_PAGE_ZERO && defined(B86_OPT_CS_CONST) && B86_OPT_CS_CONST
-    uintptr_t h = (uintptr_t)e->cpu->segp[B86_CS] + (uintptr_t)(uint16_t)off;
-    if ((h & 4095u) == 4095u) return 0;
-    return e->cpu->pt[(h >> 12) & 511u] == 0;
-#else
-    (void)e; (void)off;
-    return 0;
-#endif
-}
-
-#endif /* B86_OPT_CS_CONST */
-
 B86_HOT void be_ea(Emit *e, int d, int seg, int b1, int b2, int32_t disp)
 {
     int dd = hr(d);
     int sr = segreg(e, seg);
     if (b1 < 0 && b2 < 0) {
-#if B86_EA_IMM12_FAST
-        /* Absolute offset, guaranteed modulo 16 bits by the 8086 EA.
-         * ADDW accepts a zero-extended 12-bit immediate and does not touch
-         * NZCV. This replaces MOVW offset + ADD base, for 0..4095.
-         * Keep page translation and all SMC checks exactly as before.
-         */
-        const uint32_t offset = (uint16_t)disp;
-        if (offset == 0u) mov(e, dd, sr);
-        else if (offset <= 4095u) addw(e, dd, sr, offset, 0);
-        else {
-            movw(e, dd, offset);
-            dp_reg(e, DP_ADD, 0, dd, sr, dd, 0, 0);
-        }
-#else
         movw(e, dd, (uint32_t)disp);
         dp_reg(e, DP_ADD, 0, dd, sr, dd, 0, 0);
-#endif
-        if (seg != B86_SS) {
-#if defined(B86_OPT_CS_CONST) && B86_OPT_CS_CONST
-            if (seg != B86_CS || !ea_cs_abs_is_direct(e, (uint16_t)disp))
-                ea_translate(e, dd);
-#else
-            ea_translate(e, dd);
-#endif
-        }
+        if (seg != B86_SS) ea_translate(e, dd);     /* stack pages are never mapped */
         return;
     }
     int src = hr(b1);
