@@ -140,13 +140,13 @@ typedef struct B86Cpu {
 
 /* Host pointer for a guest linear address (honours mapped pages). */
 #ifdef B86_PAGED
-static inline uint8_t *b86_host(const B86Cpu *c, uint32_t lin)
+static inline __attribute__((always_inline)) uint8_t *b86_host(const B86Cpu *c, uint32_t lin)
 {
     uint8_t *p = c->mem + lin;
     return p + c->pt[((uintptr_t)p >> 12) & 511u];
 }
 #else
-static inline uint8_t *b86_host(const B86Cpu *c, uint32_t lin) { return c->mem + lin; }
+static inline __attribute__((always_inline)) uint8_t *b86_host(const B86Cpu *c, uint32_t lin) { return c->mem + lin; }
 #endif
 
 /* ---- core / interpreter --------------------------------------------------- */

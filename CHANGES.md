@@ -1,5 +1,28 @@
 # Changes
 
+## 2026-10-10 (r51c) — interpreter instruction fetch window
+
+Pico sampling with r51b (38.4 fps): outside generated code, the interpreter
+dominates (b86_step, cold_run, f8, rd8, b86_host, lin, fb, modrm, ...), and
+f8/rd8/lin/b86_host show up as separate functions: on the Pico build every
+fetched byte was a call chain f8 -> rd8 -> lin -> page table.
+* b86_step sets up a fetch window once per instruction (host pointer for
+  CS:IP, up to the 4 KiB mapping granule / segment end / A20 wrap, max 16
+  bytes); f8 reads from it and only falls back to the old path at an edge.
+* lin, g8/p8/g16/p16, setf, zsp_bits are always_inline. (Force-inlining
+  rd8/wr8/rm_get/... too would add ~12 KB of SRAM code: not done.)
+* interp .time_critical at -Os: 7164 -> 8004 bytes.
+* Full silicon set (614000) passes on the interpreter; JIT silicon, tiering
+  fuzz, DOS2TEST/MDSTRESS checksum pass.
+
+## 2026-10-10 (r51b) — word-wide REP STOSW in mapped pages
+
+Pico sampling (bb_pc_report): rep_paged was ~13% of all samples, almost all
+on one line: the REP STOSW fill for SRAM-mapped pages stored one byte per
+iteration with a branch per byte (3DBENCH clears its back buffer with STOSW
+every frame). fill_word() stores aligned 32-bit words (memset when AL == AH);
+used by the paged path and the plain path (the B86_REP_WIDE variant stays).
+
 ## 2026-10-10 (r51) — no cache flush on unmap
 
 B86_OPT_PAGE_ZERO flushed the native cache in b86_unmap_range too. blitzBUS

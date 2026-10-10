@@ -242,7 +242,7 @@ static const uint8_t modrm_tab[256] = {
     /* F */ 0,0,0,0,0,0,1,1, 0,0,0,0,0,0,1,1,
 };
 
-B86_HOT static inline uint8_t fb(B86Cpu *c, uint32_t cs, uint32_t ip)
+B86_HOT static inline __attribute__((always_inline)) uint8_t fb(B86Cpu *c, uint32_t cs, uint32_t ip)
 {
     return *b86_host(c, (cs << 4) + (ip & 0xFFFFu));
 }
@@ -2323,8 +2323,25 @@ B86_HOT uint32_t b86h_step(B86Cpu *c, uint32_t ip_next, uint32_t blk)
 /* REP MOVS / REP STOS in bulk. Same results as the interpreter: element-
    wise forward/backward semantics, 16-bit SI/DI wrap, A20-on addressing.
    Falls back to the interpreter for anything unusual. */
+/* (r51b) REP STOSW fill: bytes alternate a,b,a,b... starting at d[0];
+   32-bit aligned stores for the bulk (was a byte loop with a branch per byte) */
+B86_HOT static void fill_word(uint8_t *d, uint32_t len, uint8_t a, uint8_t b)
+{
+    if (a == b) { memset(d, a, len); return; }
+    uint32_t k = 0;
+    for (; k < len && ((uintptr_t)(d + k) & 3u); ++k) d[k] = (k & 1u) ? b : a;
+    if (len - k >= 4u) {
+        uint8_t e = (k & 1u) ? b : a, o = (k & 1u) ? a : b;    /* bytes at even/odd offsets from d+k */
+        uint32_t pat = (uint32_t)e | (uint32_t)o << 8 | (uint32_t)e << 16 | (uint32_t)o << 24;
+        uint32_t *q = (uint32_t *)(d + k), n4 = (len - k) >> 2;
+        for (uint32_t i = 0; i < n4; ++i) q[i] = pat;
+        k += n4 << 2;
+    }
+    for (; k < len; ++k) d[k] = (k & 1u) ? b : a;
+}
+
 #ifdef B86_PAGED
-B86_HOT static inline uint8_t *tr_host(const B86Cpu *c, uint8_t *nominal)
+B86_HOT static inline __attribute__((always_inline)) uint8_t *tr_host(const B86Cpu *c, uint8_t *nominal)
 {
     return nominal + c->pt[((uintptr_t)nominal >> 12) & 511u];
 }
@@ -2353,7 +2370,8 @@ B86_HOT static int rep_paged(B86Cpu *c, uint8_t *dst, uint8_t *src, uint32_t spa
         uint8_t *hd = tr_host(c, dst + done);
         if (src) memmove(hd, tr_host(c, src + done), lim);
         else if (!w) memset(hd, lo, lim);
-        else for (uint32_t k = 0; k < lim; ++k) hd[k] = ((done + k) & 1u) ? hi : lo;
+        else if (done & 1u) fill_word(hd, lim, hi, lo);
+        else fill_word(hd, lim, lo, hi);
         done += lim;
     }
     return 1;
@@ -2404,8 +2422,7 @@ B86_HOT uint32_t b86h_rep(B86Cpu *c, uint32_t ip_next, uint32_t blk)
             si = (uint16_t)(si + span);
         } else if (!w) memset(dst, (int)(c->r[B86_AX] & 0xFF), span);
 #ifndef B86_REP_WIDE
-        else { uint8_t lo = (uint8_t)c->r[B86_AX], hi = (uint8_t)(c->r[B86_AX] >> 8);
-               for (uint32_t i = 0; i < n; ++i) { dst[2 * i] = lo; dst[2 * i + 1] = hi; } }
+        else fill_word(dst, span, (uint8_t)c->r[B86_AX], (uint8_t)(c->r[B86_AX] >> 8));
 #else
         else {                                     /* STOSW: 32-bit stores (2 words each) */
             uint32_t ax = c->r[B86_AX] & 0xFFFFu, i = 0;
@@ -2747,7 +2764,7 @@ static const uint8_t cold_ctl[256] = {
     [0xF0 ... 0xF3] = 4, [0xF4] = 1,
 };
 
-B86_HOT static inline unsigned heat_bump(J *j, uint32_t key)
+B86_HOT static inline __attribute__((always_inline)) unsigned heat_bump(J *j, uint32_t key)
 {
     uint32_t h = (key * 2654435761u) >> (32 - HEAT_BITS);
     if (j->heat_key[h] != key) { j->heat_key[h] = key; j->heat[h] = 0; }

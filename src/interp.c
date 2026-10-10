@@ -110,7 +110,7 @@ B86_HOT void b86_set_flags(B86Cpu *c, uint16_t f)
 /* Memory                                                                   */
 /* ------------------------------------------------------------------------ */
 
-B86_HOT static inline uint32_t lin(const B86Cpu *c, int s, uint32_t off)
+B86_HOT static inline __attribute__((always_inline)) uint32_t lin(const B86Cpu *c, int s, uint32_t off)
 {
     return ((c->seg[s] << 4) + (off & 0xFFFFu)) & c->amask;
 }
@@ -171,9 +171,20 @@ typedef struct {
     uint8_t mod, reg, rm;
     int ea_seg;
     uint16_t ea_off;
+    const uint8_t *fp;          /* fetch window: host bytes at CS:fip0 */
+    uint16_t fip0, favail;
 } St;
 
-B86_HOT static inline uint8_t f8(St *s) { uint8_t v = rd8(s->c, B86_CS, s->ip); s->ip++; return v; }
+/* (r51c) instruction fetch from a host window set up once per instruction
+   (CS:IP up to the end of its 4 KiB page / the segment / the A20 wrap),
+   instead of lin()+page-table per byte */
+B86_HOT static uint8_t f8_slow(St *s) { uint8_t v = rd8(s->c, B86_CS, s->ip); s->ip++; return v; }
+B86_HOT static inline __attribute__((always_inline)) uint8_t f8(St *s)
+{
+    uint32_t i = (uint16_t)(s->ip - s->fip0);
+    if (__builtin_expect(i < s->favail, 1)) { s->ip++; return s->fp[i]; }
+    return f8_slow(s);
+}
 B86_HOT static inline uint16_t f16(St *s) { uint16_t lo = f8(s); return (uint16_t)(lo | (f8(s) << 8)); }
 
 B86_HOT static void modrm(St *s)
@@ -204,14 +215,14 @@ B86_HOT static void modrm(St *s)
     s->ea_seg = s->seg >= 0 ? s->seg : dseg;
 }
 
-B86_HOT static inline uint8_t g8(B86Cpu *c, int r) { return (uint8_t)(r < 4 ? c->r[r] : c->r[r - 4] >> 8); }
-B86_HOT static inline void p8(B86Cpu *c, int r, uint8_t v)
+B86_HOT static inline __attribute__((always_inline)) uint8_t g8(B86Cpu *c, int r) { return (uint8_t)(r < 4 ? c->r[r] : c->r[r - 4] >> 8); }
+B86_HOT static inline __attribute__((always_inline)) void p8(B86Cpu *c, int r, uint8_t v)
 {
     if (r < 4) c->r[r] = (c->r[r] & 0xFF00u) | v;
     else c->r[r - 4] = (c->r[r - 4] & 0x00FFu) | ((uint32_t)v << 8);
 }
-B86_HOT static inline uint16_t g16(B86Cpu *c, int r) { return (uint16_t)c->r[r]; }
-B86_HOT static inline void p16(B86Cpu *c, int r, uint16_t v) { c->r[r] = v; }
+B86_HOT static inline __attribute__((always_inline)) uint16_t g16(B86Cpu *c, int r) { return (uint16_t)c->r[r]; }
+B86_HOT static inline __attribute__((always_inline)) void p16(B86Cpu *c, int r, uint16_t v) { c->r[r] = v; }
 
 B86_HOT static inline uint32_t rm_get(St *s, int w)
 {
@@ -246,11 +257,11 @@ B86_HOT static inline uint16_t pop(B86Cpu *c)
 /* ------------------------------------------------------------------------ */
 
 #define FL (c->flags)
-B86_HOT static inline void setf(B86Cpu *c, uint32_t bit, int on) { if (on) FL |= bit; else FL &= ~bit; }
+B86_HOT static inline __attribute__((always_inline)) void setf(B86Cpu *c, uint32_t bit, int on) { if (on) FL |= bit; else FL &= ~bit; }
 
 /* (p) branch-light flag computation: all six arithmetic flags in one
    expression (CF 0x001, PF 0x004, AF 0x010, ZF 0x040, SF 0x080, OF 0x800) */
-B86_HOT static inline uint32_t zsp_bits(int w, uint32_t r)    /* r already masked */
+B86_HOT static inline __attribute__((always_inline)) uint32_t zsp_bits(int w, uint32_t r)    /* r already masked */
 {
     uint32_t sf = (w ? (r >> 8) : r) & 0x80u;                /* SF is bit 7 */
     return (r ? 0u : (uint32_t)B86_ZF) | sf | b86_parity[r & 0xFFu];
@@ -549,6 +560,14 @@ B86_HOT int b86_step(B86Cpu *c)
     St st, *s = &st;
     if (c->lz_kind != LZ_NONE || c->lz_ikind != LZ_NONE) b86_flags_materialize(c);   /* usually none pending */
     s->c = c; s->ip = (uint16_t)c->ip; s->seg = -1; s->rep = 0;
+    {   /* fetch window (f8): never crosses the 4 KiB mapping granule, the
+           64 KiB segment end, or the A20 wrap; 16 bytes covers any 8086 insn */
+        uint32_t a0 = lin(c, B86_CS, s->ip);
+        uint32_t n = 4096u - (a0 & 4095u), t;
+        t = 0x10000u - s->ip; if (t < n) n = t;
+        t = c->amask + 1u - a0; if (t < n) n = t;
+        s->fp = b86_host(c, a0); s->fip0 = s->ip; s->favail = (uint16_t)(n < 16u ? n : 16u);
+    }
     uint8_t op;
     for (;;) {
         op = f8(s);
