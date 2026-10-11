@@ -373,7 +373,7 @@ B86_HOT static void classify(Insn *d)
     case 0x8D: d->fuse = 0; d->native = memop; return;
     case 0x8E: if ((d->reg & 3) == B86_CS) { d->cls = C_END; return; }
         d->fuse = 0; d->native = 1; return;
-    case 0x8F: d->fuse = 0; return;
+    case 0x8F: d->fuse = 0; d->native = d->reg == 0; return;      /* r52e: POP r/m16 */
     case 0xC4: case 0xC5: case 0xD7: d->fuse = 0; return;
     case 0xD8: case 0xD9: case 0xDA: case 0xDB: case 0xDC: case 0xDD: case 0xDE: case 0xDF:
     case 0x9B: d->fuse = 0; return;
@@ -399,7 +399,8 @@ B86_HOT static void classify(Insn *d)
     case 0xFF:
         switch (d->reg) {
         case 0: case 1: d->fuse = 0; d->fdef = ALLF & ~B86_CF; d->native = 1; return;
-        case 2: d->cls = C_IND; d->fuse = ALLF; d->native = be_has_t2 && !(d->mod == 3 && d->rm == B86_SP); return;
+        case 2: d->cls = C_IND; d->fuse = ALLF;      /* r52e: CALL reg also on Thumb-2 (2 temps suffice) */
+            d->native = (be_has_t2 || d->mod == 3) && !(d->mod == 3 && d->rm == B86_SP); return;
         case 4: d->cls = C_IND; d->fuse = ALLF; d->native = 1; return;
         case 3: case 5: d->cls = C_END; return;
         default: d->fuse = 0; d->native = !(d->mod == 3 && d->rm == B86_SP); return;
@@ -601,6 +602,7 @@ B86_COLD static int checked_store(const Insn *d)
     if (is_mem_dst_producer(d)) return 1;
     switch (op) {
     case 0x88: case 0x89: case 0xC6: case 0xC7: case 0x8C: case 0xD0: case 0xD1: return 1;
+    case 0x8F: return d->reg == 0;
     case 0xF6: case 0xF7: return d->reg == 2;
     }
     return 0;
@@ -668,6 +670,7 @@ B86_COLD static uint8_t wmask(const Insn *d)
     case 0x87: return (uint8_t)((1u << d->reg) | (1u << d->rm));
     case 0x88: case 0xC6: return m3 ? r8bit(d->rm) : 0;
     case 0x89: case 0xC7: case 0x8C: return m3 ? (uint8_t)(1u << d->rm) : 0;
+    case 0x8F: return (uint8_t)((1u << B86_SP) | (m3 ? (1u << d->rm) : 0u));
     case 0x8A: return r8bit(d->reg);
     case 0x8B: case 0x8D: return (uint8_t)(1u << d->reg);
     case 0x8E: case 0xFA: case 0xFB: case 0xFC: case 0xFD: case 0xF5: case 0xF8: case 0xF9:
@@ -1160,10 +1163,17 @@ B86_COLD static int emit_alu(Tx *t, Insn *d, int xop, int w, Op dst, Op src, int
         if (dst.r < 4) a = dst.r;
         else { a = pick(&pool); ax = dst.r - 4; if (a < 0) return 0; }
     }
+    int bhi = 0;                /* r52e: b is the 16-bit register, operand = b >> 8 */
     if (src.k == O_R16) b = src.r;
     else if (src.k == O_R8) {
         if (src.r < 4) b = src.r;
-        else { b = pick(&pool); bx = src.r - 4; if (b < 0) return 0; }
+        else {
+            b = pick(&pool); bx = src.r - 4;
+            if (b < 0) {
+                if (!(be_cf_alu && logic && dst.k == O_MEM && !d->arm)) return 0;
+                b = src.r - 4; bx = -1; bhi = 1;
+            }
+        }
     }
     /* CMP feeding both NZCV and a lazy record recomputes a - b after the
        shifted compare, so its scratch must not alias a. */
@@ -1185,12 +1195,18 @@ B86_COLD static int emit_alu(Tx *t, Insn *d, int xop, int w, Op dst, Op src, int
         tmp = pick(&pool);
         if (tmp < 0) return 0;
     }
-    int cft = -1;
+    int cft = -1, cflag = 0;
     if (carry) {
         if (res >= V_T0 && res != a) pool.busy[res] = 1;
         if (x >= V_T0 && x != res && x != a && x != b) pool.busy[x] = 0;   /* x unused */
         cft = pick(&pool);
-        if (cft < 0) return 0;
+        if (cft < 0) {
+            /* r52e: no third temp (Thumb-2, memory destination): carry-in
+               goes through the host C flag and ADC/SBC instead */
+            if (!(be_cf_alu && !d->fused && dst.k == O_MEM && !bhi &&
+                  (src.k != O_IMM || be_adcsbc_imm_ok(imm)))) return 0;
+            cflag = 1;
+        }
         if (!d->fused) {
             /* (q) ADD/SUB/CMP right before (e.g. add byte [m],al / adc cx,[m]:
                the store's SMC check clobbers NZCV, so no fusion): rebuild CF
@@ -1231,18 +1247,23 @@ B86_COLD static int emit_alu(Tx *t, Insn *d, int xop, int w, Op dst, Op src, int
         else if (t->inc_pending) { be_stctx_imm(e, LZ_NONE, OFF(lz_ikind)); t->inc_pending = 0; }
         if (carry && src.k == O_IMM) be_stctx_imm(e, imm, OFF(lz_b));
     }
+    if (cflag) be_set_c_cf(e, V_T1, xop == 3);     /* T1 is free until the load */
     if (mem) be_load(e, w, V_T1, V_T0);
     if (ax >= 0) be_ubfx(e, a, ax, 8, 8);
     if (bx >= 0) be_ubfx(e, b, bx, 8, 8);
-    if (carry) {               /* after the load: a src address in T0 is dead now */
+    if (carry && !cflag) {     /* after the load: a src address in T0 is dead now */
         if (d->fused) be_get_carry(e, cft, d->mode);
         else { be_ldctx(e, cft, OFF(flags)); be_ubfx(e, cft, cft, 0, 1); }
     }
     if (lz && !logic) be_stctx(e, a, o_a);
     if (carry) {
         if (lz && src.k != O_IMM) be_stctx(e, b, OFF(lz_b));
-        if (src.k == O_IMM) be_opi(e, aop, res, a, imm); else be_op(e, aop, res, a, b);
-        be_op(e, aop, res, res, cft);
+        if (cflag) {
+            if (src.k == O_IMM) be_adcsbc_imm(e, xop == 3, res, a, imm); else be_adcsbc(e, xop == 3, res, a, b);
+        } else {
+            if (src.k == O_IMM) be_opi(e, aop, res, a, imm); else be_op(e, aop, res, a, b);
+            be_op(e, aop, res, res, cft);
+        }
         if (lz) be_stctx(e, res, o_res);
         if (dst.k == O_R8) put8(t, dst.r, res);
         if (dst.k == O_MEM) be_store(e, w, V_T1, V_T0, 1, d->next);
@@ -1251,7 +1272,9 @@ B86_COLD static int emit_alu(Tx *t, Insn *d, int xop, int w, Op dst, Op src, int
 
     if (logic) {
         int r = writes ? res : x;
-        if (src.k == O_IMM) be_opi(e, aop, r, a, imm); else be_op(e, aop, r, a, b);
+        if (src.k == O_IMM) be_opi(e, aop, r, a, imm);
+        else if (bhi) be_op_hi8(e, aop, r, a, b);
+        else be_op(e, aop, r, a, b);
         if (lz) be_stctx(e, r, o_res);
         if (dst.k == O_R8 && writes) put8(t, dst.r, r);
         if (d->arm && nzonly) be_test_nz(e, (r >= V_T0) ? r : x, r, sh);
@@ -1571,6 +1594,17 @@ B86_COLD static int lower(Tx *t, Insn *d)
         if (d->reg == d->rm) return 1;
         be_mov(e, V_T0, d->reg); be_mov(e, d->reg, d->rm); be_mov(e, d->rm, V_T0);
         return 1;
+    case 0x8F:                       /* r52e: POP r/m16 */
+        if (d->reg != 0) return 0;
+        if (d->mod == 3) { emit_pop_to(t, d->rm); return 1; }
+        /* EA first: segment overrides and page translation use lr, which is
+           T1 on Thumb-2. The 8086 EA never involves SP, so order is free. */
+        ea_modrm(t, d);                              /* T0 = destination EA */
+        be_ea(e, V_T1, B86_SS, B86_SP, -1, 0);       /* SS: no lr use */
+        be_load(e, 1, V_T1, V_T1);
+        be_opi(e, AOP_ADD, B86_SP, B86_SP, 2);
+        be_store(e, 1, V_T1, V_T0, 1, d->next);
+        return 1;
     case 0x88: case 0x89:
         if (d->mod == 3) {
             if (w) be_mov(e, d->rm, d->reg);
@@ -1867,6 +1901,14 @@ B86_COLD static int lower(Tx *t, Insn *d)
         if (d->reg == 4) {           /* JMP near r/m */
             emit_deferred(t, t->cur - 1, d->live);
             load_rm(t, d, 1, V_T0);
+            be_exit_ip_reg(e, V_T0);
+            return 1;
+        }
+        if (d->reg == 2 && d->mod == 3 && !be_has_t2) {   /* r52e: CALL reg with two temps */
+            emit_deferred(t, t->cur - 1, d->live);
+            be_movi(e, V_T1, d->next);
+            emit_push(t, V_T1, d->next, 2);
+            be_mov(e, V_T0, d->rm);                    /* rm != SP (classify) */
             be_exit_ip_reg(e, V_T0);
             return 1;
         }

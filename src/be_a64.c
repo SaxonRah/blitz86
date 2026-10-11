@@ -15,6 +15,12 @@
 const int be_has_t2 = 1;
 const int be_paged = 0;
 const int be_can_evict = 0;
+const int be_cf_alu = 0;
+void be_set_c_cf(Emit *e, int tmp, int invert) { (void)e; (void)tmp; (void)invert; }
+void be_adcsbc(Emit *e, int sbc, int d, int a, int b) { (void)e; (void)sbc; (void)d; (void)a; (void)b; }
+int be_adcsbc_imm(Emit *e, int sbc, int d, int a, uint32_t imm) { (void)e; (void)sbc; (void)d; (void)a; (void)imm; return 0; }
+int be_adcsbc_imm_ok(uint32_t imm) { (void)imm; return 0; }
+void be_op_hi8(Emit *e, int aop, int d, int a, int b) { (void)e; (void)aop; (void)d; (void)a; (void)b; }
 void be_unchain(Emit *e, uint8_t *site) { (void)e; (void)site; }
 uint8_t *be_ret_plain_fill(uint8_t *site) { return site; }
 const int be_store_clobbers_nzcv = 0;

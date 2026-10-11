@@ -39,3 +39,10 @@ no page was mapped); CS_CONST blocks (zero delta baked for CS-absolute
 accesses) are killed individually when their code segment overlaps the new
 mapping. 3DBENCH: the back-buffer mapping no longer flushes (host: flushes
 2 -> 1, the remaining one is the mode-13h A000 mapping at startup).
+
+r52e: fewer C helper round trips on Thumb-2 (two scratch registers):
+POP r/m16 and CALL reg are native; ADC/SBB with a memory destination use
+the host carry flag (ADC/SBC) instead of a third temp; AND/OR/XOR [mem], AH..BH
+use a shifted register operand. 3DBENCH helper steps (excluding the INT 16h
+keyboard poll): ~1.3M -> ~75K per 420M instructions. SST (8F, FF.2, ALU
+families, 45k vectors) and fuzzers pass.

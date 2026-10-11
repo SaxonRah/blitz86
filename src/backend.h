@@ -85,6 +85,16 @@ extern const int be_can_evict;
 void  be_unchain(Emit *e, uint8_t *site);
 /* plain RET cache (be_exit_ret): the first-use fill path */
 uint8_t *be_ret_plain_fill(uint8_t *site);
+/* r52e: two-temp forms for Thumb-2 (be_cf_alu = 1).
+   be_set_c_cf: host C = guest CF (invert: = !CF), via tmp.
+   be_adcsbc*: d = a +/- b with host carry (ADC / SBC), flags untouched.
+   be_op_hi8: d = a <aop> (b >> 8) (high-byte source register). */
+extern const int be_cf_alu;
+void be_set_c_cf(Emit *e, int tmp, int invert);
+void be_adcsbc(Emit *e, int sbc, int d, int a, int b);
+int  be_adcsbc_imm(Emit *e, int sbc, int d, int a, uint32_t imm);
+int  be_adcsbc_imm_ok(uint32_t imm);
+void be_op_hi8(Emit *e, int aop, int d, int a, int b);
 
 /* Data movement and ALU (no flags) */
 void be_mov(Emit *e, int d, int s);

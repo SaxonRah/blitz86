@@ -187,6 +187,25 @@ B86_RT void be_patch_branch(uint8_t *site, uint8_t *target) { enc_b(site, target
 B86_RT void be_kill_entry(uint8_t *entry, uint8_t *stub) { be_patch_branch(entry, stub); }
 B86_RT uintptr_t be_code_ptr(uint8_t *p) { return (uintptr_t)p | 1u; }
 const int be_can_evict = 1;
+B86_HOT static int dp_of(int aop);
+const int be_cf_alu = 1;
+B86_HOT void be_set_c_cf(Emit *e, int tmp, int invert)
+{
+    uint32_t enc;
+    ldst(e, LDRW, hr(tmp), R_CTX, OFF(flags));
+    if (invert) { modimm(1, &enc); dp_imm(e, DP_EOR, 0, hr(tmp), hr(tmp), enc); }
+    shift_imm(e, 1, hr(tmp), hr(tmp), 1, 1);                    /* LSRS tmp, tmp, #1: C = bit 0 */
+}
+B86_HOT void be_adcsbc(Emit *e, int sbc, int d, int a, int b) { dp_reg(e, sbc ? 11 : 10, 0, hr(d), hr(a), hr(b), 0, 0); }
+B86_HOT int be_adcsbc_imm_ok(uint32_t imm) { uint32_t enc; return modimm(imm, &enc); }
+B86_HOT int be_adcsbc_imm(Emit *e, int sbc, int d, int a, uint32_t imm)
+{
+    uint32_t enc;
+    if (!modimm(imm, &enc)) return 0;
+    dp_imm(e, sbc ? 11 : 10, 0, hr(d), hr(a), enc);
+    return 1;
+}
+B86_HOT void be_op_hi8(Emit *e, int aop, int d, int a, int b) { dp_reg(e, dp_of(aop), 0, hr(d), hr(a), hr(b), 1, 8); }
 B86_RT uint8_t *be_ret_plain_fill(uint8_t *site) { return site + 36; }
 
 /* ---- runtime -------------------------------------------------------------- */
