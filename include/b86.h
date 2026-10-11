@@ -192,6 +192,8 @@ typedef struct B86JitStats {
     uint64_t inner_branches;    /* forward Jcc lowered as in-block branches */
     uint64_t splits;            /* blocks killed so a new entry inside them joins */
     uint64_t cold_runs, cold_insns;   /* interpreted before an entry became hot */
+    uint64_t evictions, evicted_blocks, unchains;  /* r52 region eviction */
+    uint64_t limit_retries;     /* r52c: oversized attempts retried without a flush */
 } B86JitStats;
 
 /* Code buffer must be executable (and, on Pico, in SRAM). */
@@ -242,6 +244,7 @@ void     b86_jit_set_no_join(struct B86Jit *j, int on);    /* testing: no superb
    the dispatcher interprets it. Keeps rarely-run code out of a small code
    buffer (RP2350). */
 void     b86_jit_set_hot_threshold(struct B86Jit *j, unsigned n);
+int      b86_jit_evict_enabled(struct B86Jit *j);   /* r52: 1 = region eviction, 0 = whole-cache flushes */
 /* Testing: exits record cpu->retired (takes effect after a flush). */
 void     b86_jit_set_count_exits(struct B86Jit *j, int on);
 

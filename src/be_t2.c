@@ -135,6 +135,12 @@ static void emit_bl(Emit *e, uint8_t *target)
     site[3] = (uint8_t)(site[3] | 0x40);                     /* B.W -> BL: hw2 bit 14 */
     e->p += 4;
 }
+B86_HOT void be_unchain(Emit *e, uint8_t *site)
+{
+    enc_b(site, e->x_chreq);
+    site[3] = (uint8_t)(site[3] | 0x40);                     /* BL x_chreq (the original exit) */
+    be_flush_icache(site, 4);
+}
 B86_HOT static void put_word(Emit *e, uint32_t v) { put16(e, v & 0xFFFF); put16(e, v >> 16); }
 
 B86_RT static void enc_bcc(uint8_t *site, uint8_t *target, uint32_t cond)
@@ -180,6 +186,8 @@ B86_RT void be_flush_icache(void *start, size_t len)
 B86_RT void be_patch_branch(uint8_t *site, uint8_t *target) { enc_b(site, target); be_flush_icache(site, 4); }
 B86_RT void be_kill_entry(uint8_t *entry, uint8_t *stub) { be_patch_branch(entry, stub); }
 B86_RT uintptr_t be_code_ptr(uint8_t *p) { return (uintptr_t)p | 1u; }
+const int be_can_evict = 1;
+B86_RT uint8_t *be_ret_plain_fill(uint8_t *site) { return site + 36; }
 
 /* ---- runtime -------------------------------------------------------------- */
 
@@ -499,7 +507,7 @@ B86_HOT static void ea_translate(Emit *e, int dd)
 #if defined(B86_OPT_PAGE_ZERO) && B86_OPT_PAGE_ZERO
     /* Mapping changes flush translated code before modifying page deltas.
        This is a translation-time guard: no extra instruction per access. */
-    if (e->cpu->pt_active_pages == 0) return;
+    if (e->cpu->pt_active_pages == 0) { e->baked_zero |= 1; return; }
 #endif
     /* page table = first 2 KiB of the SMC line table (r9) */
     bitfield(e, 0xF3C0u, LR, dd, 12, 8);                              /* UBFX lr, dd, #12, #9 */
@@ -565,6 +573,7 @@ B86_HOT void be_ea(Emit *e, int d, int seg, int b1, int b2, int32_t disp)
 #if defined(B86_OPT_CS_CONST) && B86_OPT_CS_CONST
             if (seg != B86_CS || !ea_cs_abs_is_direct(e, (uint16_t)disp))
                 ea_translate(e, dd);
+            else e->baked_zero |= 2;
 #else
             ea_translate(e, dd);
 #endif

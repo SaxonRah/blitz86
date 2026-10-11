@@ -47,6 +47,16 @@ uint64_t b86_rep_bytes[4]; uint32_t b86_rep_es[65536]; uint32_t b86_cold_ip[1 <<
 #endif
 #define BIT_GET(m, a) (((m)[(a) >> 3] >> ((a) & 7u)) & 1u)
 #define BIT_SET(m, a) ((m)[(a) >> 3] |= (uint8_t)(1u << ((a) & 7u)))
+#define BIT_CLR(m, a) ((m)[(a) >> 3] &= (uint8_t)~(1u << ((a) & 7u)))
+#ifndef B86_EVICT
+#define B86_EVICT 1                 /* r52: reclaim the oldest code instead of flushing all */
+#endif
+#ifndef B86_EVICT_CHUNK
+#define B86_EVICT_CHUNK 16384u      /* bytes reclaimed per step */
+#endif
+#define B86_EVICT_ROOM 16384u       /* free space ensured before each translation */
+#define PLOGN 4096u
+#define MAP_TOMB 0xFFFFFFFFu        /* map slot of a recycled block */
 #define COVN ((B86_MEM_BYTES + 7u) >> 3)
 /* Paged Thumb-2 indexes the SMC line map with UBFX(addr, 6, 15): a 32 Ki
    table where guest lines start at ((mem >> 6) & 0x7FFF). Addresses outside
@@ -147,6 +157,7 @@ typedef struct Block {
     uint8_t dead;
     uint8_t spec;               /* continuation specialized for one RET site */
     uint8_t *ret_b, *ret_rec;   /* spec: that site's hit branch / record path */
+    uint8_t *hend;              /* end of this block's code (r52 eviction) */
 } Block;
 
 struct Insn;
@@ -184,6 +195,16 @@ typedef struct B86Jit {
     uint8_t *dead;              /* per block: killed (SRAM mirror of blk[].dead) */
     struct RetMeta *rm;         /* RET sites carrying deferred flag records */
     uint32_t nrm;
+    /* r52 region eviction: the code buffer is a ring; [e.p, free_end) is free.
+       Reclaiming the oldest chunk kills its blocks, recycles their slots and
+       undoes every patch (chain / RET cache / record branch) aimed into it. */
+    int evict;
+    int zero_code;              /* r52d: live code assumes zero page deltas */
+    uint8_t *free_end;
+    struct PatchLog *plog;
+    uint32_t nplog;
+    uint16_t *free_idx;
+    uint32_t nfree;
     B86JitStats st;
 } J;
 
@@ -438,7 +459,7 @@ B86_COLD static int ends_block(const Insn *d)
 /* A RET whose exit would rebuild deferred flag records: the hit path of its
    inline cache enters a continuation specialized with these producers as a
    virtual prefix, so the record is rebuilt only where actually needed. */
-typedef struct RetMeta { uint8_t *site, *miss, *recp, *recb; int npre; Insn pre[2]; } RetMeta;
+typedef struct RetMeta { uint8_t *site, *miss, *recp, *recb, *fill; int npre; Insn pre[2]; } RetMeta;
 /* recp: start of `write record; B normal-target`, recb: that B */
 
 /* Flags live on entry to `ip`: scan forward until every flag is defined.
@@ -1838,7 +1859,7 @@ B86_COLD static int lower(Tx *t, Insn *d)
         be_bind(e, bne, fill); be_bind(e, bhit, fill); be_bind(e, recb, fill);
         e->no_count = 0;
         RetMeta *m = &t->j->rm[t->j->nrm++];
-        m->site = site; m->miss = miss; m->recp = recp; m->recb = recb; m->npre = 0;
+        m->site = site; m->miss = miss; m->recp = recp; m->recb = recb; m->fill = fill; m->npre = 0;
         if (pa) { m->pre[m->npre] = t->v[P]; m->pre[m->npre].virt = 1; m->npre++; }
         if (Q >= 0 && (qa || pa)) { m->pre[m->npre] = t->v[Q]; m->pre[m->npre].virt = (uint8_t)(qa ? 1 : 2); m->npre++; }
         return 1; }
@@ -1920,6 +1941,7 @@ B86_HOT static Block *map_find(J *j, uint32_t key)
         uint32_t s = (h + i) & (MAPN - 1);
         uint32_t v = j->map[s];
         if (!v) return NULL;
+        if (v == MAP_TOMB) continue;
         Block *b = &j->blk[v - 1];
         if (b->key == key && !b->dead) return b;
     }
@@ -1933,7 +1955,7 @@ B86_HOT static void map_insert(J *j, uint32_t idx)
     for (uint32_t i = 0; i < MAPN; ++i) {
         uint32_t s = (h + i) & (MAPN - 1);
         uint32_t v = j->map[s];
-        if (!v || (j->blk[v - 1].key == b->key && j->blk[v - 1].dead)) {
+        if (!v || v == MAP_TOMB || (j->blk[v - 1].key == b->key && j->blk[v - 1].dead)) {
             j->map[s] = idx + 1;
             b->map_slot = s;
             return;
@@ -1953,6 +1975,7 @@ B86_HOT void b86_jit_flush(J *j)
 {
     for (uint32_t i = 0; i < j->nblk; ++i) {
         Block *b = &j->blk[i];
+        if (!b->host) continue;                       /* recycled slot (r52) */
         {   /* insns and entry lie in [glo, ghi); a wrapping one-insn block has ghi < glo */
             uint32_t lo = b->glo >> 3, hi = b->ghi > b->glo ? (b->ghi + 7u) >> 3 : lo + 1u;
             if (hi > COVN) hi = COVN;
@@ -1972,6 +1995,12 @@ B86_HOT void b86_jit_flush(J *j)
     }
     j->nblk = 0;
     j->nrm = 0;
+    if (j->map) memset(j->map, 0, MAPN * sizeof *j->map);   /* also drops tombstones */
+    j->nfree = 0;
+    j->nplog = 0;
+    j->free_end = j->buf_end;
+    j->e.end = j->buf_end;
+    j->zero_code = 0;
     /* A new generation: entries that were hot stay hot (retranslated on
        first dispatch); lukewarm ones start over. Zeroing everything made
        every flush re-interpret the whole hot set hot_threshold times. */
@@ -2052,6 +2081,119 @@ B86_HOT static void smc_hook(B86Cpu *c, uint32_t lin, uint32_t n)
     J *j = c->jit;
     j->st.smc_hits++;
     invalidate(j, lin, lin + n);
+}
+
+/* ------------------------------------------------------------------------ */
+/* r52: region eviction                                                     */
+/* ------------------------------------------------------------------------ */
+
+enum { PL_CHAIN, PL_RET, PL_RECB };
+typedef struct PatchLog { uint8_t *site, *target, *aux; uint32_t kind; } PatchLog;
+
+/* Record a patch whose target is translated code. 0: log full - the caller
+   must not patch (an unlogged patch could later point into reused code). */
+B86_HOT static int plog_add(J *j, uint32_t kind, uint8_t *site, uint8_t *target, uint8_t *aux)
+{
+    if (!j->evict) return 1;
+    if (j->nplog >= PLOGN) return 0;
+    PatchLog *l = &j->plog[j->nplog++];
+    l->site = site; l->target = target; l->aux = aux; l->kind = kind;
+    return 1;
+}
+
+B86_HOT static void pg_unlink(J *j, uint32_t idx)
+{
+    Block *b = &j->blk[idx];
+    for (int r = 0; r <= b->nx; ++r) {
+        uint32_t lo = r ? b->xlo[r - 1] : b->glo;
+        uint32_t want = (idx + 1) | ((uint32_t)r << 28);
+        uint32_t *link = &j->pg_head[lo >> PG_SHIFT];
+        while (*link) {
+            uint32_t v = *link, bi = (v & 0x0FFFFFFFu) - 1, rr = v >> 28;
+            Block *x = &j->blk[bi];
+            uint32_t *next = rr ? &x->next_pgx[rr - 1] : &x->next_pg;
+            if (v == want) { *link = *next; break; }
+            link = next;
+        }
+    }
+}
+
+/* Reclaim the code of every block that starts in [lo, hi). Returns the end
+   of the reclaimed space (a block may run past hi). */
+B86_HOT static uint8_t *evict_range(J *j, uint8_t *lo, uint8_t *hi)
+{
+    uint8_t *top = hi;
+    j->st.evictions++;
+    for (uint32_t i = 0; i < j->nblk; ++i) {
+        Block *b = &j->blk[i];
+        if (!b->host || b->host < lo || b->host >= hi) continue;
+        if (b->hend > top) top = b->hend;
+        if (!b->dead) { kill_block(j, i); j->st.smc_invalidations--; }
+        pg_unlink(j, i);
+        if (!b->spec && b->map_slot < MAPN && j->map[b->map_slot] == i + 1) j->map[b->map_slot] = MAP_TOMB;
+        {   /* this generation's coverage bits (joins only; clearing extra is safe) */
+            uint32_t a0 = b->glo, a1 = b->iend > b->glo ? b->iend : b->glo + 1u;
+            for (uint32_t a = a0; a < a1 && (a >> 3) < COVN; ++a) BIT_CLR(j->cov, a);
+            if (!b->spec) {
+                uint32_t ent = ((b->key >> 16) << 4) + (b->key & 0xFFFFu);
+                if ((ent >> 3) < COVN) BIT_CLR(j->ent, ent);
+            }
+        }
+        memset(b, 0, sizeof *b);
+        j->dead[i] = 1;
+        j->free_idx[j->nfree++] = (uint16_t)i;
+        j->st.evicted_blocks++;
+    }
+    /* surviving specialized continuations whose RET site is gone */
+    for (uint32_t i = 0; i < j->nblk; ++i) {
+        Block *b = &j->blk[i];
+        if (b->host && b->spec && b->ret_b && b->ret_b >= lo && b->ret_b < top) b->ret_b = NULL;
+    }
+    {   /* RET sites with records that lived in the reclaimed code */
+        uint32_t w = 0;
+        for (uint32_t r = 0; r < j->nrm; ++r)
+            if (!(j->rm[r].site >= lo && j->rm[r].site < top)) j->rm[w++] = j->rm[r];
+        j->nrm = w;
+    }
+    {   /* undo patches aimed into the reclaimed code; drop those inside it */
+        uint32_t w = 0;
+        for (uint32_t k = 0; k < j->nplog; ++k) {
+            PatchLog *l = &j->plog[k];
+            if (l->site >= lo && l->site < top) continue;
+            if (l->target >= lo && l->target < top) {
+                if (l->kind == PL_CHAIN) be_unchain(&j->e, l->site);
+                else if (l->kind == PL_RET) be_patch_branch(be_ret_hit_branch(l->site), l->aux);
+                else be_patch_branch(l->site, l->aux);           /* PL_RECB */
+                j->st.unchains++;
+                continue;
+            }
+            j->plog[w++] = *l;
+        }
+        j->nplog = w;
+    }
+    j->flush_gen++;          /* pending chain / RET patch sites may be gone */
+    return top;
+}
+
+/* One reclaim step: wrap at the end of the buffer, else reclaim the next
+   chunk after the free space. */
+B86_HOT static void evict_step(J *j)
+{
+    if (j->free_end >= j->buf_end) {
+        j->e.p = j->code_start;
+        j->free_end = j->code_start;
+    }
+    uint8_t *hi = j->free_end + B86_EVICT_CHUNK;
+    if (hi > j->buf_end) hi = j->buf_end;
+    uint8_t *top = evict_range(j, j->free_end, hi);
+    j->free_end = top > j->buf_end ? j->buf_end : top;
+}
+
+B86_HOT static void evict_make_room(J *j)
+{
+    while ((size_t)(j->free_end - j->e.p) < B86_EVICT_ROOM || (!j->nfree && j->nblk >= MAXB))
+        evict_step(j);
+    j->e.end = j->free_end;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -2159,9 +2301,10 @@ B86_COLD static Block *translate_ex(J *j, uint32_t cs, uint16_t ip, const Insn *
     Insn *last = &v[n - 1];
     uint32_t glo0 = glo, ghi0 = ghi;
 
-    if (j->nblk >= MAXB || (size_t)(j->buf_end - j->e.p) < 16384) b86_jit_flush(j);
+    if (j->evict) evict_make_room(j);
+    else if (j->nblk >= MAXB || (size_t)(j->buf_end - j->e.p) < 16384) b86_jit_flush(j);
 
-    uint32_t idx = j->nblk;
+    uint32_t idx = j->nfree ? j->free_idx[j->nfree - 1] : j->nblk;
     Block *b = &j->blk[idx];
     Emit *e = &j->e;
     uint8_t *start = e->p;
@@ -2170,7 +2313,9 @@ B86_COLD static Block *translate_ex(J *j, uint32_t cs, uint16_t ip, const Insn *
     /* Analysis assumes every `native` insn lowers. If one cannot (register
        pressure on Thumb-2), demote it to the helper and redo the block, so
        no consumer is ever fused to a producer that did not set NZCV. */
+    uint32_t nrm0 = j->nrm;                   /* RET records added by a discarded attempt */
     for (int attempt = 0;; ++attempt) {
+        j->nrm = nrm0;
         for (int i = 0; i < n; ++i) {
             v[i].arm = v[i].lazy = v[i].fused = v[i].mode = v[i].prod = v[i].cmode = v[i].synth = v[i].endsynth = v[i].zsrc = 0;
             v[i].live = v[i].live_taken = 0;
@@ -2192,6 +2337,7 @@ B86_COLD static Block *translate_ex(J *j, uint32_t cs, uint16_t ip, const Insn *
         e->blk = idx;
         e->nslow = 0;
         e->overflow = 0;
+        e->baked_zero = 0;
         e->p = start;
         b->host = start;
         memset(&tx, 0, sizeof tx);
@@ -2253,6 +2399,16 @@ B86_COLD static Block *translate_ex(J *j, uint32_t cs, uint16_t ip, const Insn *
     be_exit_ip_imm(e, ip, XR_LOOKUP);
 
     if (e->overflow || tx.fail) {
+        if (j->evict) {
+            /* r52c: nothing of this attempt is published - drop it instead of
+               flushing the whole cache (a full flush stalls 3DBENCH visibly) */
+            int space = e->overflow && !tx.fail && (size_t)(e->end - e->p) < 64u;
+            e->p = start;
+            j->nrm = nrm0;
+            j->st.limit_retries++;
+            if (space) { evict_step(j); return translate_ex(j, cs, ip, pre, npre); }
+            if (maxn > 4) { unsigned m = j->max_insns; j->max_insns = maxn / 2; Block *r = translate_ex(j, cs, ip, pre, npre); j->max_insns = m; return r; }
+        }
         /* out of space or an internal limit: flush and retry smaller */
         b86_jit_flush(j);
         if (tx.fail && maxn > 4) { unsigned m = j->max_insns; j->max_insns = maxn / 2; Block *r = translate_ex(j, cs, ip, pre, npre); j->max_insns = m; return r; }
@@ -2268,7 +2424,9 @@ B86_COLD static Block *translate_ex(J *j, uint32_t cs, uint16_t ip, const Insn *
     }
 #endif
 
-    j->nblk++;
+    b->hend = e->p;
+    j->zero_code |= e->baked_zero;
+    if (j->nfree && j->free_idx[j->nfree - 1] == idx) j->nfree--; else j->nblk++;
     for (int i = npre; i < n; ++i) BIT_SET(j->cov, base + v[i].ip);
     if (!npre) BIT_SET(j->ent, base + ip);
     if (npre) b->spec = 1; else map_insert(j, idx);
@@ -2553,7 +2711,21 @@ int b86_map_range(B86Cpu *c, uint32_t lin, uint32_t len, uint8_t *frame)
     /* Any code compiled with the zero-delta assumption must be discarded
        BEFORE publishing new page-table entries. Caller must not map during
        live execution of native code (same existing map/unmap contract). */
-    if (j) b86_jit_flush(j);
+    /* r52d: only code that baked a zero delta needs discarding; once a
+       page is mapped (A000 in mode 13h) new code always translates, so a
+       later mapping (the back buffer) no longer flushes everything */
+    if (j && (j->zero_code & 1)) b86_jit_flush(j);
+    else if (j && (j->zero_code & 2)) {
+        /* CS-absolute accesses baked for unmapped pages: kill the blocks whose
+           code segment window overlaps the new mapping (chains fall back
+           through their dead stubs) */
+        for (uint32_t i = 0; i < j->nblk; ++i) {
+            Block *b = &j->blk[i];
+            if (!b->host || b->dead) continue;
+            uint32_t cb = (b->key >> 16) << 4;
+            if (cb < lin + len && cb + 0x10000u > lin) kill_block(j, i);
+        }
+    }
 #endif
     memcpy(frame, c->mem + lin, len);
     for (uint32_t a = 0; a < len; a += 4096u) {
@@ -2611,7 +2783,15 @@ B86_HOT J *b86_jit_create_ex(B86Cpu *c, void *code, size_t size, void *hot, size
     J *j = calloc(1, sizeof *j);                 /* small, hot: normal (SRAM) heap */
     if (!j) return NULL;
     j->dead = calloc(MAXB, 1);
+#if defined(B86_TV_SRAM) && B86_TV_SRAM
+    {   /* r52b: the main translator scratch in .bss (Pico: SRAM, not PSRAM) */
+        static Insn tv_sram[128];
+        memset(tv_sram, 0, sizeof tv_sram);
+        j->tv = tv_sram;
+    }
+#else
     j->tv = B86_CALLOC(128, sizeof(Insn));
+#endif
     j->tw = B86_CALLOC(128, sizeof(Insn));
     j->cpu = c;
     j->buf = code;
@@ -2671,6 +2851,12 @@ B86_HOT J *b86_jit_create_ex(B86Cpu *c, void *code, size_t size, void *hot, size
     j->code_start = j->e.p;
     be_flush_icache(j->buf, (size_t)(j->e.p - j->buf));
     fast_reset(j);
+    j->free_end = j->buf_end;
+    if (B86_EVICT && be_can_evict && (size_t)(j->buf_end - j->code_start) >= 4u * B86_EVICT_ROOM) {
+        j->plog = B86_CALLOC(PLOGN, sizeof *j->plog);
+        j->free_idx = B86_CALLOC(MAXB, sizeof *j->free_idx);
+        j->evict = j->plog && j->free_idx;
+    }
     return j;
 }
 
@@ -2682,7 +2868,12 @@ B86_HOT void b86_jit_destroy(J *j)
     B86_FREE(j->cov); B86_FREE(j->ent); B86_FREE(j->heat_key); B86_FREE(j->heat);
     if (!j->hot_external) { B86_FREE(j->fast); B86_FREE(j->cm_table); }
     free(j->dead);
-    B86_FREE(j->tv); B86_FREE(j->tw);
+#if !(defined(B86_TV_SRAM) && B86_TV_SRAM)
+    B86_FREE(j->tv);
+#endif
+    B86_FREE(j->tw);
+    if (j->plog) B86_FREE(j->plog);
+    if (j->free_idx) B86_FREE(j->free_idx);
     free(j);
 }
 
@@ -2691,11 +2882,12 @@ B86_HOT const B86JitStats *b86_jit_stats(J *j) { return &j->st; }
 int b86_jit_pc_lookup(J *j, uintptr_t pc, uint32_t *key, uint32_t *offset) {
     if (!j || !key || !offset) return 0;
     pc &= ~(uintptr_t)1;
-    if (pc < (uintptr_t)j->code_start || pc >= (uintptr_t)j->e.p) return 0;
+    if (pc < (uintptr_t)j->code_start || pc >= (uintptr_t)j->buf_end) return 0;
     for (uint32_t i=0;i<j->nblk;i++) {
         Block *b=&j->blk[i];
+        if (!b->host) continue;
         uintptr_t lo=(uintptr_t)b->host;
-        uintptr_t hi=(i+1u<j->nblk)?(uintptr_t)j->blk[i+1u].host:(uintptr_t)j->e.p;
+        uintptr_t hi=(uintptr_t)b->hend;
         if (pc>=lo && pc<hi && !b->dead && !j->dead[i]) {
             *key=b->key;*offset=(uint32_t)(pc-lo);return 1;
         }
@@ -2709,6 +2901,7 @@ B86_HOT void b86_jit_set_no_fast(J *j, int on) { j->single_step = on; }
 B86_HOT void b86_jit_set_no_chain(J *j, int on) { j->no_chain = on; }
 B86_HOT void b86_jit_set_no_spec(J *j, int on) { j->no_spec = on; }
 B86_HOT void b86_jit_set_no_join(J *j, int on) { j->no_join = on; }
+int b86_jit_evict_enabled(J *j) { return j && j->evict; }
 B86_HOT void b86_jit_set_hot_threshold(J *j, unsigned n) { j->hot_threshold = n > 255u ? 255u : n; }
 B86_HOT void b86_jit_set_count_retired(J *j, int on) { j->e.count_ret = on; }
 B86_HOT void b86_jit_invalidate(J *j, uint32_t lin, uint32_t len) { if (len) invalidate(j, lin, lin + len); }
@@ -2740,7 +2933,7 @@ B86_HOT uint32_t b86_jit_sync_external(J *j, uint32_t lin, uint32_t len)
     }
     return killed;
 }
-B86_HOT void b86_jit_set_count_exits(J *j, int on) { j->e.count_exits = on; }
+B86_HOT void b86_jit_set_count_exits(J *j, int on) { j->e.count_exits = on; if (on && j->evict) { b86_jit_flush(j); j->evict = 0; } }
 B86_HOT void b86_jit_set_single_step(J *j, int on)
 {
     j->single_step = on;
@@ -2890,13 +3083,16 @@ B86_HOT int b86_jit_run(B86Cpu *c, uint64_t max_dispatch)
             if (rf_site && rf_gen == j->flush_gen && !j->no_chain) {
                 RetMeta *m = NULL;
                 for (uint32_t r = 0; r < j->nrm; ++r) if (j->rm[r].site == rf_site) { m = &j->rm[r]; break; }
-                if (m && j->no_spec) { be_patch_branch(m->recb, b->host); be_patch_ret(rf_site, (uint16_t)c->ip, m->recp, m->miss); }
-                else if (!m) be_patch_ret(rf_site, (uint16_t)c->ip, b->host, NULL);
+                if (j->evict && j->nplog + 2 > PLOGN) { /* log full: leave the RET cache unpatched */ }
+                else if (m && j->no_spec) { plog_add(j, PL_RECB, m->recb, b->host, m->fill); be_patch_branch(m->recb, b->host); be_patch_ret(rf_site, (uint16_t)c->ip, m->recp, m->miss); }
+                else if (!m) { plog_add(j, PL_RET, rf_site, b->host, be_ret_plain_fill(rf_site)); be_patch_ret(rf_site, (uint16_t)c->ip, b->host, NULL); }
                 else {
                     uint8_t *site = rf_site;
                     uint8_t *normal = b->host;
                     Block *sb = translate_ex(j, c->seg[B86_CS], (uint16_t)c->ip, m->pre, m->npre);
                     if (rf_gen == j->flush_gen) {
+                        plog_add(j, PL_RECB, m->recb, normal, m->fill);
+                        plog_add(j, PL_RET, site, sb->host, m->fill);
                         be_patch_branch(m->recb, normal);
                         sb->ret_b = be_ret_hit_branch(site);
                         sb->ret_rec = m->recp;
@@ -2910,7 +3106,7 @@ B86_HOT int b86_jit_run(B86Cpu *c, uint64_t max_dispatch)
                 j->fast[f].host = be_code_ptr(host);
             }
         }
-        if (patch_site && patch_gen == j->flush_gen && !j->no_chain) {
+        if (patch_site && patch_gen == j->flush_gen && !j->no_chain && plog_add(j, PL_CHAIN, patch_site, host, NULL)) {
             be_patch_branch(patch_site, host);
             j->st.chains++;
         }

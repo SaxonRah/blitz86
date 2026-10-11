@@ -51,6 +51,7 @@ typedef struct Emit {
     int nslow;
     int count_exits;    /* debug: exits store `retire` into cpu->retired */
     int count_ret;      /* exits add `retire` to cpu->icnt (exact retired count) */
+    int baked_zero;     /* r52d: 1 = skipped all page lookups (PAGE_ZERO), 2 = CS-absolute zero delta (CS_CONST) */
     int no_count;       /* frontend: suppress counting on exits already counted */
     uint32_t retire;
 } Emit;
@@ -77,6 +78,13 @@ void  be_patch_branch(uint8_t *site, uint8_t *target);
 /* Make block entry `entry` branch to `stub` (block invalidated). */
 void  be_kill_entry(uint8_t *entry, uint8_t *stub);
 uintptr_t be_code_ptr(uint8_t *p);       /* value to store in the fast table */
+/* Region eviction (r52): undo a chain patch (restore `BL x_chreq` at the
+   site) when its target block's code is reclaimed. be_can_evict = 0 means
+   the backend cannot, and the frontend falls back to whole-cache flushes. */
+extern const int be_can_evict;
+void  be_unchain(Emit *e, uint8_t *site);
+/* plain RET cache (be_exit_ret): the first-use fill path */
+uint8_t *be_ret_plain_fill(uint8_t *site);
 
 /* Data movement and ALU (no flags) */
 void be_mov(Emit *e, int d, int s);
