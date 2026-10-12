@@ -1289,6 +1289,37 @@ B86_COLD static int emit_alu(Tx *t, Insn *d, int xop, int w, Op dst, Op src, int
                 be_opi(e, AOP_AND, V_T1, V_T1, (uint16_t)~B86_CF);
                 be_op(e, AOP_ORR, V_T1, V_T1, V_T0);
                 be_stctx(e, V_T1, OFF(flags));
+            } else if (pxop == 2 || pxop == 3) {
+                /* r52m: ADC/SBB right before (32/48-bit add/sub chains): its
+                   carry out from the record, exactly as lazy_eval does it -
+                   ADC: msb((a & b) | ((a | b) & ~r)), SBB: msb((~a & b) | (~(a ^ b) & r)) */
+                if (pxop == 2) {
+                    be_ldctx(e, V_T0, OFF(lz_a)); be_ldctx(e, V_T1, OFF(lz_b));
+                    be_op(e, AOP_AND, V_T1, V_T0, V_T1);
+                    be_stctx(e, V_T1, OFF(rep_tmp[0]));
+                    be_ldctx(e, V_T1, OFF(lz_b));
+                    be_op(e, AOP_ORR, V_T0, V_T0, V_T1);
+                    be_ldctx(e, V_T1, OFF(lz_res));
+                    be_mvn(e, V_T1, V_T1);
+                    be_op(e, AOP_AND, V_T0, V_T0, V_T1);
+                } else {
+                    be_ldctx(e, V_T0, OFF(lz_a)); be_ldctx(e, V_T1, OFF(lz_b));
+                    be_op(e, AOP_EOR, V_T0, V_T0, V_T1);
+                    be_mvn(e, V_T0, V_T0);
+                    be_ldctx(e, V_T1, OFF(lz_res));
+                    be_op(e, AOP_AND, V_T0, V_T0, V_T1);
+                    be_stctx(e, V_T0, OFF(rep_tmp[0]));
+                    be_ldctx(e, V_T1, OFF(lz_a));
+                    be_mvn(e, V_T1, V_T1);
+                    be_ldctx(e, V_T0, OFF(lz_b));
+                    be_op(e, AOP_AND, V_T0, V_T0, V_T1);
+                }
+                be_ldctx(e, V_T1, OFF(rep_tmp[0]));
+                be_op(e, AOP_ORR, V_T0, V_T0, V_T1);
+                be_ubfx(e, V_T0, V_T0, pv->w ? 15u : 7u, 1);
+                be_ldctx(e, V_T1, OFF(flags));
+                be_bfi(e, V_T1, V_T0, 0, 1);
+                be_stctx(e, V_T1, OFF(flags));
             } else
                 flags_if_lazy(t, d, 0);                  /* CF from ctx; clobbers temps */
         }
@@ -1665,7 +1696,24 @@ B86_COLD static int lower(Tx *t, Insn *d)
             site = (bits == 16 && (cc == 4 || cc == 5)) ? (nz ? be_cbnz16(e, V_T0) : be_cbz16(e, V_T0))
                                                         : (nz ? be_cbnz(e, V_T0) : be_cbz(e, V_T0));
         } else {
+            /* r52m: flags already concrete in ctx (no record pending - e.g. a
+               callee returned CF from STC/CLC): test the bit, skip the call */
+            static const signed char cbit[8] = { 11, 0, 6, -1, 7, 2, -1, -1 };
+            uint8_t *slow = NULL, *done = NULL;
+            int bit = cbit[cc >> 1];
+            if (bit >= 0) {
+                be_ldctx(e, V_T0, OFF(lz_kind));
+                be_ldctx(e, V_T1, OFF(lz_ikind));
+                be_op(e, AOP_ORR, V_T0, V_T0, V_T1);
+                slow = be_cbnz(e, V_T0);
+                be_ldctx(e, V_T0, OFF(flags));
+                be_ubfx(e, V_T0, V_T0, (unsigned)bit, 1);
+                if (cc & 1) be_opi(e, AOP_EOR, V_T0, V_T0, 1u);
+                done = be_jmp(e);
+                be_bind(e, slow, e->p);
+            }
             DBG_SITE(t, d), be_call_cond(e, cc);
+            if (done) be_bind(e, done, e->p);
             t->inc_pending = 0;
             site = back ? be_cbz(e, V_T0) : be_cbnz(e, V_T0);
         }

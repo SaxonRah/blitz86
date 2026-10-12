@@ -43,3 +43,15 @@ instructions, translation time 345 -> 137 ms. Both are overridable
 Tried and dropped: a two-ring cache (nursery + tenured for blocks evicted
 while still needed). Either ring alone is smaller than the working set, so
 it thrashed: 3-7x more evictions than one ring.
+
+r52m: fewer C calls for flags.
+* A conditional jump whose producer is not in the block (typical: `call f;
+  jae` where f returns CF from STC/CLC) tests the flag bit in ctx when no
+  lazy record is pending, instead of calling b86h_cond.
+* ADC/SBB right after ADC/SBB (32/48-bit arithmetic chains) gets its carry
+  from the previous record inline (same formula as lazy_eval) instead of
+  materializing all flags in C.
+Host 3DBENCH (600M instructions): b86h_cond 6.70M -> 0.33M, b86h_flags
+0.80M -> 0.35M. Remaining big one: IMUL's CF/OF (b86h_mulflags) before an
+IDIV - left for later (the other flags IMUL leaves undefined would have to
+match the interpreter exactly).
