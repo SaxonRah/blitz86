@@ -90,6 +90,25 @@ uint8_t *be_ret_plain_fill(uint8_t *site);
    be_adcsbc*: d = a +/- b with host carry (ADC / SBC), flags untouched.
    be_op_hi8: d = a <aop> (b >> 8) (high-byte source register). */
 extern const int be_cf_alu;
+/* r52h: inline REP STOS helpers (be_rep_inline = 1 on Thumb-2) */
+extern const int be_rep_inline;
+void be_cmpi(Emit *e, int r, uint32_t imm);          /* CMP r, #imm (modified immediate) */
+void be_subs1(Emit *e, int r);                       /* SUBS r, r, #1 */
+void be_store_post(Emit *e, int w16, int v, int addr); /* STR(B|H) v, [addr], #1|2 */
+void be_cm_byte(Emit *e, int d, int addr);           /* d = SMC code-map byte for host addr */
+void be_cm_byte_idx(Emit *e, int d, int line);       /* d = code-map byte for line index (addr >> 6) */
+void be_load_post(Emit *e, int w16, int d, int addr);  /* LDR(B|H) d, [addr], #1|2 */
+void be_lsr(Emit *e, int d, int s, unsigned n);
+void be_cmpr(Emit *e, int a, int b);                 /* CMP a, b */
+void be_store_off(Emit *e, int w16, int v, int addr, uint32_t off);   /* STR(B|H) v, [addr, #off] */
+void be_load_off(Emit *e, int w16, int d, int addr, uint32_t off);
+/* r52k: ctx->rep_page_bytes[(T0 - mem) >> 12] += n << w (T0 = untranslated
+   host address); clobbers T0 and T1 */
+void be_rep_count(Emit *e, int n, unsigned w);
+void be_load_ss_idx(Emit *e, int w16, int d, int idx);   /* LDR(B|H) d, [SS base, idx] (stack: untranslated) */
+/* SMC check of [addr, addr+len): first and last code-map line; a hit takes
+   the usual slow path (invalidate, maybe exit to next_ip). addr is kept. */
+void be_smc_check_range(Emit *e, int addr, uint32_t len, uint16_t next_ip);
 void be_set_c_cf(Emit *e, int tmp, int invert);
 void be_adcsbc(Emit *e, int sbc, int d, int a, int b);
 int  be_adcsbc_imm(Emit *e, int sbc, int d, int a, uint32_t imm);

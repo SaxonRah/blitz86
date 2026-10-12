@@ -104,6 +104,7 @@ typedef struct B86Cpu {
     uint32_t trap_cs;       /* b86_jit_run returns B86_TRAP before running
                                any code whose CS equals this (0xFFFFFFFF: off) */
     uint32_t pad1;
+    uint32_t rep_tmp[2];    /* JIT: scratch for the inline REP MOVS/STOS path */
 
     /* --- configuration ----------------------------------------------------- */
     uint32_t amask;         /* 0xFFFFF = 8086 1 MiB wrap; 0x1FFFFF = A20 on */
@@ -183,6 +184,11 @@ typedef struct B86JitStats {
     /* runtime C round trips from translated code */
     uint64_t rt_step, rt_cond, rt_flags, rt_light, rt_smc, rt_rep;
     uint64_t translate_misses;  /* cache misses while translating (needs -DB86_MISSES=fn) */
+    /* r52g, -DB86_MPROF (needs B86_MISSES, B86_NOW; B86_XACCESS optional):
+       cache misses / accesses / microseconds per runtime category:
+       0 cold interpretation, 1 step helper, 2 REP helper, 3 cond/flags,
+       4 SMC helper, 5 light helpers (rot1/mulflags) */
+    uint64_t mp_miss[6], mp_acc[6], mp_us[6];
     uint64_t smc_bucket_visits;       /* total page-chain entries visited */
     uint64_t smc_dead_skips;          /* dead entries discovered and unlinked */
     uint64_t smc_bucket_max_depth;    /* longest page traversal */

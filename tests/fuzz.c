@@ -294,6 +294,27 @@ static void gen_smc(void)
     code[fix] = (uint8_t)target; code[fix + 1] = (uint8_t)(target >> 8);
 }
 
+/* r52i: self-modifying code through REP STOSB (inline REP fast path must
+   see translated code on the destination lines) */
+static void gen_smc_rep(void)
+{
+    if (!r16_ok(B86_AX) || !r16_ok(B86_CX) || !r16_ok(B86_DI) || !r16_ok(B86_BX)) { gen_simple(); return; }
+    uint32_t n = 1 + rn(3);
+    B(0x06);                                         /* push es */
+    B(0x8C); B(0xC8);                                /* mov ax, cs */
+    B(0x8E); B(0xC0);                                /* mov es, ax */
+    B(0xBF); uint32_t fix = pc; W(0);                /* mov di, target */
+    B(0xB0); B(0x90);                                /* mov al, 90h (NOP) */
+    B(0xB9); W((uint16_t)n);                         /* mov cx, n */
+    B(0xFC);                                         /* cld */
+    B(0xF3); B(0xAA);                                /* rep stosb */
+    B(0x07);                                         /* pop es */
+    for (int k = 0; k < 8; ++k) B(0x90);             /* beyond the 8086 prefetch queue */
+    uint32_t target = pc;
+    for (uint32_t k = 0; k < n; ++k) B(0x43);        /* inc bx (overwritten) */
+    code[fix] = (uint8_t)target; code[fix + 1] = (uint8_t)(target >> 8);
+}
+
 static void gen_block(int depth, int n)
 {
     for (int i = 0; i < n; ++i) {
@@ -301,7 +322,7 @@ static void gen_block(int depth, int n)
         if (depth < 3 && k == 0) gen_fwd_branch(depth);
         else if (depth < 2 && k == 1) gen_loop(depth);
         else if (depth < 3 && k == 2) gen_call();
-        else if (k == 3) gen_smc();
+        else if (k == 3) { if (getenv("FUZZ_SMC_REP") && rn(2)) gen_smc_rep(); else gen_smc(); }
         else if (k == 4 && depth < 3) gen_fwd_branch(depth);
         else gen_simple();
     }
@@ -370,7 +391,8 @@ int main(int argc, char **argv)
     signal(SIGALRM, on_alarm);
     B86Cpu tmp;
     b86_init(&tmp, memB);
-    struct B86Jit *j = b86_jit_create(&tmp, buf, 8 << 20);
+    size_t codesz = getenv("FUZZ_CODE") ? (size_t)atol(getenv("FUZZ_CODE")) : (size_t)(8 << 20);
+    struct B86Jit *j = b86_jit_create(&tmp, buf, codesz);
     for (long it = 0; it < iters; ++it) {
         uint64_t seed = seed0 + (uint64_t)it;
         rs = seed * 0x2545F4914F6CDD1Dull | 1;
@@ -495,6 +517,8 @@ int main(int argc, char **argv)
            (unsigned long long)s->blocks, (unsigned long long)s->guest_insns, (unsigned long long)s->helper_insns,
            (unsigned long long)s->chains, (unsigned long long)s->smc_hits, (unsigned long long)s->smc_invalidations,
            s->guest_insns ? (double)s->host_bytes / (double)s->guest_insns : 0.0);
+    printf("jit: evictions %llu evicted %llu flushes %llu\n", (unsigned long long)s->evictions,
+           (unsigned long long)s->evicted_blocks, (unsigned long long)s->flushes);
     printf("jit: joins %llu  in-block branches %llu  splits %llu\n", (unsigned long long)s->joins, (unsigned long long)s->inner_branches, (unsigned long long)s->splits);
     return bad != 0;
 }

@@ -16,6 +16,20 @@ const int be_has_t2 = 1;
 const int be_paged = 0;
 const int be_can_evict = 0;
 const int be_cf_alu = 0;
+const int be_rep_inline = 0;
+void be_cmpi(Emit *e, int r, uint32_t imm) { (void)e; (void)r; (void)imm; }
+void be_subs1(Emit *e, int r) { (void)e; (void)r; }
+void be_store_post(Emit *e, int w16, int v, int addr) { (void)e; (void)w16; (void)v; (void)addr; }
+void be_cm_byte(Emit *e, int d, int addr) { (void)e; (void)d; (void)addr; }
+void be_cm_byte_idx(Emit *e, int d, int line) { (void)e; (void)d; (void)line; }
+void be_load_post(Emit *e, int w16, int d, int addr) { (void)e; (void)w16; (void)d; (void)addr; }
+void be_store_off(Emit *e, int w16, int v, int addr, uint32_t off) { (void)e; (void)w16; (void)v; (void)addr; (void)off; }
+void be_load_off(Emit *e, int w16, int d, int addr, uint32_t off) { (void)e; (void)w16; (void)d; (void)addr; (void)off; }
+void be_rep_count(Emit *e, int n, unsigned w) { (void)e; (void)n; (void)w; }
+void be_load_ss_idx(Emit *e, int w16, int d, int idx) { (void)e; (void)w16; (void)d; (void)idx; }
+void be_smc_check_range(Emit *e, int addr, uint32_t len, uint16_t next_ip) { (void)e; (void)addr; (void)len; (void)next_ip; }
+void be_cmpr(Emit *e, int a, int b) { (void)e; (void)a; (void)b; }
+void be_lsr(Emit *e, int d, int s, unsigned n) { (void)e; (void)d; (void)s; (void)n; }
 void be_set_c_cf(Emit *e, int tmp, int invert) { (void)e; (void)tmp; (void)invert; }
 void be_adcsbc(Emit *e, int sbc, int d, int a, int b) { (void)e; (void)sbc; (void)d; (void)a; (void)b; }
 int be_adcsbc_imm(Emit *e, int sbc, int d, int a, uint32_t imm) { (void)e; (void)sbc; (void)d; (void)a; (void)imm; return 0; }

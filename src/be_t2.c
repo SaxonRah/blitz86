@@ -206,6 +206,37 @@ B86_HOT int be_adcsbc_imm(Emit *e, int sbc, int d, int a, uint32_t imm)
     return 1;
 }
 B86_HOT void be_op_hi8(Emit *e, int aop, int d, int a, int b) { dp_reg(e, dp_of(aop), 0, hr(d), hr(a), hr(b), 1, 8); }
+const int be_rep_inline = 1;
+B86_HOT void be_cmpi(Emit *e, int r, uint32_t imm) { uint32_t enc; modimm(imm, &enc); dp_imm(e, DP_SUB, 1, 15, hr(r), enc); }
+B86_HOT void be_subs1(Emit *e, int r) { uint32_t enc; modimm(1, &enc); dp_imm(e, DP_SUB, 1, hr(r), hr(r), enc); }
+B86_HOT void be_store_post(Emit *e, int w16, int v, int addr)
+{
+    put32(e, (w16 ? 0xF820u : 0xF800u) | (uint32_t)hr(addr), (uint32_t)hr(v) << 12 | 0xB00u | (w16 ? 2u : 1u));
+}
+B86_HOT void be_load_post(Emit *e, int w16, int d, int addr)
+{
+    put32(e, (w16 ? 0xF830u : 0xF810u) | (uint32_t)hr(addr), (uint32_t)hr(d) << 12 | 0xB00u | (w16 ? 2u : 1u));
+}
+B86_HOT void be_cmpr(Emit *e, int a, int b) { dp_reg(e, DP_SUB, 1, 15, hr(a), hr(b), 0, 0); }
+B86_HOT void be_lsr(Emit *e, int d, int s, unsigned n) { shift_imm(e, 0, hr(d), hr(s), 1, n); }
+B86_HOT void be_cm_byte_idx(Emit *e, int d, int line)
+{
+#ifdef B86_PAGED
+    bitfield(e, 0xF3C0u, hr(d), hr(line), 0, 14);
+#else
+    mov(e, hr(d), hr(line));
+#endif
+    put32(e, 0xF810u | R_CM, (uint32_t)hr(d) << 12 | (uint32_t)hr(d));
+}
+B86_HOT void be_cm_byte(Emit *e, int d, int addr)
+{
+#ifdef B86_PAGED
+    bitfield(e, 0xF3C0u, hr(d), hr(addr), 6, 14);
+#else
+    shift_imm(e, 0, hr(d), hr(addr), 1, 6);
+#endif
+    put32(e, 0xF810u | R_CM, (uint32_t)hr(d) << 12 | (uint32_t)hr(d));
+}
 B86_RT uint8_t *be_ret_plain_fill(uint8_t *site) { return site + 36; }
 
 /* ---- runtime -------------------------------------------------------------- */
@@ -639,6 +670,45 @@ B86_HOT void be_store(Emit *e, int w16, int v, int addr, int check, uint16_t nex
     e->nslow++;
 }
 
+B86_HOT void be_store_off(Emit *e, int w16, int v, int addr, uint32_t off) { ldst(e, w16 ? STRH : STRB, hr(v), hr(addr), off); }
+B86_HOT void be_load_off(Emit *e, int w16, int d, int addr, uint32_t off) { ldst(e, w16 ? LDRH : LDRB, hr(d), hr(addr), off); }
+B86_HOT void be_rep_count(Emit *e, int n, unsigned w)
+{
+#ifdef B86_PAGED
+    _Static_assert(offsetof(B86Cpu, rep_page_bytes) < 4096u, "rep_page_bytes beyond imm12");
+    ldst(e, LDRW, LR, R_CTX, OFF(mem));
+    dp_reg(e, DP_SUB, 0, LR, R12, LR, 0, 0);
+    shift_imm(e, 0, LR, LR, 1, 12);
+    dp_reg(e, DP_ADD, 0, LR, R_CTX, LR, 0, 2);
+    ldst(e, LDRW, R12, LR, OFF(rep_page_bytes));
+    dp_reg(e, DP_ADD, 0, R12, R12, hr(n), 0, w);
+    ldst(e, STRW, R12, LR, OFF(rep_page_bytes));
+#else
+    (void)e; (void)n; (void)w;
+#endif
+}
+B86_HOT void be_load_ss_idx(Emit *e, int w16, int d, int idx) { put32(e, (w16 ? 0xF830u : 0xF810u) | R_SS, (uint32_t)hr(d) << 12 | (uint32_t)hr(idx)); }
+B86_HOT void be_smc_check_range(Emit *e, int addr, uint32_t len, uint16_t next_ip)
+{
+    for (int end = 0; end < 2; ++end) {
+        if (end) opi_raw(e, AOP_ADD, LR, hr(addr), len - 1u);
+#ifdef B86_PAGED
+        bitfield(e, 0xF3C0u, LR, end ? LR : hr(addr), 6, 14);
+#else
+        shift_imm(e, 0, LR, end ? LR : hr(addr), 1, 6);
+#endif
+        put32(e, 0xF810u | R_CM, (uint32_t)LR << 12 | LR);
+        cmp_imm0(e, LR);
+        if (e->nslow >= 64) { e->overflow = 1; return; }
+        e->slow[e->nslow].site = emit_bcc(e, AC_NE, NULL);
+        e->slow[e->nslow].resume = e->p;
+        e->slow[e->nslow].next_ip = next_ip;
+        e->slow[e->nslow].len = (uint8_t)len;
+        e->slow[e->nslow].retire = e->retire;
+        e->slow[e->nslow].noexit = 0;
+        e->nslow++;
+    }
+}
 B86_HOT void be_set_seg(Emit *e, int s, int v)
 {
     put32(e, 0xFA1Fu, 0xF080u | LR << 8 | (uint32_t)hr(v));     /* UXTH lr, v */
