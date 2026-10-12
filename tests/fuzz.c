@@ -517,6 +517,7 @@ int main(int argc, char **argv)
            (unsigned long long)s->blocks, (unsigned long long)s->guest_insns, (unsigned long long)s->helper_insns,
            (unsigned long long)s->chains, (unsigned long long)s->smc_hits, (unsigned long long)s->smc_invalidations,
            s->guest_insns ? (double)s->host_bytes / (double)s->guest_insns : 0.0);
+    printf("jit: ds-baked %llu ds-miss %llu\n", (unsigned long long)s->ds_baked, (unsigned long long)s->ds_miss);
     printf("jit: evictions %llu evicted %llu flushes %llu\n", (unsigned long long)s->evictions,
            (unsigned long long)s->evicted_blocks, (unsigned long long)s->flushes);
     printf("jit: joins %llu  in-block branches %llu  splits %llu\n", (unsigned long long)s->joins, (unsigned long long)s->inner_branches, (unsigned long long)s->splits);

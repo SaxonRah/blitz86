@@ -51,7 +51,12 @@ typedef struct Emit {
     int nslow;
     int count_exits;    /* debug: exits store `retire` into cpu->retired */
     int count_ret;      /* exits add `retire` to cpu->icnt (exact retired count) */
-    int baked_zero;     /* r52d: 1 = skipped all page lookups (PAGE_ZERO), 2 = CS-absolute zero delta (CS_CONST) */
+    int baked_zero;     /* r52d: 1 = skipped all page lookups (PAGE_ZERO), 2 = CS-absolute zero delta (CS_CONST),
+                           4 = r52n DS-absolute zero delta (block entry guards DS) */
+    int ds_bake;        /* r52n: DS == ds_val is guarded at block entry; absolute DS
+                           operands in unmapped pages skip the page lookup */
+    uint32_t ds_val;
+    uint32_t ds_pages;  /* bit k: baked an access in page (DS base page + k) */
     int no_count;       /* frontend: suppress counting on exits already counted */
     uint32_t retire;
 } Emit;
@@ -134,6 +139,7 @@ void be_sdiv(Emit *e, int d, int a, int b);                /* d = a / b (signed 
 void be_mls(Emit *e, int d, int a, int b, int acc);        /* d = acc - a*b */
 /* Light C call fn(ctx, va, imm): guest registers preserved, no GPR sync
    (fn must not touch guest registers). Clobbers V_T0, V_T1, NZCV. */
+void b86h_dsmiss(B86Cpu *c, uint32_t unused, uint32_t idx);
 void be_call_light(Emit *e, void *fn, int va, uint32_t imm);
 /* d = a <<|>>|>>> cnt (type 0 LSL, 1 LSR, 2 ASR) with 8086 unmasked-count
    semantics for values held zero/sign-extended in 32 bits; cnt bits 8+ are

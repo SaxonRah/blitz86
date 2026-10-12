@@ -619,6 +619,17 @@ B86_HOT void be_ea(Emit *e, int d, int seg, int b1, int b2, int32_t disp)
         movw(e, dd, (uint32_t)disp);
         dp_reg(e, DP_ADD, 0, dd, sr, dd, 0, 0);
 #endif
+#if defined(B86_PAGED)
+        if (seg == B86_DS && e->ds_bake) {
+            uintptr_t h = (uintptr_t)e->cpu->mem + ((uintptr_t)e->ds_val << 4) + (uint16_t)disp;
+            if ((h & 4095u) != 4095u && e->cpu->pt[(h >> 12) & 511u] == 0) {
+                uint32_t lin = (uint32_t)(h - (uintptr_t)e->cpu->mem);
+                e->ds_pages |= 1u << ((lin >> 12) - ((e->ds_val << 4) >> 12));
+                e->baked_zero |= 4;
+                return;
+            }
+        }
+#endif
         if (seg != B86_SS) {
 #if defined(B86_OPT_CS_CONST) && B86_OPT_CS_CONST
             if (seg != B86_CS || !ea_cs_abs_is_direct(e, (uint16_t)disp))
@@ -716,7 +727,7 @@ B86_HOT void be_set_seg(Emit *e, int s, int v)
     ldst(e, LDRW, R12, R_CTX, OFF(mem));
     dp_reg(e, DP_ADD, 0, R12, R12, LR, 0, 4);
     ldst(e, STRW, R12, R_CTX, OFF(segp[s]));
-    if (s == B86_DS) mov(e, R_DS, R12);
+    if (s == B86_DS) { mov(e, R_DS, R12); e->ds_bake = 0; }
     else if (s == B86_SS) mov(e, R_SS, R12);
 }
 

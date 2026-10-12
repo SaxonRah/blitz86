@@ -58,6 +58,13 @@ uint64_t b86_rep_bytes[4]; uint32_t b86_rep_es[65536]; uint32_t b86_cold_ip[1 <<
 #define B86_EVICT_ROOM 2048u        /* free space ensured before each translation (r52l: was 16 KiB; a larger block overflows, evicts more and retries) */
 #endif
 #define PLOGN 4096u
+#ifndef B86_DS_BAKE
+#define B86_DS_BAKE 1               /* r52n: DS-absolute operands without page lookup */
+#endif
+#ifndef B86_DS_BAKE_MIN
+#define B86_DS_BAKE_MIN 2           /* absolute DS operands needed to emit the guard */
+#endif
+#define DSNOBN 1024u
 #define MAP_TOMB 0xFFFFFFFFu        /* map slot of a recycled block */
 #define COVN ((B86_MEM_BYTES + 7u) >> 3)
 /* Paged Thumb-2 indexes the SMC line map with UBFX(addr, 6, 15): a 32 Ki
@@ -182,6 +189,8 @@ B86_HOT void b86_jit_hot_report(struct B86Jit *j) {
 
 typedef struct Block {
     uint32_t key;
+    uint32_t dsb;               /* r52n: DS value + 1 its code assumes (0: none) */
+    uint32_t dspg;              /* r52n: pages (relative to DS's) with baked accesses */
     uint32_t glo, ghi;          /* guarded linear range [glo, ghi)        */
     uint32_t iend;              /* end of the translated instruction bytes */
     uint8_t *host;
@@ -243,6 +252,7 @@ typedef struct B86Jit {
     uint32_t nplog;
     uint16_t *free_idx;
     uint32_t nfree;
+    uint8_t *dsnob;             /* r52n: per key hash: DS guard missed, do not bake */
     B86JitStats st;
 } J;
 
@@ -2624,8 +2634,41 @@ B86_COLD static Block *translate_ex(J *j, uint32_t cs, uint16_t ip, const Insn *
         e->nslow = 0;
         e->overflow = 0;
         e->baked_zero = 0;
+        e->ds_bake = 0;
+        e->ds_pages = 0;
         e->p = start;
         b->host = start;
+#if defined(B86_PAGED) && B86_DS_BAKE
+        /* r52n: absolute DS operands (globals) skip the page lookup when their
+           page is unmapped; a guard at block entry checks DS is still the
+           value the code was built for (else: drop the block, retranslate
+           generic). Worth it from two such operands on. */
+        if (npre == 0 &&
+#if defined(B86_OPT_PAGE_ZERO) && B86_OPT_PAGE_ZERO
+            c->pt_active_pages &&                /* none mapped: every lookup is skipped anyway */
+#endif
+            j->dsnob && !j->dsnob[fast_hash(b->key) & (DSNOBN - 1u)]) {
+            int cand = 0;
+            for (int i = 0; i < n; ++i) {
+                const Insn *q = &v[i];
+                if (!q->native || (q->op == 0x8E && (q->reg & 3) == B86_DS) || q->op == 0x1F || q->op == 0xC5) break;
+                if ((q->seg == 0xFF || q->seg == B86_DS) &&
+                    ((q->has_modrm && q->mod == 0 && q->rm == 6) || (q->op >= 0xA0 && q->op <= 0xA3))) ++cand;
+            }
+            if (cand >= B86_DS_BAKE_MIN) {
+                be_ldctx(e, V_T0, OFF(seg[B86_DS]));
+                be_movi(e, V_T1, c->seg[B86_DS]);
+                be_cmpr(e, V_T0, V_T1);
+                uint8_t *ok = be_jcc(e, AC_EQ);
+                e->retire = 0;                       /* nothing of the block ran */
+                be_call_light(e, (void *)b86h_dsmiss, V_T0, idx);
+                be_exit_ip_imm(e, ip, XR_LOOKUP);
+                be_bind(e, ok, e->p);
+                e->ds_bake = 1;
+                e->ds_val = c->seg[B86_DS];
+            }
+        }
+#endif
         memset(&tx, 0, sizeof tx);
         tx.j = j; tx.e = e; tx.cs = cs;
         tx.inc_pending = 1;
@@ -2646,6 +2689,7 @@ B86_COLD static Block *translate_ex(J *j, uint32_t cs, uint16_t ip, const Insn *
             }
             e->retire = (uint32_t)(i + 1 - npre - radj);
             tx.cur = i;
+            if (!d->native || (d->op == 0x8E && (d->reg & 3) == B86_DS) || d->op == 0x1F || d->op == 0xC5) e->ds_bake = 0;
             if (d->sinkfl && i > 0) {            /* r52f: deferred records into ctx here */
                 emit_deferred(&tx, i - 1, ALLF);
                 for (int m = 0; m < i; ++m) if (v[m].defer && !v[m].sunk) v[m].sunk = (uint8_t)(i + 1);
@@ -2717,6 +2761,8 @@ B86_COLD static Block *translate_ex(J *j, uint32_t cs, uint16_t ip, const Insn *
 #endif
 
     b->hend = e->p;
+    if (e->baked_zero & 4) { b->dsb = e->ds_val + 1u; b->dspg = e->ds_pages; j->st.ds_baked++; }
+    e->ds_bake = 0;
     j->zero_code |= e->baked_zero;
     if (j->nfree && j->free_idx[j->nfree - 1] == idx) j->nfree--; else j->nblk++;
     for (int i = npre; i < n; ++i) BIT_SET(j->cov, base + v[i].ip);
@@ -2900,6 +2946,19 @@ B86_HOT uint32_t MPF(b86h_rep)(B86Cpu *c, uint32_t ip_next, uint32_t blk)
     return b86h_step(c, ip_next, blk);
 }
 
+/* r52n: a block's DS guard failed: drop the block and never bake DS for
+   this entry again (the dispatcher retranslates it generically) */
+B86_HOT void b86h_dsmiss(B86Cpu *c, uint32_t unused, uint32_t idx)
+{
+    J *j = c->jit;
+    (void)unused;
+    if (idx < j->nblk && j->blk[idx].host && !j->blk[idx].dead) {
+        if (j->dsnob) j->dsnob[fast_hash(j->blk[idx].key) & (DSNOBN - 1u)] = 1;
+        j->st.ds_miss++;
+        kill_block(j, idx);
+    }
+}
+
 B86_HOT void MPF(b86h_rot1)(B86Cpu *c, uint32_t a_res, uint32_t kind)
 {
     uint32_t res = a_res >> 16, w = (kind >> 1) & 1u, sb = w ? 0x8000u : 0x80u;
@@ -2999,6 +3058,17 @@ int b86_map_range(B86Cpu *c, uint32_t lin, uint32_t len, uint8_t *frame)
     if (j && j->codemap)
         for (uint32_t l = lin >> B86_LINE_SHIFT; l < (lin + len) >> B86_LINE_SHIFT; ++l)
             if (j->codemap[l]) return -3;        /* translated code lives there */
+    if (j && (j->zero_code & 4)) {
+        /* r52n: DS-absolute code that skipped lookups for a DS window now
+           (partly) mapped */
+        for (uint32_t i = 0; i < j->nblk; ++i) {
+            Block *b = &j->blk[i];
+            if (!b->host || b->dead || !b->dsb) continue;
+            uint32_t p0 = ((b->dsb - 1u) << 4) >> 12;     /* only pages it actually baked */
+            for (uint32_t p = lin >> 12; p <= (lin + len - 1u) >> 12; ++p)
+                if (p >= p0 && p - p0 < 32u && (b->dspg >> (p - p0) & 1u)) { kill_block(j, i); break; }
+        }
+    }
 #if defined(B86_OPT_PAGE_ZERO) && B86_OPT_PAGE_ZERO
     /* Any code compiled with the zero-delta assumption must be discarded
        BEFORE publishing new page-table entries. Caller must not map during
@@ -3149,6 +3219,9 @@ B86_HOT J *b86_jit_create_ex(B86Cpu *c, void *code, size_t size, void *hot, size
         j->free_idx = B86_CALLOC(MAXB, sizeof *j->free_idx);
         j->evict = j->plog && j->free_idx;
     }
+#if defined(B86_PAGED) && B86_DS_BAKE
+    j->dsnob = B86_CALLOC(DSNOBN, 1);
+#endif
     return j;
 }
 
@@ -3166,6 +3239,7 @@ B86_HOT void b86_jit_destroy(J *j)
     B86_FREE(j->tw);
     if (j->plog) B86_FREE(j->plog);
     if (j->free_idx) B86_FREE(j->free_idx);
+    if (j->dsnob) B86_FREE(j->dsnob);
     free(j);
 }
 

@@ -55,3 +55,17 @@ Host 3DBENCH (600M instructions): b86h_cond 6.70M -> 0.33M, b86h_flags
 0.80M -> 0.35M. Remaining big one: IMUL's CF/OF (b86h_mulflags) before an
 IDIV - left for later (the other flags IMUL leaves undefined would have to
 match the interpreter exactly).
+
+r52n: DS-absolute operands (globals, `mov ax,[1B8C]`) skip the page lookup.
+Once any guest page is mapped to SRAM, every DS/ES access pays ubfx + table
+load + add. A block with two or more absolute DS operands (before any DS
+write or helper instruction) now starts with a guard: DS == the value at
+translation. Under it, an absolute operand whose page is unmapped at
+translation (and not the last byte of a page) is addressed directly. Guard
+miss: the block is dropped and its entry is never baked again (b86h_dsmiss).
+b86_map_range kills blocks that baked an access in a page being mapped.
+Stats: ds_baked, ds_miss. -DB86_DS_BAKE=0 disables, -DB86_DS_BAKE_MIN sets the
+operand threshold. Fuzz with FUZZ_MAP + B86_OPT_PAGE_ZERO and threshold 1:
+~490 baked blocks, ~30 guard misses per 400 programs, no new mismatches (the
+remaining FUZZ_MAP mismatches - seeds 189, 2108, 2575, 4056 - occur with the
+pre-session JIT too).

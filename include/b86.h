@@ -200,6 +200,7 @@ typedef struct B86JitStats {
     uint64_t cold_runs, cold_insns;   /* interpreted before an entry became hot */
     uint64_t evictions, evicted_blocks, unchains;  /* r52 region eviction */
     uint64_t limit_retries;     /* r52c: oversized attempts retried without a flush */
+    uint64_t ds_baked, ds_miss; /* r52n: blocks with DS-absolute baking / guard misses */
 } B86JitStats;
 
 /* Code buffer must be executable (and, on Pico, in SRAM). */
