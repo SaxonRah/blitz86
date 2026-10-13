@@ -66,7 +66,7 @@ enum {
 };
 
 /* Return codes from b86_step / b86_run. */
-enum { B86_OK = 0, B86_HALT = 1, B86_EXIT = 2, B86_BUDGET = 3, B86_TRAP = 4 };
+enum { B86_OK = 0, B86_HALT = 1, B86_EXIT = 2, B86_BUDGET = 3, B86_TRAP = 4, B86_UNSUPPORTED = 5 };
 
 struct B86Cpu;
 typedef uint8_t (*B86In8)(struct B86Cpu *, uint16_t port);
@@ -77,7 +77,7 @@ typedef void    (*B86SmcHook)(struct B86Cpu *, uint32_t lin, uint32_t len);
 /* Called for every guest byte range a new translation depends on. */
 typedef void    (*B86CodeHook)(struct B86Cpu *, uint32_t lin, uint32_t len);
 
-enum { B86_CPU_8086 = 0, B86_CPU_186 = 1, B86_CPU_286 = 2 };   /* B86Cpu.model (286: real mode) */
+enum { B86_CPU_8086 = 0, B86_CPU_186 = 1, B86_CPU_286 = 2, B86_CPU_386 = 3 }; /* BB_386_RM0_V1: 386 real mode */   /* B86Cpu.model (286: real mode) */
 
 typedef struct B86Cpu {
     /* --- hot block: generated code touches these ------------------------ */
@@ -185,6 +185,9 @@ typedef struct B86JitStats {
     uint64_t blocks, guest_insns, host_bytes, helper_insns;
     uint64_t chains, lookups, flushes, smc_hits, smc_invalidations;
     uint64_t dispatches;
+    /* BB_CHAIN_EXIT_SPLIT_V2: cumulative return-reason counters. */
+    uint64_t exit_dynamic, exit_native_miss, exit_direct_lookup;
+    uint64_t exit_step_return, exit_ds_guard, exit_dead_stub; /* BB_EXIT_HOTSPOT_V1 */
     uint64_t translate_us;  /* time in translation (needs -DB86_NOW=fn returning us) */
     uint64_t fast_dispatches; /* dispatcher entries resolved by the SRAM fast table */
     /* runtime C round trips from translated code */

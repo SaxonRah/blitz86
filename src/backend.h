@@ -36,7 +36,9 @@ enum { AC_EQ, AC_NE, AC_CS, AC_CC, AC_MI, AC_PL, AC_VS, AC_VC,
        AC_HI, AC_LS, AC_GE, AC_LT, AC_GT, AC_LE, AC_AL };
 
 /* Exit reasons returned by the enter trampoline. */
-enum { XR_LOOKUP = 0, XR_CHAIN = 1, XR_HALT = 2, XR_IRQ = 3, XR_RETFILL = 4 };
+/* BB_CHAIN_EXIT_SPLIT_V2: distinguish equivalent return paths to the C dispatcher. */
+enum { XR_LOOKUP = 0, XR_CHAIN = 1, XR_HALT = 2, XR_IRQ = 3, XR_RETFILL = 4,
+       XR_DYNAMIC = 5, XR_FASTMISS = 6, XR_STEP_EXIT = 7, XR_DS_GUARD = 8, XR_DEAD_STUB = 9 }; /* BB_EXIT_HOTSPOT_V1 */
 
 typedef struct Emit {
     uint8_t *base;      /* start of code buffer */

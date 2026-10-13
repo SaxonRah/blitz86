@@ -290,10 +290,13 @@ B86_HOT void *be_emit_runtime(Emit *e)
     mov(e, R12, LR);
     emit_b(e, e->x_epilogue);
 
+    /* BB_CHAIN_EXIT_SPLIT_V2: separate reasons, identical C dispatcher behavior. */
     e->x_dynexit = e->p;
-    movw(e, R12, XR_LOOKUP);
+    movw(e, R12, XR_DYNAMIC);
     emit_b(e, e->x_epilogue);
-    e->x_miss = e->x_dynexit;                        /* lookup stores ip first */
+    e->x_miss = e->p;
+    movw(e, R12, XR_FASTMISS);
+    emit_b(e, e->x_epilogue);
 
     e->x_chain = e->p;                               /* r12 = ip, lr = site */
     ldst(e, STRW, LR, R_CTX, OFF(patch));
@@ -376,7 +379,9 @@ B86_HOT void *be_emit_runtime(Emit *e)
     dp_reg(e, DP_ADD, 0, 0, 0, LR, 0, 0);
     ldst(e, STRW, 0, R_CTX, OFF(icnt));
     put16(e, 0xBC01u);
-    emit_b(e, e->x_dynexit);
+    /* BB_EXIT_HOTSPOT_V1: same epilogue, distinct reason for step helper nonzero. */
+    movw(e, R12, XR_STEP_EXIT);
+    emit_b(e, e->x_epilogue);
 
     e->x_lookup = e->p;                              /* r12 = ip */
     put32(e, 0xFA1Fu, 0xF080u | R12 << 8 | R12);     /* UXTH r12, r12 */

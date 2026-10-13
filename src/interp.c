@@ -697,7 +697,12 @@ B86_HOT static int step186(St *s, uint8_t op, int w)
     return B86_OK;
 }
 
-B86_HOT int b86_step(B86Cpu *c)
+/* BB_386_RM0_V1: 386 66h operand path stays in flash. */
+#include "i386_rm0.inc"
+/* BB_386_RM1_V1: 67h address-size interpreter, flash only. */
+#include "i386_rm1.inc"
+
+B86_HOT static int b86_step_internal(B86Cpu *c)
 {
     St st, *s = &st;
     if (c->lz_kind != LZ_NONE || c->lz_ikind != LZ_NONE) b86_flags_materialize(c);   /* usually none pending */
@@ -711,8 +716,11 @@ B86_HOT int b86_step(B86Cpu *c)
         s->fp = b86_host(c, a0); s->fip0 = s->ip; s->favail = (uint16_t)(n < 16u ? n : 16u);
     }
     uint8_t op;
+    int operand32 = 0, address32 = 0;  /* BB_386_RM0_V1 */
     for (;;) {
         op = f8(s);
+        if (c->model >= B86_CPU_386 && op == 0x66) { operand32 = 1; continue; }
+        if (c->model >= B86_CPU_386 && op == 0x67) { address32 = 1; continue; }
         if (op == 0x26 || op == 0x2E || op == 0x36 || op == 0x3E) { s->seg = (op >> 3) & 3; continue; }
         if (op == 0xF2 || op == 0xF3) { s->rep = op; continue; }
         if (op == 0xF0 || op == 0xF1) continue;
@@ -721,6 +729,15 @@ B86_HOT int b86_step(B86Cpu *c)
     c->step_op = op; c->step_oip = (uint16_t)(s->ip - 1u);   /* for cold runs (jit.c) */
     c->icount++;
     int w = op & 1;
+    if (c->model >= B86_CPU_386) {
+        if (address32) return b86_rm1_67(s, op, operand32); /* 67h with optional 66h */
+        if (op == 0x63 || op == 0x64 || op == 0x65 ||
+            (op == 0x0F && !operand32 &&
+             rd8(c, B86_CS, s->ip) != 0x01 && rd8(c, B86_CS, s->ip) != 0x06)) {
+            c->ip = s->fip0; return B86_UNSUPPORTED;
+        }
+        if (operand32) return b86_rm0_66(s, op);
+    }
 
     if (op < 0x40 && (op & 7) < 6) {      /* ALU r/m,r  r,r/m  acc,imm */
         int aop = op >> 3;
@@ -919,6 +936,30 @@ B86_HOT int b86_step(B86Cpu *c)
     }
     c->ip = s->ip;
     return B86_OK;
+}
+
+/* BB_386_RM0_V1: on a 386, 16-bit instructions must preserve the
+   upper halves of EAX..EDI, even when the legacy 286 interpreter assigns
+   directly to 16-bit register slots.  The wrapper is never used by 286.
+   A 66h instruction writes the entire 32-bit destination, so skip merge. */
+B86_HOT int b86_step(B86Cpu *c)
+{
+    if (c->model < B86_CPU_386) return b86_step_internal(c);
+    uint32_t hi[8];
+    for (unsigned i = 0; i < 8; ++i) hi[i] = c->r[i] & 0xFFFF0000u;
+    uint16_t ip = (uint16_t)c->ip;
+    int operand32 = 0;
+    for (unsigned k = 0; k < 15; ++k) {
+        uint8_t op = rd8(c, B86_CS, ip++);
+        if (op == 0x66) { operand32 = 1; continue; }
+        if (op == 0x67 || op == 0x26 || op == 0x2E || op == 0x36 ||
+            op == 0x3E || op == 0xF0 || op == 0xF1 || op == 0xF2 || op == 0xF3)
+            continue;
+        break;
+    }
+    int rc = b86_step_internal(c);
+    if (!operand32) for (unsigned i = 0; i < 8; ++i) c->r[i] = (c->r[i] & 0xFFFFu) | hi[i];
+    return rc;
 }
 
 B86_HOT int b86_run_interp(B86Cpu *c, uint64_t max)

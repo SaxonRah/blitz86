@@ -57,7 +57,27 @@ uint64_t b86_rep_bytes[4]; uint32_t b86_rep_es[65536]; uint32_t b86_cold_ip[1 <<
 #ifndef B86_EVICT_ROOM
 #define B86_EVICT_ROOM 2048u        /* free space ensured before each translation (r52l: was 16 KiB; a larger block overflows, evicts more and retries) */
 #endif
+/* BB_DEADSTUB_UNCHAIN_AB_V1: default OFF; toggle with the test script. */
+#define B86_DEADSTUB_EAGER_UNCHAIN 1
+/* BB_RCX_MEM1_AB_V1: Thumb-2 8/16-bit RCL/RCR memory, count=1. */
+#define B86_RCX_MEM1 1
 #define PLOGN 4096u
+/* BB_CHAIN_AUDIT_V1 - bounded diagnostic counters; only the dispatcher writes these. */
+#ifndef BB_CHAIN_PROFILE
+#define BB_CHAIN_PROFILE 0
+#endif
+#if BB_CHAIN_PROFILE
+enum {
+  CH_EXIT_CHAIN, CH_EXIT_RET, CH_EXIT_LOOKUP, CH_EXIT_IRQ, CH_EXIT_OTHER,
+  CH_STALE, CH_DISABLED, CH_PLOG_FULL, CH_PLOG_PEAK, CH_RET_REFUSED,
+  CH_NCOUNTERS
+};
+static uint32_t bb_chain_audit[CH_NCOUNTERS];
+void b86_chain_audit_read(uint32_t out[10])
+{
+    memcpy(out, bb_chain_audit, sizeof bb_chain_audit);
+}
+#endif
 #ifndef B86_DS_BAKE
 #define B86_DS_BAKE 1               /* r52n: DS-absolute operands without page lookup */
 #endif
@@ -252,6 +272,9 @@ typedef struct B86Jit {
     uint32_t nplog;
     uint16_t *free_idx;
     uint32_t nfree;
+#if B86_DEADSTUB_EAGER_UNCHAIN
+    uint8_t bb_deadstub_eviction_active;
+#endif
     uint8_t *dsnob;             /* r52n: per key hash: DS guard missed, do not bake */
     B86JitStats st;
 } J;
@@ -510,6 +533,7 @@ B86_HOT static void classify(Insn *d)
         d->fuse = (d->reg == 2 || d->reg == 3) ? B86_CF : 0;
         d->fdef = d->reg < 4 ? (B86_CF | B86_OF) : ALLF;
         d->native = (d->reg == 4 || d->reg == 5 || d->reg == 7) ||
+                    (B86_RCX_MEM1 && memop && (d->reg == 2 || d->reg == 3)) ||
                     (d->reg < 4 && d->mod == 3 && (d->w || d->rm < 4));   /* ROL/ROR/RCL/RCR r,1 */
         if (d->reg < 4) d->nzclob = 1;
         return;
@@ -868,6 +892,12 @@ B86_COLD static int materializes(const Insn *d)
     if (op == 0xE0 || op == 0xE1 || op == 0xF5 || op == 0xF8 || op == 0xF9) return 1;
     if (op == 0x9C || op == 0x9E || op == 0x9F) return 1;
     if ((op == 0xD0 || op == 0xD1) && d->reg < 2) return 1;
+#if B86_RCX_MEM1
+    /* Memory RCL/RCR will materialize the previous arithmetic/overlay flags.
+       Do not postpone an older ZF/SF record beyond this instruction. */
+    if ((op == 0xD0 || op == 0xD1) && d->mod != 3 &&
+        (d->reg == 2 || d->reg == 3)) return 1;
+#endif
     if (is_rcx(d)) return 1;   /* defines only CF/OF: older ZF/SF records must not be deferred past it */
     if ((op == 0xF6 || op == 0xF7) && d->reg >= 4) return 1;
     if (is_carry_alu(d) && !d->fused) return 1;
@@ -1996,6 +2026,62 @@ B86_COLD static int lower(Tx *t, Insn *d)
         be_stctx(e, V_T0, OFF(flags));
         return 1; }
     case 0xD0: case 0xD1:
+#if B86_RCX_MEM1
+        /* BB_RCX_MEM1_AB_V1: memory RCL/RCR by one (D0 byte / D1 word).
+           Two Thumb-2 virtual temporaries: T0=effective address, T1=value.
+           Preserve existing 8086 flags: these rotates define CF and OF
+           only; ZF/SF/PF/AF must not be overwritten by the ARM operation.
+           We deliberately do NOT fuse NZCV across the checked memory store. */
+        if ((d->reg == 2 || d->reg == 3) && d->mod != 3) {
+            const unsigned bits = w ? 16u : 8u;
+            const unsigned pad = 32u - bits;
+            /* Fold any earlier lazy ZF/SF/PF/CF records BEFORE updating the
+               CF/OF bits; otherwise a later materialization could undo them. */
+            flags_if_lazy(t, d, 1);
+            t->inc_pending = 0;
+            ea_modrm(t, d);
+            if (d->lazy) be_stctx(e, V_T0, OFF(rep_tmp[0]));
+            /* host C = incoming x86 CF; LDRH/LDRB and MOV/shift (S=0)
+               preserve it, so a third Thumb-2 scratch is unnecessary. */
+            be_set_c_cf(e, V_T1, 0);
+            be_load(e, w, V_T1, V_T0);
+            if (d->reg == 2) {        /* RCL a,1 = (a << 1) + CF */
+                be_adcsbc(e, 0, V_T1, V_T1, V_T1);
+            } else {                  /* RCR a,1: RRX in top bits */
+                if (d->lazy) be_stctx(e, V_T1, OFF(scratch)); /* old bit0 -> CF */
+                be_lsl(e, V_T1, V_T1, pad);
+                /* Thumb-2 MOV.W, RRX; type 3 / shift 0 is the RRX encoding. */
+                be_shift_imm(e, 3, V_T1, V_T1, 0);
+                be_lsr(e, V_T1, V_T1, pad);
+            }
+            if (d->lazy) {
+                /* SMC can exit immediately after be_store(), so materialize
+                   the NEW CF/OF BEFORE the checked store, not after it. */
+                be_stctx(e, V_T1, OFF(rep_tmp[1]));  /* resulting 8/16 bits */
+                if (d->reg == 2) {        /* RCL: CF = bit[bits] of 2*a+CF */
+                    be_ubfx(e, V_T0, V_T1, bits, 1);
+                    be_ubfx(e, V_T1, V_T1, bits - 1u, 1);
+                    be_op(e, AOP_EOR, V_T1, V_T1, V_T0); /* OF = MSB ^ CF */
+                    be_op_lsl(e, AOP_ORR, V_T0, V_T0, V_T1, 11);
+                } else {                   /* RCR: CF=old bit0, OF=new top2 XOR */
+                    be_op_lsl(e, AOP_EOR, V_T0, V_T1, V_T1, 1);
+                    be_ubfx(e, V_T0, V_T0, bits - 1u, 1); /* OF */
+                    be_ldctx(e, V_T1, OFF(scratch));
+                    be_ubfx(e, V_T1, V_T1, 0, 1); /* CF */
+                    be_op_lsl(e, AOP_ORR, V_T0, V_T1, V_T0, 11);
+                }
+                be_ldctx(e, V_T1, OFF(flags));
+                be_opi(e, AOP_AND, V_T1, V_T1,
+                       (uint16_t)~(B86_CF | B86_OF));
+                be_op(e, AOP_ORR, V_T1, V_T1, V_T0);
+                be_stctx(e, V_T1, OFF(flags));
+                be_ldctx(e, V_T0, OFF(rep_tmp[0]));
+                be_ldctx(e, V_T1, OFF(rep_tmp[1]));
+            }
+            be_store(e, w, V_T1, V_T0, 1, d->next);
+            return 1;
+        }
+#endif
         if (is_rcx(d)) {                         /* RCL/RCR r,1 (AX..DI, AL..BL) */
             unsigned bits = w ? 16 : 8;
             int sh = w ? 16 : 24;
@@ -2376,6 +2462,9 @@ B86_HOT void b86_jit_flush(J *j)
     j->st.flushes++;
 }
 
+#if B86_DEADSTUB_EAGER_UNCHAIN
+static void bb_deadstub_unlink(J *j, uint8_t *target);
+#endif
 B86_HOT static void kill_block(J *j, uint32_t idx)
 {
     Block *b = &j->blk[idx];
@@ -2392,6 +2481,11 @@ B86_HOT static void kill_block(J *j, uint32_t idx)
         j->fast[f].key = 0xFFFFFFFFu;
         j->fast[f].host = be_code_ptr(j->e.x_miss);
     }
+#if B86_DEADSTUB_EAGER_UNCHAIN
+    /* Non-eviction invalidations previously left incoming patches pointing
+       to the dead entry until eventual region reclamation. */
+    if (!j->bb_deadstub_eviction_active) bb_deadstub_unlink(j, b->host);
+#endif
     be_kill_entry(b->host, b->dead_stub);
     if (b->spec && b->ret_b) be_patch_branch(b->ret_b, b->ret_rec);
     j->st.smc_invalidations++;
@@ -2458,11 +2552,40 @@ typedef struct PatchLog { uint8_t *site, *target, *aux; uint32_t kind; } PatchLo
 B86_HOT static int plog_add(J *j, uint32_t kind, uint8_t *site, uint8_t *target, uint8_t *aux)
 {
     if (!j->evict) return 1;
-    if (j->nplog >= PLOGN) return 0;
+    if (j->nplog >= PLOGN) {
+#if BB_CHAIN_PROFILE
+        bb_chain_audit[CH_PLOG_FULL]++;
+#endif
+        return 0;
+    }
     PatchLog *l = &j->plog[j->nplog++];
     l->site = site; l->target = target; l->aux = aux; l->kind = kind;
+#if BB_CHAIN_PROFILE
+    if (j->nplog > bb_chain_audit[CH_PLOG_PEAK]) bb_chain_audit[CH_PLOG_PEAK] = j->nplog;
+#endif
     return 1;
 }
+
+#if B86_DEADSTUB_EAGER_UNCHAIN
+/* Remove logged incoming patches to a killed-but-not-yet-reclaimed block.
+   Preserve the same restoration rules as the established evict_range path. */
+B86_HOT static void bb_deadstub_unlink(J *j, uint8_t *target)
+{
+    uint32_t w = 0;
+    for (uint32_t k = 0; k < j->nplog; ++k) {
+        PatchLog *l = &j->plog[k];
+        if (l->target != target) {
+            j->plog[w++] = *l;
+            continue;
+        }
+        if (l->kind == PL_CHAIN) be_unchain(&j->e, l->site);
+        else if (l->kind == PL_RET) be_patch_branch(be_ret_hit_branch(l->site), l->aux);
+        else be_patch_branch(l->site, l->aux); /* PL_RECB */
+        j->st.unchains++;
+    }
+    j->nplog = w;
+}
+#endif
 
 B86_HOT static void pg_unlink(J *j, uint32_t idx)
 {
@@ -2481,17 +2604,51 @@ B86_HOT static void pg_unlink(J *j, uint32_t idx)
     }
 }
 
+/* BB_REUSE_DIAG_V1: evicted-entry recurrence, diagnostic only. */
+static uint32_t bbdiag_evicted_keys[256];
+static uint8_t bbdiag_evicted_valid[256];
+static uint32_t bbdiag_evicted_total, bbdiag_retranslated, bbdiag_collision;
+static uint32_t bbdiag_evicted_lost_chains;
+static uint32_t bbdiag_slot(uint32_t key) { return (key ^ (key >> 13) ^ (key >> 22)) & 255u; }
+static void bbdiag_evict(uint32_t key) {
+    uint32_t s=bbdiag_slot(key);
+    if (bbdiag_evicted_valid[s] && bbdiag_evicted_keys[s]!=key) ++bbdiag_collision;
+    bbdiag_evicted_keys[s]=key;
+    bbdiag_evicted_valid[s]=1;
+    ++bbdiag_evicted_total;
+}
+static void bbdiag_translate(uint32_t key) {
+    uint32_t s=bbdiag_slot(key);
+    if (bbdiag_evicted_valid[s] && bbdiag_evicted_keys[s]==key) {
+        ++bbdiag_retranslated;
+        bbdiag_evicted_valid[s]=0;
+    }
+}
+void b86_jit_reuse_diag(uint32_t *evicted, uint32_t *retranslated,
+                        uint32_t *collisions, uint32_t *broken_patches) {
+    if(evicted)*evicted=bbdiag_evicted_total;
+    if(retranslated)*retranslated=bbdiag_retranslated;
+    if(collisions)*collisions=bbdiag_collision;
+    if(broken_patches)*broken_patches=bbdiag_evicted_lost_chains;
+}
+
 /* Reclaim the code of every block that starts in [lo, hi). Returns the end
    of the reclaimed space (a block may run past hi). */
 B86_HOT static uint8_t *evict_range(J *j, uint8_t *lo, uint8_t *hi)
 {
     uint8_t *top = hi;
+#if B86_DEADSTUB_EAGER_UNCHAIN
+    j->bb_deadstub_eviction_active = 1; /* evict_range handles its own patch log */
+#endif
     j->st.evictions++;
     for (uint32_t i = 0; i < j->nblk; ++i) {
         Block *b = &j->blk[i];
         if (!b->host || b->host < lo || b->host >= hi) continue;
         if (b->hend > top) top = b->hend;
-        if (!b->dead) { kill_block(j, i); j->st.smc_invalidations--; }
+        if (!b->dead) {
+            if (!b->spec) bbdiag_evict(b->key);
+            kill_block(j, i); j->st.smc_invalidations--;
+        }
         pg_unlink(j, i);
         if (!b->spec && b->map_slot < MAPN && j->map[b->map_slot] == i + 1) j->map[b->map_slot] = MAP_TOMB;
         {   /* this generation's coverage bits (joins only; clearing extra is safe) */
@@ -2528,12 +2685,16 @@ B86_HOT static uint8_t *evict_range(J *j, uint8_t *lo, uint8_t *hi)
                 else if (l->kind == PL_RET) be_patch_branch(be_ret_hit_branch(l->site), l->aux);
                 else be_patch_branch(l->site, l->aux);           /* PL_RECB */
                 j->st.unchains++;
+                ++bbdiag_evicted_lost_chains;
                 continue;
             }
             j->plog[w++] = *l;
         }
         j->nplog = w;
     }
+#if B86_DEADSTUB_EAGER_UNCHAIN
+    j->bb_deadstub_eviction_active = 0;
+#endif
     j->flush_gen++;          /* pending chain / RET patch sites may be gone */
     return top;
 }
@@ -2730,7 +2891,7 @@ B86_COLD static Block *translate_ex(J *j, uint32_t cs, uint16_t ip, const Insn *
                 uint8_t *ok = be_jcc(e, AC_EQ);
                 e->retire = 0;                       /* nothing of the block ran */
                 be_call_light(e, (void *)b86h_dsmiss, V_T0, idx);
-                be_exit_ip_imm(e, ip, XR_LOOKUP);
+                be_exit_ip_imm(e, ip, XR_DS_GUARD); /* BB_EXIT_HOTSPOT_V1 */
                 be_bind(e, ok, e->p);
                 e->ds_bake = 1;
                 e->ds_val = c->seg[B86_DS];
@@ -2800,7 +2961,7 @@ B86_COLD static Block *translate_ex(J *j, uint32_t cs, uint16_t ip, const Insn *
         if (P >= 0 && v[P].virt == 1 && defer_info(&v[P], &o)) emit_record(&tx, &o, Q < 0);
         if (Q >= 0 && v[Q].virt == 1 && defer_info(&v[Q], &o)) emit_record(&tx, &o, 0);
     }
-    be_exit_ip_imm(e, ip, XR_LOOKUP);
+    be_exit_ip_imm(e, ip, XR_DEAD_STUB); /* BB_EXIT_HOTSPOT_V1 */
 
     if (e->overflow || tx.fail) {
         if (j->evict) {
@@ -2846,6 +3007,7 @@ B86_COLD static Block *translate_ex(J *j, uint32_t cs, uint16_t ip, const Insn *
         if (j->shadow) memcpy(j->shadow + lo, c->mem + lo, hi - lo);
         if (c->code_hook) c->code_hook(c, lo, hi - lo);
     }
+    if (!npre) bbdiag_translate(b->key);
     j->st.blocks++;
     j->st.guest_insns += (uint64_t)(n - npre);
     j->st.host_bytes += (uint64_t)(e->p - start);
@@ -3467,11 +3629,26 @@ B86_HOT static int MPF(cold_run)(J *j, B86Cpu *c, uint32_t key, int force)
     return 1;
 }
 
+/* BB_386_RM0_V1: never run the 16-bit Thumb-2/A64 JIT with 386
+   registers.  Cold interpreter is deliberately in flash, not SRAM. */
+B86_COLD static int b86_386_rm0_run(B86Cpu *c, uint64_t budget)
+{
+    for (uint64_t i = 0; i < budget; ++i) {
+        if (c->irq & 0x80000000u) { c->irq &= 0x7FFFFFFFu; return B86_HALT; }
+        if (c->irq) return B86_EXIT;
+        if (c->seg[B86_CS] == c->trap_cs) return B86_TRAP;
+        int r = b86_step(c);
+        if (r != B86_OK) return r;
+    }
+    return B86_BUDGET;
+}
+
 B86_HOT int b86_jit_run(B86Cpu *c, uint64_t max_dispatch)
 {
 #ifdef B86_PAGED
     if (be_paged && c->jit && c->jit->cm_table) c->pt = (int32_t *)(void *)c->jit->cm_table;   /* struct copies */
 #endif
+    if (c->model >= B86_CPU_386) return b86_386_rm0_run(c, max_dispatch);
     J *j = c->jit;
     uint64_t n = 0;
     uint8_t *patch_site = NULL, *rf_site = NULL;
@@ -3520,7 +3697,12 @@ B86_HOT int b86_jit_run(B86Cpu *c, uint64_t max_dispatch)
             if (rf_site && rf_gen == j->flush_gen && !j->no_chain) {
                 RetMeta *m = NULL;
                 for (uint32_t r = 0; r < j->nrm; ++r) if (j->rm[r].site == rf_site) { m = &j->rm[r]; break; }
-                if (j->evict && j->nplog + 2 > PLOGN) { /* log full: leave the RET cache unpatched */ }
+                if (j->evict && j->nplog + 2 > PLOGN) {
+#if BB_CHAIN_PROFILE
+                    bb_chain_audit[CH_RET_REFUSED]++;
+#endif
+                    /* log full: leave the RET cache unpatched */
+                }
                 else if (m && j->no_spec) { plog_add(j, PL_RECB, m->recb, b->host, m->fill); be_patch_branch(m->recb, b->host); be_patch_ret(rf_site, (uint16_t)c->ip, m->recp, m->miss); }
                 else if (!m) { plog_add(j, PL_RET, rf_site, b->host, be_ret_plain_fill(rf_site)); be_patch_ret(rf_site, (uint16_t)c->ip, b->host, NULL); }
                 else {
@@ -3543,6 +3725,10 @@ B86_HOT int b86_jit_run(B86Cpu *c, uint64_t max_dispatch)
                 j->fast[f].host = be_code_ptr(host);
             }
         }
+#if BB_CHAIN_PROFILE
+        if (patch_site && patch_gen != j->flush_gen) bb_chain_audit[CH_STALE]++;
+        if (patch_site && patch_gen == j->flush_gen && j->no_chain) bb_chain_audit[CH_DISABLED]++;
+#endif
         if (patch_site && patch_gen == j->flush_gen && !j->no_chain && plog_add(j, PL_CHAIN, patch_site, host, NULL)) {
             be_patch_branch(patch_site, host);
             j->st.chains++;
@@ -3567,8 +3753,23 @@ B86_HOT int b86_jit_run(B86Cpu *c, uint64_t max_dispatch)
 #ifdef B86_COND_HISTO
         { extern uint32_t b86_xr[8]; b86_xr[r & 7]++; }
 #endif
+#if BB_CHAIN_PROFILE
+        if (r == XR_CHAIN) ++bb_chain_audit[CH_EXIT_CHAIN];
+        else if (r == XR_RETFILL) ++bb_chain_audit[CH_EXIT_RET];
+        else if (r == XR_LOOKUP || r == XR_DS_GUARD || r == XR_DEAD_STUB) ++bb_chain_audit[CH_EXIT_LOOKUP]; /* BB_EXIT_HOTSPOT_V1 */
+        else if (r == XR_IRQ) ++bb_chain_audit[CH_EXIT_IRQ];
+        else ++bb_chain_audit[CH_EXIT_OTHER];
+#endif
         switch (r) {
         case XR_HALT: return B86_HALT;
+        /* BB_CHAIN_EXIT_SPLIT_V2: count and dispatch exactly as XR_LOOKUP did. */
+        case XR_DYNAMIC: j->st.exit_dynamic++; break;
+        /* BB_EXIT_HOTSPOT_V1: reasons treated exactly as the old XR_LOOKUP/XR_DYNAMIC. */
+        case XR_STEP_EXIT: j->st.exit_step_return++; break;
+        case XR_DS_GUARD: j->st.exit_ds_guard++; break;
+        case XR_DEAD_STUB: j->st.exit_dead_stub++; break;
+        case XR_FASTMISS: j->st.exit_native_miss++; break;
+        case XR_LOOKUP: j->st.exit_direct_lookup++; break;
         case XR_CHAIN:
             patch_site = (uint8_t *)c->patch;
             patch_gen = j->flush_gen;
