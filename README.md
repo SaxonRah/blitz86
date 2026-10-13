@@ -69,3 +69,41 @@ operand threshold. Fuzz with FUZZ_MAP + B86_OPT_PAGE_ZERO and threshold 1:
 ~490 baked blocks, ~30 guard misses per 400 programs, no new mismatches (the
 remaining FUZZ_MAP mismatches - seeds 189, 2108, 2575, 4056 - occur with the
 pre-session JIT too).
+
+r53: CPU model setting, 80186 instruction set (B86Cpu.model = B86_CPU_186).
+Default stays B86_CPU_8086 (exact 8086: 60-6F are Jcc aliases, C0/C1 RET
+aliases, 0F POP CS, shift counts unmasked). With model 186:
+PUSHA/POPA, BOUND (INT 5; reg form INT 6), PUSH imm16/imm8, IMUL r,r/m,imm,
+INS/OUTS (REP), shift/rotate r/m,imm8, ENTER/LEAVE, shift counts masked to 5
+bits. Interpreter only for now: the JIT ends a block at these opcodes (and at
+shift-by-CL) and the interpreter steps them; hot ones go native next.
+Tests: tools/sst286_convert.py turns the SingleStepTests 80286 real-mode
+vectors (moo2json output) into sst.bin; 286-only faults (segment limit) are
+skipped. SST_MODEL=1 SST_A20=1 build/sst_interp: 28325/28326 (the one ENTER
+miss reads memory the vector does not list); JIT runners: all pass. 8086
+vectors, fuzzers (8086) unchanged; FUZZ_186=1 adds 186 instructions.
+
+r53b: native 80186 paths (Thumb-2): PUSH imm16/imm8, LEAVE, shift by
+immediate (C0/C1 SHL/SHR/SAR, flags dead) and shift by CL with the count
+masked to 5 bits (register form). These decode to the unused op value 0xF1
+(PUSH imm, LEAVE) or to D2/D3 with an immediate count, so no 8086 meaning of
+60-6F / C0-C1 can leak into the analysis. Memory-form shift by CL, PUSHA/POPA,
+IMUL imm, ENTER, BOUND, INS/OUTS still run in the interpreter. AArch64 keeps
+them all in the interpreter. 186 vectors: 3865 of 24986 now native, all pass.
+
+r54: 80286 real mode (B86Cpu.model = B86_CPU_286, includes the 186 set).
+* 0F 01: SGDT/SIDT (6th byte FFh), LGDT/LIDT (24-bit base; LIDT moves the
+  real-mode IVT), SMSW (FFF0h | MSW), LMSW (MP/EM/TS; setting PE -> #UD,
+  protected mode is not implemented yet); 0F 06 CLTS; other 0F xx -> #UD.
+* FLAGS bits 12-15 read 0 (PUSHF, interrupts); PUSH SP pushes the old SP.
+* #UD (INT 6) for the 8086 alias forms: MOV sreg reg>3 / MOV CS,x; LEA, LES,
+  LDS, CALL/JMP FAR with a register operand; 8F/C6/C7 reg != 0; FE reg > 1;
+  FF /7.
+* Divide error pushes the faulting IP; IDIV accepts -128 / -32768 quotients;
+  AAA/AAS adjust AX as a whole; DAA/DAS carry/borrow from the +-6 step and
+  test the old AL > 99h.
+* Not modelled: 286 segment-limit faults in real mode (word access at offset
+  FFFFh -> #GP/#SS); the converter skips those vectors.
+SingleStepTests 80286 v1_real_mode (300 per opcode): 94427/94427 in the
+interpreter, 83809/83809 through the JIT (the rest wrap-dependent). 8086
+suite 61600/61600 unchanged; 186 28325/28326. FUZZ_286=1 for fuzzing.

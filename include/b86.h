@@ -77,6 +77,8 @@ typedef void    (*B86SmcHook)(struct B86Cpu *, uint32_t lin, uint32_t len);
 /* Called for every guest byte range a new translation depends on. */
 typedef void    (*B86CodeHook)(struct B86Cpu *, uint32_t lin, uint32_t len);
 
+enum { B86_CPU_8086 = 0, B86_CPU_186 = 1, B86_CPU_286 = 2 };   /* B86Cpu.model (286: real mode) */
+
 typedef struct B86Cpu {
     /* --- hot block: generated code touches these ------------------------ */
     uint32_t r[8];          /* GPRs; only bits 0..15 are meaningful        */
@@ -105,6 +107,10 @@ typedef struct B86Cpu {
                                any code whose CS equals this (0xFFFFFFFF: off) */
     uint32_t pad1;
     uint32_t rep_tmp[2];    /* JIT: scratch for the inline REP MOVS/STOS path */
+    uint32_t model;         /* CPU model: B86_CPU_8086 (0, default), _186, _286 */
+    uint32_t idt_base, gdt_base;    /* 286: LIDT/LGDT (24-bit bases); real-mode IVT = idt_base */
+    uint16_t idt_limit, gdt_limit;
+    uint16_t msw;                   /* 286 machine status word (PE, MP, EM, TS) */
 
     /* --- configuration ----------------------------------------------------- */
     uint32_t amask;         /* 0xFFFFF = 8086 1 MiB wrap; 0x1FFFFF = A20 on */

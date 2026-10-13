@@ -278,6 +278,8 @@ typedef struct Insn {
     uint8_t sinkfl;                     /* r52f: flush deferred records before this insn */
     uint8_t sunk;                       /* r52f: producer's record flushed at index sunk-1 */
     uint8_t runf;                       /* r52j: PUSH/POP emitted by the run leader */
+    uint8_t x186;                       /* r53b: op 0xF1 = this 80186 opcode (PUSH imm, LEAVE) */
+    uint8_t ximm;                       /* r53b: D2/D3 shift with an immediate count (186 C0/C1) */
     uint8_t wm;                         /* guest GPRs (bit per reg16) written   */
     uint8_t pendb;                      /* INC/DEC overlay possibly live before */
     uint8_t inv;                        /* unrolled LOOP copy: exit when CX == 0 */
@@ -356,6 +358,47 @@ B86_HOT static void decode(B86Cpu *c, uint32_t cs, uint16_t ip, Insn *d)
         if (op == 0xF0 || op == 0xF1) { d->nprefix++; continue; }
         break;
     }
+    int ximm = 0;
+    if (c->model >= B86_CPU_186 && (op == 0x68 || op == 0x6A || op == 0xC9)) {
+        /* r53b: native 186 ops get the unused prefix value 0xF1 as their op
+           (never a decoded op), so no 8086 meaning (Jcc / RET alias) leaks */
+        d->op = 0xF1; d->x186 = op;
+        if (op == 0x68) { d->imm = (uint16_t)(fb(c, cs, p) | fb(c, cs, p + 1) << 8); p += 2; }
+        else if (op == 0x6A) { d->imm = (uint16_t)(int16_t)(int8_t)fb(c, cs, p); p += 1; }
+        d->next = (uint16_t)p;
+        if (p > 0xFFFFu) d->cls = C_END;
+        return;
+    }
+    if (c->model >= B86_CPU_186 && (op == 0xC0 || op == 0xC1)) { op = (uint8_t)(0xD2 | (op & 1)); ximm = 1; }
+    else if (c->model >= B86_CPU_286 && (op == 0x8C || op == 0x8E || op == 0x8D || op == 0xC4 || op == 0xC5 ||
+                                         op == 0x8F || op == 0xC6 || op == 0xC7 || op == 0xFE || op == 0xFF)) {
+        /* 286: forms that are 8086 aliases raise #UD - the interpreter does it */
+        uint8_t m = fb(c, cs, p);
+        int mod = m >> 6, reg = (m >> 3) & 7, ud;
+        switch (op) {
+        case 0x8C: ud = reg > 3; break;
+        case 0x8E: ud = reg > 3 || reg == B86_CS; break;
+        case 0x8D: case 0xC4: case 0xC5: ud = mod == 3; break;
+        case 0x8F: case 0xC6: case 0xC7: ud = reg != 0; break;
+        case 0xFE: ud = reg > 1; break;
+        default:   ud = reg == 7 || ((reg == 3 || reg == 5) && mod == 3) || m == 0xF4u; break;  /* FF; FF F4 = PUSH SP */
+        }
+        if (ud) { d->op = 0x0F; d->cls = C_END; d->next = (uint16_t)p; return; }
+    }
+    if (c->model >= B86_CPU_286 && op == 0x54) {
+        d->op = 0x0F; d->cls = C_END; d->next = (uint16_t)p; return;   /* 286 PUSH SP pushes the old SP */
+    }
+    else if (c->model >= B86_CPU_186 && ((op >= 0x60 && op <= 0x6F) ||
+                                    op == 0xC8 || op == 0x0F || op == 0xD2 || op == 0xD3) &&
+             !((op == 0xD2 || op == 0xD3) && (fb(c, cs, p) >> 6) == 3)) {
+        /* 80186 opcodes (their 8086 meanings - Jcc, RET aliases, POP CS -
+           are gone) and shifts by CL (count masked to 5 bits on the 186):
+           the interpreter runs them, the block ends there */
+        d->op = 0x0F;
+        d->cls = C_END;
+        d->next = (uint16_t)p;
+        return;
+    }
     d->op = op;
     d->w = op & 1;
     if (modrm_tab[op]) {
@@ -371,6 +414,12 @@ B86_HOT static void decode(B86Cpu *c, uint32_t cs, uint16_t ip, Insn *d)
     else if (n >= 2) d->imm = (uint16_t)(fb(c, cs, p) | fb(c, cs, p + 1) << 8);
     if (n == 4) d->imm2 = (uint16_t)(fb(c, cs, p + 2) | fb(c, cs, p + 3) << 8);
     p += (uint32_t)n;
+    if (ximm) {                                     /* 186 C0/C1: shift by imm8 (& 31) */
+        d->ximm = 1;
+        d->imm = fb(c, cs, p) & 31u;
+        p += 1;
+        if (!d->imm) d->cls = C_END;                /* count 0: flags untouched, let the helper do it */
+    }
     d->next = (uint16_t)p;
     if (p > 0xFFFFu) d->cls = C_END;    /* crosses the segment end: helper */
 }
@@ -397,6 +446,7 @@ B86_HOT static void classify(Insn *d)
         return;
     }
     switch (op) {
+    case 0xF1: d->fuse = 0; d->native = be_rep_inline; return;   /* r53b: 186 PUSH imm / LEAVE (Thumb-2) */
     case 0x06: case 0x0E: case 0x16: case 0x1E: d->fuse = 0; d->native = 1; return;
     case 0x07: case 0x17: case 0x1F: d->fuse = 0; d->native = 1; return;
     case 0x0F: d->cls = C_END; return;
@@ -465,7 +515,7 @@ B86_HOT static void classify(Insn *d)
         return;
     case 0xD2: case 0xD3: /* count may be 0: defines nothing for sure */
         d->fuse = (d->reg == 2 || d->reg == 3) ? B86_CF : 0; d->fdef = 0;
-        if (d->reg == 4 || d->reg == 5 || d->reg == 7) { d->native = 1; d->nfd = ALLF; d->nzclob = 1; }
+        if ((d->reg == 4 || d->reg == 5 || d->reg == 7) && (!d->ximm || be_rep_inline)) { d->native = 1; d->nfd = ALLF; d->nzclob = 1; }
         return;
     case 0xD4: d->fuse = ALLF; d->fdef = 0; return;
     case 0xA4: case 0xA5: case 0xAA: case 0xAB:
@@ -649,6 +699,7 @@ B86_COLD static int checked_store(const Insn *d)
     if ((op >= 0x50 && op <= 0x57) || op == 0x06 || op == 0x0E || op == 0x16 || op == 0x1E || op == 0xE8 || op == 0x9C)
         return 1;                                                          /* PUSH / CALL */
     if (op == 0xFF && (d->reg == 2 || d->reg >= 6)) return 1;
+    if (op == 0xF1 && d->x186 != 0xC9) return 1;                         /* 186 PUSH imm */
     if (!d->has_modrm || d->mod == 3) return 0;
     if (is_mem_dst_producer(d)) return 1;
     switch (op) {
@@ -735,6 +786,7 @@ B86_COLD static uint8_t wmask(const Insn *d)
     case 0x06: case 0x0E: case 0x16: case 0x1E: case 0x07: case 0x17: case 0x1F:
     case 0xE8: case 0xC2: case 0xC3: case 0xC0: case 0xC1: return 1u << B86_SP;
     case 0xE0: case 0xE1: case 0xE2: return 1u << B86_CX;
+    case 0xF1: return (uint8_t)((1u << B86_SP) | (d->x186 == 0xC9 ? 1u << B86_BP : 0u));
     case 0xF6: case 0xF7:
         if (d->reg < 2) return 0;
         if (d->reg < 4) return m3 ? ((op & 1) ? (uint8_t)(1u << d->rm) : r8bit(d->rm)) : 0;
@@ -1668,6 +1720,18 @@ B86_COLD static int lower(Tx *t, Insn *d)
     if ((op == 0xFE || op == 0xFF) && d->reg < 2) {
         return emit_alu(t, d, d->reg ? 5 : 0, w, op_rm(d, w), op_imm(1), d->reg ? 2 : 1);
     }
+    if (op == 0xF1) {                              /* r53b: 80186 */
+        if (d->x186 == 0xC9) {                     /* LEAVE: SP = BP; POP BP */
+            be_mov(e, B86_SP, B86_BP);
+            be_ubfx(e, V_T0, B86_SP, 0, 16);
+            be_load_ss_idx(e, 1, B86_BP, V_T0);
+            be_opi(e, AOP_ADD, B86_SP, B86_SP, 2u);
+        } else {                                   /* PUSH imm16 / imm8 (sign-extended) */
+            be_movi(e, V_T1, d->imm);
+            emit_push(t, V_T1, d->next, 1);
+        }
+        return 1;
+    }
     if (op >= 0x50 && op <= 0x5F) {
         if (d->runf) return 1;                     /* emitted by the run leader */
         if (be_rep_inline && op >= 0x58 && op != 0x5C) {
@@ -2053,7 +2117,11 @@ B86_COLD static int lower(Tx *t, Insn *d)
         int src = v;
         if (d->reg == 5) { be_ubfx(e, V_T1, v, 0, w ? 16 : 8); src = V_T1; }
         else if (d->reg == 7) { be_sbfx(e, V_T1, v, 0, w ? 16 : 8); src = V_T1; }
-        be_shift_reg(e, d->reg == 4 ? 0 : d->reg == 5 ? 1 : 2, v, src, B86_CX);
+        if (d->ximm) be_shift_imm(e, d->reg == 4 ? 0 : d->reg == 5 ? 1 : 2, v, src, d->imm);
+        else if (t->j->cpu->model >= B86_CPU_186) {           /* 186: count = CL & 31 (reg form only) */
+            be_opi(e, AOP_AND, V_T0, B86_CX, 31u);
+            be_shift_reg(e, d->reg == 4 ? 0 : d->reg == 5 ? 1 : 2, v, src, V_T0);
+        } else be_shift_reg(e, d->reg == 4 ? 0 : d->reg == 5 ? 1 : 2, v, src, B86_CX);
         if (mem) be_store(e, w, V_T1, V_T0, 1, d->next);
         else if (!w) put8(t, d->rm, V_T1);
         return 1; }
@@ -2190,7 +2258,7 @@ B86_COLD static int lower(Tx *t, Insn *d)
         (DBG_SITE(t, d), be_call_flags(e)); t->inc_pending = 0;
         be_ldctx(e, V_T1, OFF(flags));
         be_opi(e, AOP_AND, V_T1, V_T1, 0x0FD5u);
-        be_opi(e, AOP_ORR, V_T1, V_T1, 0xF002u);
+        be_opi(e, AOP_ORR, V_T1, V_T1, t->j->cpu->model >= B86_CPU_286 ? 0x0002u : 0xF002u);   /* 286: bits 12-15 read 0 */
         emit_push(t, V_T1, d->next, 1);
         return 1;
     case 0x9D:                                   /* POPF */

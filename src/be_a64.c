@@ -29,6 +29,7 @@ void be_rep_count(Emit *e, int n, unsigned w) { (void)e; (void)n; (void)w; }
 void be_load_ss_idx(Emit *e, int w16, int d, int idx) { (void)e; (void)w16; (void)d; (void)idx; }
 void be_smc_check_range(Emit *e, int addr, uint32_t len, uint16_t next_ip) { (void)e; (void)addr; (void)len; (void)next_ip; }
 void be_cmpr(Emit *e, int a, int b) { (void)e; (void)a; (void)b; }
+void be_shift_imm(Emit *e, int type, int d, int s, unsigned n) { (void)e; (void)type; (void)d; (void)s; (void)n; }
 void be_lsr(Emit *e, int d, int s, unsigned n) { (void)e; (void)d; (void)s; (void)n; }
 void be_set_c_cf(Emit *e, int tmp, int invert) { (void)e; (void)tmp; (void)invert; }
 void be_adcsbc(Emit *e, int sbc, int d, int a, int b) { (void)e; (void)sbc; (void)d; (void)a; (void)b; }

@@ -35,6 +35,7 @@ B86_HOT void b86_init(B86Cpu *c, uint8_t *mem)
     c->amask = 0x1FFFFFu;
     c->flags = 0xF002u;
     c->trap_cs = 0xFFFFFFFFu;
+    c->idt_limit = 0x03FFu;                         /* 286 reset state */
 #ifdef B86_PAGED
     c->pt = c->pt_store;
 #endif
@@ -96,7 +97,7 @@ B86_HOT void b86_flags_materialize(B86Cpu *c)
 B86_HOT uint16_t b86_get_flags(B86Cpu *c)
 {
     b86_flags_materialize(c);
-    return (uint16_t)((c->flags & 0x0FD5u) | 0xF002u);
+    return (uint16_t)((c->flags & 0x0FD5u) | (c->model >= B86_CPU_286 ? 0x0002u : 0xF002u));
 }
 
 B86_HOT void b86_set_flags(B86Cpu *c, uint16_t f)
@@ -174,6 +175,9 @@ typedef struct {
     const uint8_t *fp;          /* fetch window: host bytes at CS:fip0 */
     uint16_t fip0, favail;
 } St;
+
+/* divide error: the 8086 pushes the next IP, the 286 the faulting instruction */
+#define DE_IP(s) ((s)->c->model >= B86_CPU_286 ? (s)->fip0 : (s)->ip)
 
 /* (r51c) instruction fetch from a host window set up once per instruction
    (CS:IP up to the end of its 4 KiB page / the segment / the A20 wrap),
@@ -389,11 +393,12 @@ B86_HOT void b86_interrupt(B86Cpu *c, uint8_t v)
 {
     b86_flags_materialize(c);
     if (c->int_hook && c->int_hook(c, v)) return;
-    push(c, (uint16_t)((c->flags & 0x0FD5u) | 0xF002u));
+    push(c, (uint16_t)((c->flags & 0x0FD5u) | (c->model >= B86_CPU_286 ? 0x0002u : 0xF002u)));
     FL &= ~(uint32_t)(B86_IF | B86_TF);
     push(c, (uint16_t)c->seg[B86_CS]);
     push(c, (uint16_t)c->ip);
     uint32_t vec = (uint32_t)v * 4u;
+    if (c->model >= B86_CPU_286) vec = (c->idt_base + vec) & c->amask;   /* LIDT moves the real-mode IVT */
     c->ip = *b86_host(c, vec) | (*b86_host(c, vec + 1) << 8);
     b86_set_seg(c, B86_CS, (uint16_t)(*b86_host(c, vec + 2) | (*b86_host(c, vec + 3) << 8)));
 }
@@ -495,28 +500,28 @@ B86_HOT static int group3(St *s, int w)
     case 6: /* DIV */
         if (!w) {
             uint32_t n = g16(c, B86_AX);
-            if (v == 0 || n / v > 0xFF) { c->ip = s->ip; b86_interrupt(c, 0); return 1; }
+            if (v == 0 || n / v > 0xFF) { c->ip = DE_IP(s); b86_interrupt(c, 0); return 1; }
             p8(c, 0, (uint8_t)(n / v)); p8(c, 4, (uint8_t)(n % v));
         } else {
             uint32_t n = ((uint32_t)g16(c, B86_DX) << 16) | g16(c, B86_AX);
-            if (v == 0 || n / v > 0xFFFF) { c->ip = s->ip; b86_interrupt(c, 0); return 1; }
+            if (v == 0 || n / v > 0xFFFF) { c->ip = DE_IP(s); b86_interrupt(c, 0); return 1; }
             p16(c, B86_AX, (uint16_t)(n / v)); p16(c, B86_DX, (uint16_t)(n % v));
         }
         break;
     case 7: /* IDIV */
         if (!w) {
             int32_t n = (int16_t)g16(c, B86_AX), d = (int8_t)v;
-            if (d == 0) { c->ip = s->ip; b86_interrupt(c, 0); return 1; }
+            if (d == 0) { c->ip = DE_IP(s); b86_interrupt(c, 0); return 1; }
             int32_t q = n / d, r = n % d;
-            if (q <= -128 || q > 127) { c->ip = s->ip; b86_interrupt(c, 0); return 1; }
+            if (q < (s->c->model >= B86_CPU_286 ? -128 : -127) || q > 127) { c->ip = DE_IP(s); b86_interrupt(c, 0); return 1; }
             if (s->rep) q = -q;
             p8(c, 0, (uint8_t)q); p8(c, 4, (uint8_t)r);
         } else {
             int32_t n = (int32_t)(((uint32_t)g16(c, B86_DX) << 16) | g16(c, B86_AX)), d = (int16_t)v;
-            if (d == 0) { c->ip = s->ip; b86_interrupt(c, 0); return 1; }
-            if (n == INT32_MIN && d == -1) { c->ip = s->ip; b86_interrupt(c, 0); return 1; }
+            if (d == 0) { c->ip = DE_IP(s); b86_interrupt(c, 0); return 1; }
+            if (n == INT32_MIN && d == -1) { c->ip = DE_IP(s); b86_interrupt(c, 0); return 1; }
             int32_t q = n / d, r = n % d;
-            if (q <= -32768 || q > 32767) { c->ip = s->ip; b86_interrupt(c, 0); return 1; }
+            if (q < (s->c->model >= B86_CPU_286 ? -32768 : -32767) || q > 32767) { c->ip = DE_IP(s); b86_interrupt(c, 0); return 1; }
             if (s->rep) q = -q;
             p16(c, B86_AX, (uint16_t)q); p16(c, B86_DX, (uint16_t)r);
         }
@@ -533,8 +538,11 @@ B86_HOT static void daa_das(B86Cpu *c, int sub)
 {
     uint8_t al = g8(c, 0), old = al;
     int oaf = (FL & B86_AF) != 0, ocf = (FL & B86_CF) != 0, af = 0, cf = 0;
-    if ((al & 0x0F) > 9 || oaf) { al = (uint8_t)(sub ? al - 6 : al + 6); af = 1; }
-    if (ocf || old > 0x9F || (old > 0x99 && !oaf)) { al = (uint8_t)(sub ? al - 0x60 : al + 0x60); cf = 1; }
+    if ((al & 0x0F) > 9 || oaf) {
+        if (c->model >= B86_CPU_286 && (sub ? al < 6 : al > 0xF9)) cf = 1;   /* 286: borrow/carry of the +-6 */
+        al = (uint8_t)(sub ? al - 6 : al + 6); af = 1;
+    }
+    if (ocf || (c->model >= B86_CPU_286 ? old > 0x99 : (old > 0x9F || (old > 0x99 && !oaf)))) { al = (uint8_t)(sub ? al - 0x60 : al + 0x60); cf = 1; }
     setf(c, B86_AF, af); setf(c, B86_CF, cf);
     p8(c, 0, al);
     szp(c, 0, al);
@@ -544,7 +552,11 @@ B86_HOT static void aaa_aas(B86Cpu *c, int sub)
 {
     uint8_t al = g8(c, 0), ah = g8(c, 4);
     if ((al & 0x0F) > 9 || (FL & B86_AF)) {
-        al = (uint8_t)(sub ? al - 6 : al + 6);
+        if (c->model >= B86_CPU_286) {              /* 286: AX +/- 6 carries into AH */
+            uint16_t ax = (uint16_t)(al | ah << 8);
+            ax = (uint16_t)(sub ? ax - 6 : ax + 6);
+            al = (uint8_t)ax; ah = (uint8_t)(ax >> 8);
+        } else al = (uint8_t)(sub ? al - 6 : al + 6);
         ah = (uint8_t)(sub ? ah - 1 : ah + 1);
         FL |= B86_AF | B86_CF;
     } else FL &= ~(uint32_t)(B86_AF | B86_CF);
@@ -554,6 +566,136 @@ B86_HOT static void aaa_aas(B86Cpu *c, int sub)
 /* ------------------------------------------------------------------------ */
 /* The step function                                                        */
 /* ------------------------------------------------------------------------ */
+
+/* 80286 real mode: 0F xx. Protected-mode-only forms (and LMSW setting PE,
+   which this emulator does not support) raise #UD (INT 6). */
+B86_HOT static int step0f(St *s)
+{
+    B86Cpu *c = s->c;
+    uint8_t op2 = f8(s);
+    if (op2 == 0x01) {
+        modrm(s);
+        int reg = s->reg;
+        if (reg <= 3) {                             /* SGDT SIDT LGDT LIDT: memory only */
+            if (s->mod == 3) goto ud;
+            uint16_t o = s->ea_off; int sg = s->ea_seg;
+            uint32_t *base = (reg & 1) ? &c->idt_base : &c->gdt_base;
+            uint16_t *lim = (reg & 1) ? &c->idt_limit : &c->gdt_limit;
+            if (reg < 2) {
+                wr16(c, sg, o, *lim);
+                wr16(c, sg, (uint16_t)(o + 2), (uint16_t)*base);
+                wr8(c, sg, (uint16_t)(o + 4), (uint8_t)(*base >> 16));
+                wr8(c, sg, (uint16_t)(o + 5), 0xFF);          /* 286 stores FFh in the 6th byte */
+            } else {
+                *lim = rd16(c, sg, o);
+                *base = rd16(c, sg, (uint16_t)(o + 2)) | (uint32_t)rd8(c, sg, (uint16_t)(o + 4)) << 16;
+            }
+        } else if (reg == 4) {                      /* SMSW */
+            rm_put(s, 1, (uint16_t)(0xFFF0u | c->msw));
+        } else if (reg == 6) {                      /* LMSW: PE can be set, not cleared */
+            uint16_t v = (uint16_t)rm_get(s, 1);
+            if (v & 1u) goto ud;                    /* protected mode: not supported (yet) */
+            c->msw = (uint16_t)((c->msw & 1u) | (v & 0x0Eu));
+        } else goto ud;
+        c->ip = s->ip;
+        return B86_OK;
+    }
+    if (op2 == 0x06) { c->msw &= (uint16_t)~8u; c->ip = s->ip; return B86_OK; }   /* CLTS */
+ud: c->ip = s->fip0;
+    b86_interrupt(c, 6);
+    return B86_OK;
+}
+
+/* 80186/80188 additions (model >= B86_CPU_186). Returns -1 when op is not
+   one of them (the 8086 table handles it), else the b86_step result. */
+B86_HOT static int step186(St *s, uint8_t op, int w)
+{
+    B86Cpu *c = s->c;
+    switch (op) {
+    case 0x60: {                                    /* PUSHA */
+        uint16_t sp = (uint16_t)c->r[B86_SP];
+        push(c, g16(c, B86_AX)); push(c, g16(c, B86_CX)); push(c, g16(c, B86_DX)); push(c, g16(c, B86_BX));
+        push(c, sp); push(c, g16(c, B86_BP)); push(c, g16(c, B86_SI)); push(c, g16(c, B86_DI));
+        break; }
+    case 0x61:                                      /* POPA (the SP slot is skipped) */
+        p16(c, B86_DI, pop(c)); p16(c, B86_SI, pop(c)); p16(c, B86_BP, pop(c)); (void)pop(c);
+        p16(c, B86_BX, pop(c)); p16(c, B86_DX, pop(c)); p16(c, B86_CX, pop(c)); p16(c, B86_AX, pop(c));
+        break;
+    case 0x62: {                                    /* BOUND r16, m16&16 -> INT 5 */
+        modrm(s);
+        if (s->mod == 3) { c->ip = s->fip0; b86_interrupt(c, 6); return B86_OK; }
+        int16_t v = (int16_t)reg_get(s, 1);
+        int16_t lo = (int16_t)rd16(c, s->ea_seg, s->ea_off), hi = (int16_t)rd16(c, s->ea_seg, (uint16_t)(s->ea_off + 2));
+        if (v < lo || v > hi) { c->ip = s->fip0; b86_interrupt(c, 5); return B86_OK; }   /* IP of the first prefix */
+        break; }
+    case 0x68: push(c, f16(s)); break;              /* PUSH imm16 */
+    case 0x6A: push(c, (uint16_t)(int16_t)(int8_t)f8(s)); break;   /* PUSH imm8 (sign-extended) */
+    case 0x69: case 0x6B: {                         /* IMUL r16, r/m16, imm */
+        modrm(s);
+        int32_t a = (int16_t)rm_get(s, 1);
+        int32_t b = op == 0x69 ? (int16_t)f16(s) : (int8_t)f8(s);
+        int32_t r = a * b;
+        reg_put(s, 1, (uint16_t)r);
+        setf(c, B86_CF | B86_OF, r != (int16_t)r);
+        szp(c, 1, (uint16_t)r);
+        break; }
+    case 0x6C: case 0x6D: case 0x6E: case 0x6F: {   /* INS / OUTS */
+        int16_t d = (int16_t)((FL & B86_DF) ? -(1 << w) : (1 << w));
+        int sseg = s->seg >= 0 ? s->seg : B86_DS;
+        uint16_t port = g16(c, B86_DX);
+        for (;;) {
+            if (s->rep && (uint16_t)c->r[B86_CX] == 0) break;
+            if (op < 0x6E) {
+                uint16_t di = (uint16_t)c->r[B86_DI];
+                uint8_t lo = c->in8 ? c->in8(c, port) : 0xFF;
+                if (w) wr16(c, B86_ES, di, (uint16_t)(lo | (c->in8 ? c->in8(c, (uint16_t)(port + 1)) : 0xFF) << 8));
+                else wr8(c, B86_ES, di, lo);
+                c->r[B86_DI] = (uint16_t)(di + d);
+            } else {
+                uint16_t si = (uint16_t)c->r[B86_SI];
+                uint16_t v = w ? rd16(c, sseg, si) : rd8(c, sseg, si);
+                if (c->out8) { c->out8(c, port, (uint8_t)v); if (w) c->out8(c, (uint16_t)(port + 1), (uint8_t)(v >> 8)); }
+                c->r[B86_SI] = (uint16_t)(si + d);
+            }
+            if (!s->rep) break;
+            c->r[B86_CX] = (uint16_t)(c->r[B86_CX] - 1);
+        }
+        break; }
+    case 0xC0: case 0xC1: {                         /* shift/rotate r/m, imm8 */
+        modrm(s);
+        uint32_t v = rm_get(s, w);
+        unsigned n = f8(s) & 31u;
+        uint32_t r = shift(c, s->reg, w, v, n);
+        if (n) rm_put(s, w, r);
+        break; }
+    case 0xC8: {                                    /* ENTER size, level */
+        uint16_t size = f16(s);
+        unsigned level = f8(s) & 31u;
+        push(c, g16(c, B86_BP));
+        uint16_t frame = (uint16_t)c->r[B86_SP];
+        if (level) {
+            for (unsigned i = 1; i < level; ++i) {
+                p16(c, B86_BP, (uint16_t)(g16(c, B86_BP) - 2));
+                push(c, rd16(c, B86_SS, g16(c, B86_BP)));
+            }
+            push(c, frame);
+        }
+        p16(c, B86_BP, frame);
+        c->r[B86_SP] = (uint16_t)(c->r[B86_SP] - size);
+        break; }
+    case 0x0F:                                      /* 286: two-byte opcodes */
+        if (c->model < B86_CPU_286) { c->ip = s->fip0; b86_interrupt(c, 6); return B86_OK; }   /* 186: #UD */
+        return step0f(s);
+    case 0xC9:                                      /* LEAVE */
+        c->r[B86_SP] = (uint16_t)c->r[B86_BP];
+        p16(c, B86_BP, pop(c));
+        break;
+    default:
+        return -1;
+    }
+    c->ip = s->ip;
+    return B86_OK;
+}
 
 B86_HOT int b86_step(B86Cpu *c)
 {
@@ -592,6 +734,24 @@ B86_HOT int b86_step(B86Cpu *c)
         return B86_OK;
     }
 
+    if (c->model >= B86_CPU_286 && (op == 0x8C || op == 0x8E || op == 0x8D || op == 0xC4 || op == 0xC5 ||
+                                     op == 0x8F || op == 0xC6 || op == 0xC7 || op == 0xFF || op == 0xFE)) {
+        uint8_t m = *b86_host(c, lin(c, B86_CS, s->ip));
+        int mod = m >> 6, reg = (m >> 3) & 7, ud;
+        switch (op) {
+        case 0x8C: ud = reg > 3; break;
+        case 0x8E: ud = reg > 3 || reg == B86_CS; break;
+        case 0x8D: case 0xC4: case 0xC5: ud = mod == 3; break;
+        case 0x8F: case 0xC6: case 0xC7: ud = reg != 0; break;
+        case 0xFE: ud = reg > 1; break;
+        default:   ud = reg == 7 || ((reg == 3 || reg == 5) && mod == 3); break;   /* FF */
+        }
+        if (ud) { c->ip = s->fip0; b86_interrupt(c, 6); return B86_OK; }
+    }
+    if (c->model >= B86_CPU_186) {
+        int r = step186(s, op, w);
+        if (r >= 0) return r;
+    }
     switch (op) {
     case 0x06: case 0x0E: case 0x16: case 0x1E: push(c, (uint16_t)c->seg[op >> 3]); break;
     case 0x07: case 0x0F: case 0x17: case 0x1F: b86_set_seg(c, op >> 3, pop(c)); break;
@@ -605,7 +765,8 @@ B86_HOT int b86_step(B86Cpu *c)
         p16(c, op & 7, (uint16_t)incdec(c, 1, g16(c, op & 7), 1)); break;
     case 0x50: case 0x51: case 0x52: case 0x53: case 0x55: case 0x56: case 0x57:
         push(c, g16(c, op & 7)); break;
-    case 0x54: /* 8086 PUSH SP pushes the decremented value */
+    case 0x54: /* 8086 PUSH SP pushes the decremented value; 286 the old one */
+        if (c->model >= B86_CPU_286) { push(c, (uint16_t)c->r[B86_SP]); break; }
         c->r[B86_SP] = (uint16_t)(c->r[B86_SP] - 2);
         wr16(c, B86_SS, c->r[B86_SP], (uint16_t)c->r[B86_SP]);
         break;
@@ -646,7 +807,7 @@ B86_HOT int b86_step(B86Cpu *c)
         push(c, (uint16_t)c->seg[B86_CS]); push(c, s->ip);
         b86_set_seg(c, B86_CS, cs); s->ip = ip; break; }
     case 0x9B: break;
-    case 0x9C: push(c, (uint16_t)((FL & 0x0FD5u) | 0xF002u)); break;
+    case 0x9C: push(c, (uint16_t)((FL & 0x0FD5u) | (c->model >= B86_CPU_286 ? 0x0002u : 0xF002u))); break;
     case 0x9D: FL = (pop(c) & 0x0FD5u) | 0xF002u; break;
     case 0x9E: FL = (FL & ~0xFFu) | (g8(c, 4) & 0xD5u) | 2u; break;
     case 0x9F: p8(c, 4, (uint8_t)((FL & 0xD5u) | 2u)); break;
@@ -680,12 +841,13 @@ B86_HOT int b86_step(B86Cpu *c)
     case 0xD0: case 0xD1: case 0xD2: case 0xD3: {
         modrm(s);
         unsigned n = (op & 2) ? g8(c, 1) : 1;
+        if (c->model >= B86_CPU_186) n &= 31u;          /* 80186+: count masked to 5 bits */
         uint32_t v = rm_get(s, w);
         uint32_t r = shift(c, s->reg, w, v, n);
         if (n) rm_put(s, w, r);
         break; }
     case 0xD4: { uint8_t b = f8(s), al = g8(c, 0);
-        if (!b) { szp(c, 0, 0); c->ip = s->ip; b86_interrupt(c, 0); return B86_OK; }
+        if (!b) { szp(c, 0, 0); c->ip = DE_IP(s); b86_interrupt(c, 0); return B86_OK; }
         p8(c, 4, al / b); p8(c, 0, al % b); szp(c, 0, al % b); break; }
     case 0xD5: { uint8_t b = f8(s);
         uint32_t r = add_f(c, 0, g8(c, 0), (uint8_t)(g8(c, 4) * b), 0);
@@ -746,7 +908,7 @@ B86_HOT int b86_step(B86Cpu *c)
         case 5: { uint16_t ip = rd16(c, s->ea_seg, s->ea_off), cs = rd16(c, s->ea_seg, (uint16_t)(s->ea_off + 2));
             b86_set_seg(c, B86_CS, cs); s->ip = ip; break; }
         default: /* PUSH r/m; PUSH SP pushes the decremented SP */
-            if (s->mod == 3 && s->rm == B86_SP) {
+            if (s->mod == 3 && s->rm == B86_SP && c->model < B86_CPU_286) {
                 c->r[B86_SP] = (uint16_t)(c->r[B86_SP] - 2);
                 wr16(c, B86_SS, c->r[B86_SP], (uint16_t)c->r[B86_SP]);
             } else push(c, (uint16_t)rm_get(s, 1));

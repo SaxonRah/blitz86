@@ -218,6 +218,7 @@ B86_HOT void be_load_post(Emit *e, int w16, int d, int addr)
     put32(e, (w16 ? 0xF830u : 0xF810u) | (uint32_t)hr(addr), (uint32_t)hr(d) << 12 | 0xB00u | (w16 ? 2u : 1u));
 }
 B86_HOT void be_cmpr(Emit *e, int a, int b) { dp_reg(e, DP_SUB, 1, 15, hr(a), hr(b), 0, 0); }
+B86_HOT void be_shift_imm(Emit *e, int type, int d, int s, unsigned n) { shift_imm(e, 0, hr(d), hr(s), type, n); }
 B86_HOT void be_lsr(Emit *e, int d, int s, unsigned n) { shift_imm(e, 0, hr(d), hr(s), 1, n); }
 B86_HOT void be_cm_byte_idx(Emit *e, int d, int line)
 {

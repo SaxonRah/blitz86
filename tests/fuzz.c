@@ -315,6 +315,35 @@ static void gen_smc_rep(void)
     code[fix] = (uint8_t)target; code[fix + 1] = (uint8_t)(target >> 8);
 }
 
+/* FUZZ_186: 80186 instructions (both CPUs run model 186) */
+static int fuzz186;
+static void gen_186(void)
+{
+    int r = (int)rn(8);
+    switch (rn(7)) {
+    case 0: B(0x60); B(0x40 + rn(8) % 4); B(0x61); break;               /* PUSHA; INC r; POPA */
+    case 1: if (r == B86_SP || !r16_ok(r)) { gen_simple(); break; }
+            if (rn(2)) { B(0x68); W((uint16_t)rnd()); } else { B(0x6A); B((uint8_t)rnd()); }
+            B(0x58 + r); break;                                         /* PUSH imm; POP r */
+    case 2: if (r == B86_SP || !r16_ok(r)) { gen_simple(); break; }     /* IMUL r, r2, imm */
+            B(rn(2) ? 0x69 : 0x6B); B(0xC0 | r << 3 | rn(8));
+            if (code[pc - 2] == 0x69) W((uint16_t)rnd()); else B((uint8_t)rnd()); break;
+    case 3: { int w = (int)rn(2), sub = (int)rn(8);                     /* shift r, imm8 */
+            if (w && (r == B86_SP || !r16_ok(r))) { gen_simple(); break; }
+            if (!w && !r16_ok(r & 3)) { gen_simple(); break; }
+            B(0xC0 | w); B(0xC0 | sub << 3 | r); B((uint8_t)rn(40)); break; }
+    case 4: if (!r16_ok(B86_BP)) { gen_simple(); break; }               /* ENTER n, l ... LEAVE */
+            { unsigned keep = forbid; forbid |= 1u << B86_BP;
+              B(0xC8); W((uint16_t)(rn(8) * 2)); B((uint8_t)rn(4)); gen_simple(); B(0xC9); forbid = keep; } break;
+    case 5: if (fuzz186 >= 2 && r != B86_SP && r16_ok(r)) {           /* 286: SMSW r; PUSH SP; POP r */
+                B(0x0F); B(0x01); B(0xE0 | r); B(0x54); B(0x58 + r); break; }
+            /* fall through */
+    default: if (!r16_ok(B86_CX)) { gen_simple(); break; }              /* shift by CL (masked) */
+            if (r == B86_SP || !r16_ok(r)) { gen_simple(); break; }
+            B(0xD3); B(0xC0 | (4 + rn(2)) << 3 | r); break;
+    }
+}
+
 static void gen_block(int depth, int n)
 {
     for (int i = 0; i < n; ++i) {
@@ -324,6 +353,7 @@ static void gen_block(int depth, int n)
         else if (depth < 3 && k == 2) gen_call();
         else if (k == 3) { if (getenv("FUZZ_SMC_REP") && rn(2)) gen_smc_rep(); else gen_smc(); }
         else if (k == 4 && depth < 3) gen_fwd_branch(depth);
+        else if (fuzz186 && k >= 15) gen_186();
         else gen_simple();
     }
 }
@@ -383,6 +413,8 @@ static void on_alarm(int sig) { (void)sig; if (alarm_cpu) alarm_cpu->irq = 1; }
 int main(int argc, char **argv)
 {
     long iters = argc > 1 ? atol(argv[1]) : 200;
+    fuzz186 = getenv("FUZZ_186") != NULL ? 1 : 0;
+    if (getenv("FUZZ_286")) fuzz186 = 2;
     uint64_t seed0 = argc > 2 ? strtoull(argv[2], 0, 0) : 1;
     void *buf = mmap(NULL, 8 << 20, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     B86Cpu a, b;
@@ -400,6 +432,7 @@ int main(int argc, char **argv)
         /* interpreter */
         memcpy(memA, init_img, B86_MEM_BYTES);
         init_cpu(&a, memA, seed);
+        a.model = (uint32_t)fuzz186;
         static uint8_t aframe[0x20000 + 1] __attribute__((aligned(4096)));
         int amap = getenv("FUZZ_MAP") && b86_map_range(&a, 0x30000, 0x20000, aframe) == 0;
         int ra = b86_run_interp(&a, 3000000);
@@ -409,6 +442,7 @@ int main(int argc, char **argv)
         /* translator */
         memcpy(memB, init_img, B86_MEM_BYTES);
         init_cpu(&b, memB, seed);
+        b.model = (uint32_t)fuzz186;
         b.jit = j; b.codemap = tmp.codemap; b.codemap_host = tmp.codemap_host;
         b.fast = tmp.fast; b.smc_hook = tmp.smc_hook;
         /* the JIT keeps its cpu pointer; copy state into it */

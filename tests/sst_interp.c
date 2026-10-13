@@ -3,6 +3,7 @@
 #include "b86.h"
 #include "sst.h"
 #include <string.h>
+#include <stdlib.h>
 
 static uint8_t mem[B86_MEM_BYTES];
 
@@ -16,7 +17,8 @@ int main(int argc, char **argv)
     B86Cpu c;
     while (sst_read(f, &t)) {
         b86_init(&c, mem);
-        c.amask = 0xFFFFF; c.exact_wrap = 1;
+        c.amask = getenv("SST_A20") ? 0x1FFFFF : 0xFFFFF; c.exact_wrap = 1;
+        if (getenv("SST_MODEL")) c.model = (uint32_t)atoi(getenv("SST_MODEL"));
         for (int i = 0; i < t.ni; ++i) mem[t.ri[i].a] = t.ri[i].v;
         static const int map[14] = { B86_AX, B86_BX, B86_CX, B86_DX, -1, -1, -1, -1, B86_SP, B86_BP, B86_SI, B86_DI, -1, -1 };
         for (int i = 0; i < 14; ++i) if (map[i] >= 0) c.r[map[i]] = t.init[i];
@@ -34,7 +36,11 @@ int main(int argc, char **argv)
         for (int i = 0; i < t.nf; ++i) {
             int ign = 0;
             for (int g = 0; g < t.ng; ++g) if (t.ign[g] == t.rf[i].a) ign = 1;
-            if (!ign && mem[t.rf[i].a] != t.rf[i].v) ok = 0;
+            if (!ign && mem[t.rf[i].a] != t.rf[i].v) {
+                ok = 0;
+                if (getenv("SST_VERBOSE") && fails[t.op * 9 + (t.reg == 0xFF ? 8 : t.reg)] < 2)
+                    printf("  mem[%05X]=%02X exp %02X\n", (unsigned)t.rf[i].a, mem[t.rf[i].a], t.rf[i].v);
+            }
         }
         unsigned key = t.op * 9 + (t.reg == 0xFF ? 8 : t.reg);
         total[key]++;

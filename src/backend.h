@@ -104,6 +104,7 @@ void be_cm_byte(Emit *e, int d, int addr);           /* d = SMC code-map byte fo
 void be_cm_byte_idx(Emit *e, int d, int line);       /* d = code-map byte for line index (addr >> 6) */
 void be_load_post(Emit *e, int w16, int d, int addr);  /* LDR(B|H) d, [addr], #1|2 */
 void be_lsr(Emit *e, int d, int s, unsigned n);
+void be_shift_imm(Emit *e, int type, int d, int s, unsigned n);   /* type 0 LSL, 1 LSR, 2 ASR; n 1..31 */
 void be_cmpr(Emit *e, int a, int b);                 /* CMP a, b */
 void be_store_off(Emit *e, int w16, int v, int addr, uint32_t off);   /* STR(B|H) v, [addr, #off] */
 void be_load_off(Emit *e, int w16, int d, int addr, uint32_t off);

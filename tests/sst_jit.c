@@ -1,3 +1,4 @@
+#include <stdlib.h>
 /* Run SingleStepTests 8086 hardware vectors through the translator, one
    instruction per block, and compare with silicon.  Vectors whose result
    depends on 1 MiB / in-segment wrap (which the JIT's A20-on model does not
@@ -73,6 +74,7 @@ int main(int argc, char **argv)
     unsigned long n = 0, bad = 0, wrap = 0;
     B86Cpu c;
     b86_init(&c, mem);
+    if (getenv("SST_MODEL")) c.model = (uint32_t)atoi(getenv("SST_MODEL"));
     struct B86Jit *j = b86_jit_create(&c, code, 4 << 20);
     b86_jit_set_single_step(j, 1);
     while (sst_read(f, &t)) {
