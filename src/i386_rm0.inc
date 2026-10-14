@@ -1,38 +1,39 @@
+/* BB_386_RM2_FLASH_SRAM_V1: force every 386-only handler to XIP flash. */
 /* blitz86 386 real-mode milestone 0.  Included once by interp.c after the
    existing 8086/186 helpers.  No JIT-generated 32-bit code is used yet.
    Address-size remains 16 bits; 67h is deliberately unsupported. */
 
-B86_COLD static uint32_t b86_rm0_f32(St *s)
+static __attribute__((noinline, cold, section(".text.bb386_flash"))) uint32_t b86_rm0_f32(St *s)
 {
     uint32_t lo = f16(s);
     return lo | ((uint32_t)f16(s) << 16);
 }
-B86_COLD static uint32_t b86_rm0_rd32(B86Cpu *c, int seg, uint16_t off)
+static __attribute__((noinline, cold, section(".text.bb386_flash"))) uint32_t b86_rm0_rd32(B86Cpu *c, int seg, uint16_t off)
 {
     uint32_t lo = rd16(c, seg, off);
     return lo | ((uint32_t)rd16(c, seg, (uint16_t)(off + 2u)) << 16);
 }
-B86_COLD static void b86_rm0_wr32(B86Cpu *c, int seg, uint16_t off, uint32_t v)
+static __attribute__((noinline, cold, section(".text.bb386_flash"))) void b86_rm0_wr32(B86Cpu *c, int seg, uint16_t off, uint32_t v)
 {
     wr16(c, seg, off, (uint16_t)v);
     wr16(c, seg, (uint16_t)(off + 2u), (uint16_t)(v >> 16));
 }
-B86_COLD static uint32_t b86_rm0_rmget(St *s)
+static __attribute__((noinline, cold, section(".text.bb386_flash"))) uint32_t b86_rm0_rmget(St *s)
 {
     return s->mod == 3 ? s->c->r[s->rm] : b86_rm0_rd32(s->c, s->ea_seg, s->ea_off);
 }
-B86_COLD static void b86_rm0_rmput(St *s, uint32_t v)
+static __attribute__((noinline, cold, section(".text.bb386_flash"))) void b86_rm0_rmput(St *s, uint32_t v)
 {
     if (s->mod == 3) s->c->r[s->rm] = v;
     else b86_rm0_wr32(s->c, s->ea_seg, s->ea_off, v);
 }
-B86_COLD static void b86_rm0_push(B86Cpu *c, uint32_t v)
+static __attribute__((noinline, cold, section(".text.bb386_flash"))) void b86_rm0_push(B86Cpu *c, uint32_t v)
 {
     uint16_t sp = (uint16_t)(c->r[B86_SP] - 4u);
     c->r[B86_SP] = (c->r[B86_SP] & 0xFFFF0000u) | sp;
     b86_rm0_wr32(c, B86_SS, sp, v);
 }
-B86_COLD static uint32_t b86_rm0_pop(B86Cpu *c)
+static __attribute__((noinline, cold, section(".text.bb386_flash"))) uint32_t b86_rm0_pop(B86Cpu *c)
 {
     uint16_t sp = (uint16_t)c->r[B86_SP];
     uint32_t value = b86_rm0_rd32(c, B86_SS, sp);
@@ -42,7 +43,7 @@ B86_COLD static uint32_t b86_rm0_pop(B86Cpu *c)
 /* 386 EFLAGS OSZAPC.  64-bit temporaries are confined to this cold flash
    routine.  The unchanged 8086/286 lazy record engine is never used for a
    32-bit operation (b86_step already materializes pending records). */
-B86_COLD static uint32_t b86_rm0_alu(B86Cpu *c, int kind, uint32_t a, uint32_t b)
+static __attribute__((noinline, cold, section(".text.bb386_flash"))) uint32_t b86_rm0_alu(B86Cpu *c, int kind, uint32_t a, uint32_t b)
 {
     uint32_t r = 0, f = 0;
     uint32_t cin = (kind == 2 || kind == 3) && (c->flags & B86_CF) ? 1u : 0u;
@@ -71,7 +72,7 @@ B86_COLD static uint32_t b86_rm0_alu(B86Cpu *c, int kind, uint32_t a, uint32_t b
     return r;
 }
 
-B86_COLD static int b86_rm0_66(St *s, uint8_t op)
+static __attribute__((noinline, cold, section(".text.bb386_flash"))) int b86_rm0_66(St *s, uint8_t op)
 {
     B86Cpu *c = s->c;
     uint32_t a, b, result;

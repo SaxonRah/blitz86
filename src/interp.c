@@ -534,7 +534,7 @@ B86_HOT static int group3(St *s, int w)
 /* BCD                                                                      */
 /* ------------------------------------------------------------------------ */
 
-B86_HOT static void daa_das(B86Cpu *c, int sub)
+static __attribute__((noinline, cold, section(".text.bb386_flash"))) void daa_das(B86Cpu *c, int sub)
 {
     uint8_t al = g8(c, 0), old = al;
     int oaf = (FL & B86_AF) != 0, ocf = (FL & B86_CF) != 0, af = 0, cf = 0;
@@ -548,7 +548,7 @@ B86_HOT static void daa_das(B86Cpu *c, int sub)
     szp(c, 0, al);
 }
 
-B86_HOT static void aaa_aas(B86Cpu *c, int sub)
+static __attribute__((noinline, cold, section(".text.bb386_flash"))) void aaa_aas(B86Cpu *c, int sub)
 {
     uint8_t al = g8(c, 0), ah = g8(c, 4);
     if ((al & 0x0F) > 9 || (FL & B86_AF)) {
@@ -569,7 +569,7 @@ B86_HOT static void aaa_aas(B86Cpu *c, int sub)
 
 /* 80286 real mode: 0F xx. Protected-mode-only forms (and LMSW setting PE,
    which this emulator does not support) raise #UD (INT 6). */
-B86_HOT static int step0f(St *s)
+static __attribute__((noinline, cold, section(".text.bb386_flash"))) int step0f(St *s)
 {
     B86Cpu *c = s->c;
     uint8_t op2 = f8(s);
@@ -700,7 +700,15 @@ B86_HOT static int step186(St *s, uint8_t op, int w)
 /* BB_386_RM0_V1: 386 66h operand path stays in flash. */
 #include "i386_rm0.inc"
 /* BB_386_RM1_V1: 67h address-size interpreter, flash only. */
+/* BB_386_RM3_V1: forward selector accessor for RM1 memory helpers. */
+static uint32_t b86_rm3_segvalue(B86Cpu *c, int which);
 #include "i386_rm1.inc"
+/* BB_386_RM2_V1: 80386 real-mode extended 0F decoder, flash-only. */
+#include "i386_rm2.inc"
+/* BB_386_RM3_V1: FS/GS and 32-bit near flow, XIP flash. */
+#include "i386_rm3.inc"
+/* BB_386_PM0_V1: GDT descriptor helpers in flash, no PE switch. */
+#include "i386_pm0.inc"
 
 B86_HOT static int b86_step_internal(B86Cpu *c)
 {
@@ -721,6 +729,9 @@ B86_HOT static int b86_step_internal(B86Cpu *c)
         op = f8(s);
         if (c->model >= B86_CPU_386 && op == 0x66) { operand32 = 1; continue; }
         if (c->model >= B86_CPU_386 && op == 0x67) { address32 = 1; continue; }
+        if (c->model >= B86_CPU_386 && (op == 0x64 || op == 0x65)) {
+            s->seg = op == 0x64 ? B86_FS : B86_GS; continue;
+        }
         if (op == 0x26 || op == 0x2E || op == 0x36 || op == 0x3E) { s->seg = (op >> 3) & 3; continue; }
         if (op == 0xF2 || op == 0xF3) { s->rep = op; continue; }
         if (op == 0xF0 || op == 0xF1) continue;
@@ -730,6 +741,16 @@ B86_HOT static int b86_step_internal(B86Cpu *c)
     c->icount++;
     int w = op & 1;
     if (c->model >= B86_CPU_386) {
+        /* BB_386_RM3_V1: intercept only new 386 encodings. */
+        { int r3 = b86_rm3_dispatch(s, op, operand32, address32);
+          if (r3 >= 0) return r3; }
+        /* RM2: 386-only 0F opcodes. The 286 0F 01/06 cases stay on
+           their existing descriptor/MSW/CLTS interpreter path. */
+        if (op == 0x0F) {
+            uint8_t op2 = rd8(c, B86_CS, s->ip);
+            if (op2 != 0x01 && op2 != 0x06)
+                return b86_rm2_0f(s, operand32, address32);
+        }
         if (address32) return b86_rm1_67(s, op, operand32); /* 67h with optional 66h */
         if (op == 0x63 || op == 0x64 || op == 0x65 ||
             (op == 0x0F && !operand32 &&
@@ -942,9 +963,9 @@ B86_HOT static int b86_step_internal(B86Cpu *c)
    upper halves of EAX..EDI, even when the legacy 286 interpreter assigns
    directly to 16-bit register slots.  The wrapper is never used by 286.
    A 66h instruction writes the entire 32-bit destination, so skip merge. */
-B86_HOT int b86_step(B86Cpu *c)
+/* BB_386_RM2_FLASH_SRAM_V1: 386-only upper-register preservation in XIP flash. */
+static __attribute__((noinline, cold, section(".text.bb386_flash"))) int b86_386_step_flash(B86Cpu *c)
 {
-    if (c->model < B86_CPU_386) return b86_step_internal(c);
     uint32_t hi[8];
     for (unsigned i = 0; i < 8; ++i) hi[i] = c->r[i] & 0xFFFF0000u;
     uint16_t ip = (uint16_t)c->ip;
@@ -952,7 +973,7 @@ B86_HOT int b86_step(B86Cpu *c)
     for (unsigned k = 0; k < 15; ++k) {
         uint8_t op = rd8(c, B86_CS, ip++);
         if (op == 0x66) { operand32 = 1; continue; }
-        if (op == 0x67 || op == 0x26 || op == 0x2E || op == 0x36 ||
+        if (op == 0x67 || op == 0x64 || op == 0x65 || op == 0x26 || op == 0x2E || op == 0x36 ||
             op == 0x3E || op == 0xF0 || op == 0xF1 || op == 0xF2 || op == 0xF3)
             continue;
         break;
@@ -960,6 +981,12 @@ B86_HOT int b86_step(B86Cpu *c)
     int rc = b86_step_internal(c);
     if (!operand32) for (unsigned i = 0; i < 8; ++i) c->r[i] = (c->r[i] & 0xFFFFu) | hi[i];
     return rc;
+}
+
+B86_HOT int b86_step(B86Cpu *c)
+{
+    if (c->model < B86_CPU_386) return b86_step_internal(c);
+    return b86_386_step_flash(c);
 }
 
 B86_HOT int b86_run_interp(B86Cpu *c, uint64_t max)

@@ -39,6 +39,8 @@ extern "C" {
 
 enum { B86_AX, B86_CX, B86_DX, B86_BX, B86_SP, B86_BP, B86_SI, B86_DI };
 enum { B86_ES, B86_CS, B86_SS, B86_DS };
+/* BB_386_RM3_V1: extra segment selectors; do not renumber the native four. */
+enum { B86_FS = 4, B86_GS = 5 };
 
 enum {
     B86_CF = 0x0001, B86_PF = 0x0004, B86_AF = 0x0010, B86_ZF = 0x0040,
@@ -143,6 +145,8 @@ typedef struct B86Cpu {
        last cleared it: a cheap signal for which pages to move to SRAM */
     uint32_t rep_page_bytes[B86_MEM_BYTES >> 12];
 #endif
+    /* BB_386_RM3_V1: appended only; old generated-code offsets unchanged. */
+    uint16_t seg386[2];   /* FS and GS selectors, real mode */
 } B86Cpu;
 
 /* Host pointer for a guest linear address (honours mapped pages). */

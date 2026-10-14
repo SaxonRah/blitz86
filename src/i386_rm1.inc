@@ -1,3 +1,5 @@
+/* BB_386_RM3_V1: FS/GS-compatible real-mode segment-value lookup. */
+/* BB_386_RM2_FLASH_SRAM_V1: force every 386-only handler to XIP flash. */
 /* BB_386_RM1_V1 - 80386 real-mode 67h addressing.
  * Interpreter-only, flash resident (B86_COLD). No new CPU/JIT state.
  * The legacy 8086/186/286 ModR/M, JIT, and memory implementations are unchanged.
@@ -15,14 +17,14 @@ typedef struct B86RM1EA {
     int seg;
 } B86RM1EA;
 
-B86_COLD static uint32_t b86_rm1_f32(St *s)
+static __attribute__((noinline, cold, section(".text.bb386_flash"))) uint32_t b86_rm1_f32(St *s)
 {
     uint32_t lo = f16(s);
     return lo | (uint32_t)f16(s) << 16;
 }
 
 /* Returns -1 for a register form, 0 for successfully decoded memory. */
-B86_COLD static int b86_rm1_ea(St *s, B86RM1EA *m)
+static __attribute__((noinline, cold, section(".text.bb386_flash"))) int b86_rm1_ea(St *s, B86RM1EA *m)
 {
     B86Cpu *c = s->c;
     uint8_t b = f8(s);
@@ -59,56 +61,56 @@ B86_COLD static int b86_rm1_ea(St *s, B86RM1EA *m)
 
 /* Byte-granular accesses avoid host-unaligned loads and respect page mapping,
  * A20 and SMC. All bounds are checked before the first byte is modified. */
-B86_COLD static int b86_rm1_memok(const B86RM1EA *m, unsigned bytes)
+static __attribute__((noinline, cold, section(".text.bb386_flash"))) int b86_rm1_memok(const B86RM1EA *m, unsigned bytes)
 {
     return m->mod != 3 && m->off <= 0xFFFFu &&
            bytes >= 1 && bytes <= 4 && m->off <= 0x10000u - bytes;
 }
-B86_COLD static uint32_t b86_rm1_read(B86Cpu *c, const B86RM1EA *m, unsigned bytes)
+static __attribute__((noinline, cold, section(".text.bb386_flash"))) uint32_t b86_rm1_read(B86Cpu *c, const B86RM1EA *m, unsigned bytes)
 {
     uint32_t r = 0;
     for (unsigned i = 0; i < bytes; ++i) {
-        uint32_t a = ((c->seg[m->seg] << 4) + m->off + i) & c->amask;
+        uint32_t a = ((b86_rm3_segvalue(c, m->seg) << 4) + m->off + i) & c->amask;
         r |= (uint32_t)*b86_host(c, a) << (8u * i);
     }
     return r;
 }
-B86_COLD static void b86_rm1_write(B86Cpu *c, const B86RM1EA *m, unsigned bytes, uint32_t v)
+static __attribute__((noinline, cold, section(".text.bb386_flash"))) void b86_rm1_write(B86Cpu *c, const B86RM1EA *m, unsigned bytes, uint32_t v)
 {
     for (unsigned i = 0; i < bytes; ++i) {
-        uint32_t a = ((c->seg[m->seg] << 4) + m->off + i) & c->amask;
+        uint32_t a = ((b86_rm3_segvalue(c, m->seg) << 4) + m->off + i) & c->amask;
         *b86_host(c, a) = (uint8_t)(v >> (i * 8u));
         smc(c, a, 1);
     }
 }
 /* Width 0/1/2 means 8/16/32. Unlike the old 16-bit setters these always
  * retain upper halves on byte/word writes, even with a redundant 66h prefix. */
-B86_COLD static uint32_t b86_rm1_regget(B86Cpu *c, unsigned reg, unsigned width)
+static __attribute__((noinline, cold, section(".text.bb386_flash"))) uint32_t b86_rm1_regget(B86Cpu *c, unsigned reg, unsigned width)
 {
     if (width == 2) return c->r[reg];
     if (width == 1) return c->r[reg] & 0xFFFFu;
     return reg < 4 ? c->r[reg] & 255u : (c->r[reg - 4] >> 8) & 255u;
 }
-B86_COLD static void b86_rm1_regput(B86Cpu *c, unsigned reg, unsigned width, uint32_t v)
+static __attribute__((noinline, cold, section(".text.bb386_flash"))) void b86_rm1_regput(B86Cpu *c, unsigned reg, unsigned width, uint32_t v)
 {
     if (width == 2) c->r[reg] = v;
     else if (width == 1) c->r[reg] = (c->r[reg] & 0xFFFF0000u) | (v & 0xFFFFu);
     else if (reg < 4) c->r[reg] = (c->r[reg] & 0xFFFFFF00u) | (v & 255u);
     else c->r[reg - 4] = (c->r[reg - 4] & 0xFFFF00FFu) | ((v & 255u) << 8);
 }
-B86_COLD static uint32_t b86_rm1_rmget(B86Cpu *c, const B86RM1EA *m, unsigned width)
+static __attribute__((noinline, cold, section(".text.bb386_flash"))) uint32_t b86_rm1_rmget(B86Cpu *c, const B86RM1EA *m, unsigned width)
 {
     return m->mod == 3 ? b86_rm1_regget(c, m->rm, width)
                        : b86_rm1_read(c, m, 1u << width);
 }
-B86_COLD static void b86_rm1_rmput(B86Cpu *c, const B86RM1EA *m, unsigned width, uint32_t v)
+static __attribute__((noinline, cold, section(".text.bb386_flash"))) void b86_rm1_rmput(B86Cpu *c, const B86RM1EA *m, unsigned width, uint32_t v)
 {
     if (m->mod == 3) b86_rm1_regput(c, m->rm, width, v);
     else b86_rm1_write(c, m, 1u << width, v);
 }
 /* Use the existing 8086 flag ALU for byte/word, and RM0 32-bit flag ALU
  * for DWORD. Neither allocates new state or changes the 286/JIT path. */
-B86_COLD static uint32_t b86_rm1_alu(B86Cpu *c, unsigned width,
+static __attribute__((noinline, cold, section(".text.bb386_flash"))) uint32_t b86_rm1_alu(B86Cpu *c, unsigned width,
                                       unsigned kind, uint32_t a, uint32_t b)
 {
     return width == 2 ? b86_rm0_alu(c, kind, a, b)
@@ -117,7 +119,7 @@ B86_COLD static uint32_t b86_rm1_alu(B86Cpu *c, unsigned width,
 
 /* 67h changes only effective address calculation and moffs width, not the
  * default 16-bit operand size of real mode. It has no JIT lowering yet. */
-B86_COLD static int b86_rm1_67(St *s, uint8_t op, int operand32)
+static __attribute__((noinline, cold, section(".text.bb386_flash"))) int b86_rm1_67(St *s, uint8_t op, int operand32)
 {
     B86Cpu *c = s->c;
     B86RM1EA m;
