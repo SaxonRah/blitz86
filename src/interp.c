@@ -97,6 +97,10 @@ B86_HOT void b86_flags_materialize(B86Cpu *c)
 B86_HOT uint16_t b86_get_flags(B86Cpu *c)
 {
     b86_flags_materialize(c);
+    /* Stage 5C1: real-mode 386 FLAGS has IOPL and NT as well as the
+     * 8086 arithmetic and control bits. Earlier CPU models are unchanged. */
+    if (c->model >= B86_CPU_386)
+        return (uint16_t)((c->flags & 0x7FD5u) | 0x0002u);
     return (uint16_t)((c->flags & 0x0FD5u) | (c->model >= B86_CPU_286 ? 0x0002u : 0xF002u));
 }
 
@@ -104,6 +108,10 @@ B86_HOT void b86_set_flags(B86Cpu *c, uint16_t f)
 {
     c->lz_kind = LZ_NONE;
     c->lz_ikind = LZ_NONE;
+    if (c->model >= B86_CPU_386) {
+        c->flags = (c->flags & 0xFFFF0000u) | (f & 0x7FD5u) | 0x0002u;
+        return;
+    }
     c->flags = (f & 0x0FD5u) | 0xF002u;
 }
 
