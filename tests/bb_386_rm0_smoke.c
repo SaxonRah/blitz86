@@ -102,7 +102,10 @@ int main(void)
 
     static const uint8_t unsupported66[] = {0x66,0x0F,0xB6,0xC0};
     start(unsupported66, sizeof unsupported66, B86_CPU_386);
-    chk("missing 386 op explicit status", b86_step(&cpu), B86_UNSUPPORTED);
+    cpu.r[B86_AX] = 0x89ABCDEFu;
+    chk("MOVZX EAX,AL status", b86_step(&cpu), B86_OK);
+    chk("MOVZX EAX,AL result", cpu.r[B86_AX], 0x000000EFu);
+    chk("MOVZX instruction length", cpu.ip, 4u);
 
     static const uint8_t old[] = {0xB8,0x34,0x12};
     start(old, sizeof old, B86_CPU_286);

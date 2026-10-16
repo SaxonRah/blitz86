@@ -238,6 +238,14 @@ void     b86_jit_set_count_retired(struct B86Jit *j, int on);
 /* Optional shadow (B86_MEM_BYTES) of translated guest bytes; enables
    byte-exact b86_jit_sync_external. Set before translating anything. */
 void     b86_jit_set_shadow(struct B86Jit *j, uint8_t *shadow);
+/* B86_SPARSE_SHADOW_V1: optional, bounded PSRAM snapshots of translated
+   64-byte guest lines. index has B86_LINES zero-initialized uint16_t entries;
+   slot_storage has slot_count * (1u << B86_LINE_SHIFT) bytes. The JIT clears
+   index on attachment; storage is caller-owned. A full pool conservatively
+   invalidates unsnapshotted code lines, never executes stale translations.
+   Configure before translating any code, not during guest execution. */
+void     b86_jit_set_sparse_shadow(struct B86Jit *j, uint16_t *index,
+                                   uint8_t *slot_storage, uint32_t slot_count);
 /* Memory in [lin, lin+len) may have been written by someone else: kill only
    translations whose bytes actually changed. Returns lines that differed. */
 uint32_t b86_jit_sync_external(struct B86Jit *j, uint32_t lin, uint32_t len);

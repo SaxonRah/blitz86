@@ -258,7 +258,11 @@ typedef struct B86Jit {
     uint8_t *heat;              /* cold entries: decayed execution count */
     unsigned hot_threshold;     /* translate an entry after this many runs (0: at once) */
     uint32_t heat_ticks;        /* cold dispatches since the last decay  */
-    uint8_t *shadow;            /* optional copy of translated guest bytes */
+    uint8_t *shadow;            /* optional dense copy of translated guest bytes */
+    /* B86_SPARSE_SHADOW_V1: 1-based uint16 slot ID per guest 64-byte line. */
+    uint16_t *shadow_line_ids;
+    uint8_t *shadow_lines;
+    uint32_t shadow_slots, shadow_used, shadow_reclaim;
     uint8_t *dead;              /* per block: killed (SRAM mirror of blk[].dead) */
     struct RetMeta *rm;         /* RET sites carrying deferred flag records */
     uint32_t nrm;
@@ -533,7 +537,7 @@ B86_HOT static void classify(Insn *d)
         d->fuse = (d->reg == 2 || d->reg == 3) ? B86_CF : 0;
         d->fdef = d->reg < 4 ? (B86_CF | B86_OF) : ALLF;
         d->native = (d->reg == 4 || d->reg == 5 || d->reg == 7) ||
-                    (B86_RCX_MEM1 && memop && (d->reg == 2 || d->reg == 3)) ||
+                    (B86_RCX_MEM1 && !be_has_t2 && memop && (d->reg == 2 || d->reg == 3)) ||
                     (d->reg < 4 && d->mod == 3 && (d->w || d->rm < 4));   /* ROL/ROR/RCL/RCR r,1 */
         if (d->reg < 4) d->nzclob = 1;
         return;
@@ -2032,7 +2036,7 @@ B86_COLD static int lower(Tx *t, Insn *d)
            Preserve existing 8086 flags: these rotates define CF and OF
            only; ZF/SF/PF/AF must not be overwritten by the ARM operation.
            We deliberately do NOT fuse NZCV across the checked memory store. */
-        if ((d->reg == 2 || d->reg == 3) && d->mod != 3) {
+        if (!be_has_t2 && (d->reg == 2 || d->reg == 3) && d->mod != 3) {
             const unsigned bits = w ? 16u : 8u;
             const unsigned pad = 32u - bits;
             /* Fold any earlier lazy ZF/SF/PF/CF records BEFORE updating the
@@ -2269,7 +2273,10 @@ B86_COLD static int lower(Tx *t, Insn *d)
         DeferInfo op_, oq_;
         int sp_used = (pa && defer_info(&t->v[P], &op_) && (defer_regs(&op_) & (1u << B86_SP))) ||
                       (qa && defer_info(&t->v[Q], &oq_) && (defer_regs(&oq_) & (1u << B86_SP)));
-        if (!(pa || qa) || sp_used || t->j->nrm >= RMN) {
+        /* Thumb-2: materialize pending records at RET, then use the normal
+           direct RET cache. The virtual-prefix specialized RET continuation
+           is currently incorrect on T2; do not force every RET through C. */
+        if (!(pa || qa) || sp_used || t->j->nrm >= RMN || !be_has_t2) {
             emit_deferred(t, t->cur - 1, d->live);
             be_ea(e, V_T0, B86_SS, B86_SP, -1, 0);
             be_load(e, 1, V_T0, V_T0);
@@ -2724,6 +2731,61 @@ B86_HOT static void evict_make_room(J *j)
 /* Translation                                                              */
 /* ------------------------------------------------------------------------ */
 
+/* B86_SPARSE_SHADOW_V1: capture code bytes only as lines enter the JIT.
+   New slots snapshot the entire 64-byte line to avoid false comparisons
+   when a translation covers only part of a line. Existing slots refresh
+   precisely the translated byte range, matching the original dense shadow.
+   Pool exhaustion is safe: unsnapshotted lines invalidate conservatively. */
+B86_COLD static void b86_shadow_capture(J *j, const uint8_t *mem,
+                                        uint32_t lo, uint32_t hi)
+{
+    if (j->shadow) {
+        memcpy(j->shadow + lo, mem + lo, hi - lo);
+        return;
+    }
+    if (!j->shadow_line_ids) return;
+    while (lo < hi) {
+        const uint32_t line = lo >> B86_LINE_SHIFT;
+        const uint32_t base = line << B86_LINE_SHIFT;
+        uint32_t next = base + (1u << B86_LINE_SHIFT);
+        if (next > hi) next = hi;
+        uint16_t id = j->shadow_line_ids[line];
+        if (!id) {
+            if (j->shadow_used < j->shadow_slots) {
+                id = (uint16_t)(++j->shadow_used);
+            } else {
+                /* Recycle snapshots only after their guest line has no live
+                   translations. Bound the scan to keep translation latency
+                   predictable; missing a victim is safe (slow invalidation). */
+                for (uint32_t scan = 0; scan < 256u; ++scan) {
+                    uint32_t victim = (j->shadow_reclaim + scan) % B86_LINES;
+                    if (j->shadow_line_ids[victim] && !j->codemap[victim]) {
+                        id = j->shadow_line_ids[victim];
+                        j->shadow_line_ids[victim] = 0;
+                        j->shadow_reclaim = victim + 1u;
+                        if (j->shadow_reclaim >= B86_LINES) j->shadow_reclaim = 0;
+                        break;
+                    }
+                }
+                if (!id) {
+                    j->shadow_reclaim = (j->shadow_reclaim + 256u) % B86_LINES;
+                }
+            }
+            if (id) {
+                j->shadow_line_ids[line] = id;
+                uint32_t n = (1u << B86_LINE_SHIFT);
+                if (base + n > B86_MEM_BYTES) n = B86_MEM_BYTES - base;
+                memcpy(j->shadow_lines + (((size_t)id - 1u) << B86_LINE_SHIFT),
+                       mem + base, n);
+            }
+        } else {
+            memcpy(j->shadow_lines + (((size_t)id - 1u) << B86_LINE_SHIFT) + lo - base,
+                   mem + lo, next - lo);
+        }
+        lo = next;
+    }
+}
+
 static Block *translate_ex(J *j, uint32_t cs, uint16_t ip, const Insn *pre, int npre);
 
 /* A new entry point inside a live block's instructions: kill that block so
@@ -3004,7 +3066,7 @@ B86_COLD static Block *translate_ex(J *j, uint32_t cs, uint16_t ip, const Insn *
         j->pg_head[pg] = (idx + 1) | ((uint32_t)r << 28);
         for (uint32_t l = lo >> B86_LINE_SHIFT; l <= (hi - 1) >> B86_LINE_SHIFT; ++l)
             if (j->codemap[l] != 255) j->codemap[l]++;
-        if (j->shadow) memcpy(j->shadow + lo, c->mem + lo, hi - lo);
+        b86_shadow_capture(j, c->mem, lo, hi);
         if (c->code_hook) c->code_hook(c, lo, hi - lo);
     }
     if (!npre) bbdiag_translate(b->key);
@@ -3502,29 +3564,60 @@ B86_HOT void b86_jit_set_hot_threshold(J *j, unsigned n) { j->hot_threshold = n 
 B86_HOT void b86_jit_set_count_retired(J *j, int on) { j->e.count_ret = on; }
 B86_HOT void b86_jit_invalidate(J *j, uint32_t lin, uint32_t len) { if (len) invalidate(j, lin, lin + len); }
 
-B86_HOT void b86_jit_set_shadow(J *j, uint8_t *shadow) { j->shadow = shadow; }
+B86_HOT void b86_jit_set_shadow(J *j, uint8_t *shadow)
+{
+    j->shadow_line_ids = NULL;
+    j->shadow_lines = NULL;
+    j->shadow_slots = j->shadow_used = j->shadow_reclaim = 0;
+    j->shadow = shadow;
+}
 
-/* Someone else may have written [lin, lin+len). Compare only the 64-byte
-   lines that hold translated code against the shadow and invalidate exactly
-   the bytes that differ, so data stored next to code kills nothing. Without
-   a shadow this falls back to invalidating the whole range. */
+/* B86_SPARSE_SHADOW_V1: caller-owned PSRAM, no allocations in the hot path.
+   Must be installed before the first block is translated. */
+void b86_jit_set_sparse_shadow(J *j, uint16_t *index,
+                               uint8_t *slot_storage, uint32_t slot_count)
+{
+    j->shadow = NULL;
+    j->shadow_line_ids = index && slot_storage && slot_count ? index : NULL;
+    j->shadow_lines = j->shadow_line_ids ? slot_storage : NULL;
+    j->shadow_slots = slot_count > 65535u ? 65535u : slot_count;
+    j->shadow_used = j->shadow_reclaim = 0;
+    if (j->shadow_line_ids) memset(j->shadow_line_ids, 0, B86_LINES * sizeof(uint16_t));
+}
+
+/* Compare only translated 64-byte lines against their exact snapshots.
+   If a sparse snapshot slot could not be allocated, conservatively kill all
+   blocks dependent on that line: correctness is not capacity-dependent. */
 B86_HOT uint32_t b86_jit_sync_external(J *j, uint32_t lin, uint32_t len)
 {
     uint32_t killed = 0;
     if (!len) return 0;
-    if (!j->shadow) { invalidate(j, lin, lin + len); return 1; }
+    if (!j->shadow && !j->shadow_line_ids) {
+        invalidate(j, lin, lin + len);
+        return 1;
+    }
     const uint8_t *mem = j->cpu->mem;
     uint32_t l0 = lin >> B86_LINE_SHIFT, l1 = (lin + len - 1) >> B86_LINE_SHIFT;
     for (uint32_t l = l0; l <= l1 && l < B86_LINES; ++l) {
         if (!j->codemap[l]) continue;
         uint32_t base = l << B86_LINE_SHIFT, n = 1u << B86_LINE_SHIFT;
         if (base + n > B86_MEM_BYTES) n = B86_MEM_BYTES - base;
-        if (!memcmp(mem + base, j->shadow + base, n)) continue;
+        const uint8_t *saved = j->shadow ? j->shadow + base : NULL;
+        if (!saved) {
+            uint16_t id = j->shadow_line_ids[l];
+            if (!id) {
+                invalidate(j, base, base + n);
+                ++killed;
+                continue;
+            }
+            saved = j->shadow_lines + (((size_t)id - 1u) << B86_LINE_SHIFT);
+        }
+        if (!memcmp(mem + base, saved, n)) continue;
         uint32_t a = 0, b = n;
-        while (mem[base + a] == j->shadow[base + a]) ++a;
-        while (mem[base + b - 1] == j->shadow[base + b - 1]) --b;
+        while (mem[base + a] == saved[a]) ++a;
+        while (mem[base + b - 1] == saved[b - 1]) --b;
         invalidate(j, base + a, base + b);
-        memcpy(j->shadow + base, mem + base, n);
+        memcpy((uint8_t *)saved, mem + base, n);
         ++killed;
     }
     return killed;

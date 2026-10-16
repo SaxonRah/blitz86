@@ -38,7 +38,7 @@ static __attribute__((noinline, cold, section(".text.bb386_flash"))) unsigned b8
  * the quotient uses mathematical floor (C / rounds negative toward zero).
  * An imm8 bit offset is unsigned.  In registers both forms are masked. */
 static __attribute__((noinline, cold, section(".text.bb386_flash"))) int b86_rm2_bitpos(B86RM1EA *ea, unsigned width,
-                                   uint32_t index, int signed_index)
+                                   uint32_t index, int signed_index, int address32)
 {
     unsigned bits = width == 2 ? 32u : 16u;
     unsigned bytes = width == 2 ? 4u : 2u;
@@ -48,18 +48,19 @@ static __attribute__((noinline, cold, section(".text.bb386_flash"))) int b86_rm2
         int64_t ix = width == 2 ? (int32_t)index : (int16_t)index;
         shift = ix / (int64_t)bits;
         if (ix < 0 && ix % bits) --shift;
-    } else shift = (uint8_t)index / bits;
+    } else shift = 0; /* imm8 high bits ignored by 386 hardware */
     ea->off = (uint32_t)(ea->off + shift * bytes);
+    if (!address32) ea->off &= 0xFFFFu; /* 16-bit EA wraps */
     return b86_rm1_memok(ea, bytes);
 }
 
 static __attribute__((noinline, cold, section(".text.bb386_flash"))) int b86_rm2_bit(B86Cpu *c, const B86RM1EA *arg,
                                unsigned width, unsigned operation,
-                               uint32_t index, int signed_index)
+                               uint32_t index, int signed_index, int address32)
 {
     B86RM1EA ea = *arg;
     unsigned n = width == 2 ? 32u : 16u;
-    if (!b86_rm2_bitpos(&ea, width, index, signed_index)) return 0;
+    if (!b86_rm2_bitpos(&ea, width, index, signed_index, address32)) return 0;
     uint32_t mask = 1u << (index & (n - 1u));
     uint32_t old = b86_rm1_rmget(c, &ea, width);
     uint32_t changed = old;
@@ -137,8 +138,9 @@ static __attribute__((noinline, cold, section(".text.bb386_flash"))) int b86_rm2
 
     if (op == 0xB6 || op == 0xB7 || op == 0xBE || op == 0xBF) { /* MOVZX/SX */
         unsigned sw = (op & 1) ? 1u : 0u;
-        /* MOVSX/Zx must widen. r16 <- r/m16 is not an encoding. */
-        if (sw == 1u && width == 1u) goto unsupported;
+        /* 80386EX SST: 0F B7/BF with 16-bit operand size execute as
+           same-width moves. Destination remains 16-bit; upper half
+           of the 32-bit register is preserved by regput(). */
         form = b86_rm2_operand(s, address32, &ea);
         if (!form && !b86_rm1_memok(&ea, 1u << sw)) goto unsupported;
         src = b86_rm1_rmget(c, &ea, sw);
@@ -197,7 +199,7 @@ static __attribute__((noinline, cold, section(".text.bb386_flash"))) int b86_rm2
             index = b86_rm1_regget(c, ea.reg, width);
             signed_index = 1;
         }
-        if (!b86_rm2_bit(c, &ea, width, action, index, signed_index)) goto unsupported;
+        if (!b86_rm2_bit(c, &ea, width, action, index, signed_index, address32)) goto unsupported;
         goto done;
     }
 

@@ -236,13 +236,66 @@ static BB386RM3_FLASH int b86_rm3_fs16(St *s, uint8_t op, int operand32)
         if (!b86_rm1_memok(&ea, 1u << width)) goto unsupported;
         if (op & 2u) b86_rm1_write(c, &ea, 1u << width, b86_rm1_regget(c, B86_AX, width));
         else b86_rm1_regput(c, B86_AX, width, b86_rm1_read(c, &ea, 1u << width));
-    } else if ((op >= 0x88 && op <= 0x8B) || op == 0xC6 || op == 0xC7 ||
-               op == 0x84 || op == 0x85) {
+    } else if (op < 0x40 && (op & 7u) >= 4u && (op & 7u) <= 5u) {
+        /* Segment prefix has no effect on accumulator-immediate ALU. */
+        unsigned accwidth = (op & 1u) ? (operand32 ? 2u : 1u) : 0u;
+        unsigned kind = op >> 3;
+        uint32_t a = b86_rm1_regget(c, B86_AX, accwidth);
+        uint32_t b = accwidth == 2u ? b86_rm1_f32(s) :
+                     accwidth == 1u ? f16(s) : f8(s);
+        uint32_t result = b86_rm1_alu(c, accwidth, kind, a, b);
+        if (kind != 7u) b86_rm1_regput(c, B86_AX, accwidth, result);
+    } else if ((op < 0x40 && (op & 7u) <= 3u) ||
+               op == 0x80 || op == 0x81 || op == 0x83 ||
+               (op >= 0x88 && op <= 0x8B) || op == 0xC6 || op == 0xC7 ||
+               op == 0x84 || op == 0x85 || op == 0x86 || op == 0x87 ||
+               op == 0x8D) {
         modrm(s);
         ea.mod = s->mod; ea.reg = s->reg; ea.rm = s->rm;
         ea.off = s->ea_off; ea.seg = s->ea_seg;
+        if (op == 0x8D) {  /* LEA: compute offset only; override ignored */
+            if (ea.mod == 3) goto unsupported;
+            b86_rm1_regput(c, ea.reg, operand32 ? 2u : 1u, ea.off);
+            c->ip = s->ip;
+            return B86_OK;
+        }
         if (ea.mod != 3 && !b86_rm1_memok(&ea, 1u << width)) goto unsupported;
-        if (op >= 0x88 && op <= 0x8B) {
+        if ((op < 0x40 && (op & 7u) <= 3u) ||
+            op == 0x80 || op == 0x81 || op == 0x83) {
+            /* 386 FS/GS with 16-bit effective addressing. The segment
+               override matters only for memory operands. Reuse the existing
+               8/16/32 ALU so ADC, SBB and all architecturally defined flags
+               follow the same path as the validated non-overridden cases. */
+            unsigned kind = op < 0x40 ? (op >> 3) : ea.reg;
+            uint32_t a, b, result;
+            if (op == 0x80 || op == 0x81 || op == 0x83) {
+                a = b86_rm1_rmget(c, &ea, width);
+                b = op == 0x83 ? (uint32_t)(int32_t)(int8_t)f8(s)
+                    : op == 0x80 ? (uint32_t)f8(s)
+                    : width == 2u ? b86_rm1_f32(s) : f16(s);
+                /* 83 /r imm8 sign extends to the OPERAND width. When
+                   the destination is 16-bit, trim 0xFFFFFFxx to 0xFFxx
+                   before calling the legacy 16-bit ALU (CF depends on it). */
+                if (op == 0x83 && width == 1u) b &= 0xFFFFu;
+                result = b86_rm1_alu(c, width, kind, a, b);
+                if (kind != 7u) b86_rm1_rmput(c, &ea, width, result);
+            } else if (op & 2u) { /* ALU reg, r/m */
+                a = b86_rm1_regget(c, ea.reg, width);
+                b = b86_rm1_rmget(c, &ea, width);
+                result = b86_rm1_alu(c, width, kind, a, b);
+                if (kind != 7u) b86_rm1_regput(c, ea.reg, width, result);
+            } else {             /* ALU r/m, reg */
+                a = b86_rm1_rmget(c, &ea, width);
+                b = b86_rm1_regget(c, ea.reg, width);
+                result = b86_rm1_alu(c, width, kind, a, b);
+                if (kind != 7u) b86_rm1_rmput(c, &ea, width, result);
+            }
+        } else if (op == 0x86 || op == 0x87) {  /* XCHG reg, r/m */
+            uint32_t a = b86_rm1_rmget(c, &ea, width);
+            uint32_t b = b86_rm1_regget(c, ea.reg, width);
+            b86_rm1_rmput(c, &ea, width, b);
+            b86_rm1_regput(c, ea.reg, width, a);
+        } else if (op >= 0x88 && op <= 0x8B) {
             if (op & 2u) b86_rm1_regput(c, ea.reg, width, b86_rm1_rmget(c, &ea, width));
             else b86_rm1_rmput(c, &ea, width, b86_rm1_regget(c, ea.reg, width));
         } else if (op == 0xC6 || op == 0xC7) {
@@ -263,10 +316,120 @@ unsupported:
 
 /* Called ONLY in model 386 before the previous RM2/RM1/RM0 diversions.
  * -1 means no RM3 interception needed; >=0 means completed/status code. */
+/* BB_386_SHIFT_V2: 386 real-mode group-2 shifter.  Only the 386 model
+ * dispatches here; the existing 8086/186/286 execution and JIT are unchanged.
+ * Width is 0/1/2 for 8/16/32.  Undefined shift flags are preserved rather
+ * than assigned fabricated values; the SST runner remains responsible for
+ * the hardware corpus' per-vector compare masks.
+ */
+static BB386RM3_FLASH uint32_t b86_rm3_shift_value(B86Cpu *c, unsigned kind,
+                                                      unsigned width, uint32_t value,
+                                                      unsigned n)
+{
+    unsigned bits = width == 2u ? 32u : width == 1u ? 16u : 8u;
+    uint32_t mask = width == 2u ? 0xFFFFFFFFu : (1u << bits) - 1u;
+    uint32_t msb = 1u << (bits - 1u);
+    uint32_t v = value & mask;
+    if (!n) return v;
+    uint32_t cf = (c->flags & B86_CF) ? 1u : 0u;
+    uint32_t of = 0u;
+    uint32_t old_msb = (v & msb) ? 1u : 0u;
+    for (unsigned i = 0; i < n; ++i) {
+        uint32_t lost;
+        switch (kind) {
+        case 0: /* ROL */
+            lost = (v & msb) ? 1u : 0u;
+            v = ((v << 1u) | lost) & mask; cf = lost;
+            break;
+        case 1: /* ROR */
+            lost = v & 1u;
+            v = (v >> 1u) | (lost ? msb : 0u); cf = lost;
+            break;
+        case 2: /* RCL */
+            lost = (v & msb) ? 1u : 0u;
+            v = ((v << 1u) | cf) & mask; cf = lost;
+            break;
+        case 3: /* RCR */
+            lost = v & 1u;
+            v = (v >> 1u) | (cf ? msb : 0u); cf = lost;
+            break;
+        case 4: case 6: /* SHL/SAL; /6 386 aliases SHL */
+            cf = (v & msb) ? 1u : 0u;
+            v = (v << 1u) & mask;
+            break;
+        case 5: /* SHR */
+            cf = v & 1u;
+            v >>= 1u;
+            break;
+        default: /* SAR */
+            cf = v & 1u;
+            v = (v >> 1u) | (v & msb);
+            break;
+        }
+    }
+    /* 386EX silicon records a deterministic OF for multi-bit counts too,
+       although the x86 architecture leaves OF undefined except count 1.
+       Keep this behavior 386-only and verify against the 386EX corpus. */
+    {
+        switch (kind) {
+        case 0: case 2: case 4: case 6:
+            of = ((v & msb) ? 1u : 0u) ^ cf; break;
+        case 1: case 3:
+            of = ((v & msb) ? 1u : 0u) ^ ((v & (msb >> 1u)) ? 1u : 0u);
+            break;
+        case 5: of = old_msb; break;
+        default: of = 0u; break;
+        }
+    }
+    uint32_t f = c->flags;
+    f = (f & ~(uint32_t)B86_CF) | (cf ? B86_CF : 0u);
+    if (kind >= 4u) {
+        f &= ~(uint32_t)(B86_SF | B86_ZF | B86_PF);
+        if (v & msb) f |= B86_SF;
+        if (!v) f |= B86_ZF;
+        f |= b86_parity[v & 255u];
+    }
+    /* The 386EX observed multi-count OF value is used here (other CPUs
+       need not agree). AF remains undefined and is preserved. */
+    f = (f & ~(uint32_t)B86_OF) | (of ? B86_OF : 0u);
+    c->flags = f;
+    return v;
+}
+
+static BB386RM3_FLASH int b86_rm3_shift386(St *s, uint8_t op,
+                                             int operand32, int address32)
+{
+    B86Cpu *c = s->c;
+    B86RM1EA ea;
+    if (address32) (void)b86_rm1_ea(s, &ea);
+    else {
+        modrm(s);
+        ea.mod = s->mod; ea.reg = s->reg; ea.rm = s->rm;
+        ea.off = s->ea_off; ea.seg = s->ea_seg;
+    }
+    unsigned width = (op & 1u) ? (operand32 ? 2u : 1u) : 0u;
+    unsigned n = (op == 0xD0 || op == 0xD1) ? 1u :
+                 (op == 0xD2 || op == 0xD3) ? (c->r[B86_CX] & 255u) : f8(s);
+    n &= 31u; /* 80186+ architecturally masks the raw shift count */
+    if (ea.mod != 3 && !b86_rm1_memok(&ea, 1u << width)) goto unsupported;
+    if (n) {
+        uint32_t a = b86_rm1_rmget(c, &ea, width);
+        uint32_t r = b86_rm3_shift_value(c, ea.reg, width, a, n);
+        b86_rm1_rmput(c, &ea, width, r);
+    }
+    c->ip = s->ip;
+    return B86_OK;
+unsupported:
+    c->ip = s->fip0;
+    return B86_UNSUPPORTED;
+}
+
 static BB386RM3_FLASH int b86_rm3_dispatch(St *s, uint8_t op,
                                              int operand32, int address32)
 {
     B86Cpu *c = s->c;
+    if ((op >= 0xD0 && op <= 0xD3) || op == 0xC0 || op == 0xC1)
+        return b86_rm3_shift386(s, op, operand32, address32);
     if (op == 0x8C || op == 0x8E)
         return b86_rm3_mov_seg(s, op, operand32, address32);
     if (op == 0x0F) {
