@@ -183,6 +183,10 @@ typedef struct {
     const uint8_t *fp;          /* fetch window: host bytes at CS:fip0 */
     uint16_t fip0, favail;
 } St;
+/* BB_386_STAGE5C4C_V1: 386-only bridge to the existing bounded #UD path.
+ * Keep the earlier 186/286 b86_interrupt behavior unchanged. */
+static __attribute__((noinline, cold, section(".text.bb386_flash")))
+int b86_rm5c2_fault(St *s, unsigned vector);
 
 /* divide error: the 8086 pushes the next IP, the 286 the faulting instruction */
 #define DE_IP(s) ((s)->c->model >= B86_CPU_286 ? (s)->fip0 : (s)->ip)
@@ -602,14 +606,24 @@ static __attribute__((noinline, cold, section(".text.bb386_flash"))) int step0f(
             rm_put(s, 1, (uint16_t)(0xFFF0u | c->msw));
         } else if (reg == 6) {                      /* LMSW: PE can be set, not cleared */
             uint16_t v = (uint16_t)rm_get(s, 1);
-            if (v & 1u) goto ud;                    /* protected mode: not supported (yet) */
+            /* Setting PE requests a mode transition this engine cannot perform.
+             * Do not fabricate #UD for an architecturally valid 386 LMSW. */
+            if (v & 1u) {
+                if (c->model >= B86_CPU_386) {
+                    c->ip = s->fip0;
+                    return B86_UNSUPPORTED;
+                }
+                goto ud;
+            }
             c->msw = (uint16_t)((c->msw & 1u) | (v & 0x0Eu));
         } else goto ud;
         c->ip = s->ip;
         return B86_OK;
     }
     if (op2 == 0x06) { c->msw &= (uint16_t)~8u; c->ip = s->ip; return B86_OK; }   /* CLTS */
-ud: c->ip = s->fip0;
+ud:
+    if (c->model >= B86_CPU_386) return b86_rm5c2_fault(s, 6u);
+    c->ip = s->fip0;
     b86_interrupt(c, 6);
     return B86_OK;
 }
@@ -631,7 +645,12 @@ B86_HOT static int step186(St *s, uint8_t op, int w)
         break;
     case 0x62: {                                    /* BOUND r16, m16&16 -> INT 5 */
         modrm(s);
-        if (s->mod == 3) { c->ip = s->fip0; b86_interrupt(c, 6); return B86_OK; }
+        if (s->mod == 3) {
+            if (c->model >= B86_CPU_386) return b86_rm5c2_fault(s, 6u);
+            c->ip = s->fip0;
+            b86_interrupt(c, 6);
+            return B86_OK;
+        }
         int16_t v = (int16_t)reg_get(s, 1);
         int16_t lo = (int16_t)rd16(c, s->ea_seg, s->ea_off), hi = (int16_t)rd16(c, s->ea_seg, (uint16_t)(s->ea_off + 2));
         if (v < lo || v > hi) { c->ip = s->fip0; b86_interrupt(c, 5); return B86_OK; }   /* IP of the first prefix */
@@ -718,6 +737,175 @@ static uint32_t b86_rm3_segvalue(B86Cpu *c, int which);
 /* BB_386_PM0_V1: GDT descriptor helpers in flash, no PE switch. */
 #include "i386_pm0.inc"
 
+/* BB_386_STAGE5C3C_V1: model-386-only legacy word memory limit preflight. */
+/* The 8086/186/286 interpreter and JIT memory primitives are intentionally
+ * unchanged. This runs only for unprefixed-operand-size, 16-bit EA 386 paths
+ * that fall through the 386-specific RM3/RM2/RM1/RM0 decoders.
+ * A shadow St decodes ModRM without committing IP or any guest state.
+ * Check whole memory operands before legacy code performs *any* reads/writes.
+ * This is not the string/REP, I/O string, instruction-fetch, or stack pass. */
+static __attribute__((noinline, cold, section(".text.bb386_flash")))
+int b86_rm5c3c_preflight16(St *s, uint8_t op)
+{
+    St shadow = *s;
+    B86Cpu *c = s->c;
+    unsigned bytes = 0;
+    uint32_t off;
+    int seg;
+    int use_modrm = 0;
+    (void)c;
+
+    if (op >= 0xA0u && op <= 0xA3u) {
+        off = f16(&shadow);
+        seg = s->seg >= 0 ? s->seg : B86_DS;
+        bytes = (op & 1u) ? 2u : 1u;
+    } else {
+        if ((op < 0x40u && (op & 7u) <= 3u) ||
+            op == 0x80u || op == 0x81u || op == 0x83u ||
+            (op >= 0x84u && op <= 0x8Bu) || op == 0x8Fu ||
+            op == 0x62u || op == 0x69u || op == 0x6Bu ||
+            op == 0xC4u || op == 0xC5u || op == 0xC6u || op == 0xC7u ||
+            op == 0xF6u || op == 0xF7u || op == 0xFEu || op == 0xFFu)
+            use_modrm = 1;
+        if (!use_modrm) return -1;
+
+        modrm(&shadow);
+        /* A register-only operand or invalid encoding never accesses data
+         * memory. Let the original interpreter handle register and #UD cases. */
+        if (shadow.mod == 3u) return -1;
+        if ((op == 0xC6u || op == 0xC7u || op == 0x8Fu) && shadow.reg) return -1;
+        if ((op == 0xF6u || op == 0xF7u) && shadow.reg == 1u) return -1;
+        if (op == 0xFEu && shadow.reg > 1u) return -1;
+        if (op == 0xFFu && shadow.reg == 7u) return -1;
+        off = shadow.ea_off;
+        seg = shadow.ea_seg;
+        if (op == 0x62u || op == 0xC4u || op == 0xC5u ||
+            (op == 0xFFu && (shadow.reg == 3u || shadow.reg == 5u)))
+            bytes = 4u; /* two 16-bit words: BOUND, LES/LDS, far pointer */
+        else if (op == 0x80u || op == 0x84u || op == 0x86u ||
+                 op == 0x88u || op == 0x8Au || op == 0xC6u ||
+                 op == 0xF6u || op == 0xFEu ||
+                 (op < 0x40u && !(op & 1u)))
+            bytes = 1u;
+        else
+            bytes = 2u;
+    }
+    if (off <= 0x10000u - bytes) return -1;
+    return b86_rm5c2_fault(s, seg == B86_SS ? 12u : 13u);
+}
+
+/* BB_386_STAGE5C3D_V1: real-mode 386 string/REP engine. */
+/* Only invoked by model 386; the legacy 8086/286 and JIT paths remain intact.
+ * 67h selects ESI, EDI, ECX; otherwise SI, DI, CX. 66h selects DWORD
+ * elements for non-byte string opcodes, without changing stack size.
+ * Preflight BOTH memory operands before the first read, write, or port I/O
+ * of each iteration. Completed REP iterations remain committed on #GP/#SS. */
+static __attribute__((noinline, cold, section(".text.bb386_flash")))
+int b86_rm5c3d_string(St *s, uint8_t op, int operand32, int address32)
+{
+    B86Cpu *c = s->c;
+    const int repeated = s->rep == 0xF2 || s->rep == 0xF3;
+    const unsigned bytes = (op & 1u) ? (operand32 ? 4u : 2u) : 1u;
+    const unsigned width = bytes == 4u ? 2u : bytes == 2u ? 1u : 0u;
+    const int uses_src = op == 0xA4 || op == 0xA5 ||
+                         op == 0xA6 || op == 0xA7 ||
+                         op == 0xAC || op == 0xAD ||
+                         op == 0x6E || op == 0x6F;
+    const int uses_dst = op == 0xA4 || op == 0xA5 ||
+                         op == 0xA6 || op == 0xA7 ||
+                         op == 0xAA || op == 0xAB ||
+                         op == 0xAE || op == 0xAF ||
+                         op == 0x6C || op == 0x6D;
+    const int source_seg = s->seg >= 0 ? s->seg : B86_DS;
+    const uint16_t port = (uint16_t)c->r[B86_DX];
+    const uint32_t delta = (c->flags & B86_DF) ? (uint32_t)(0u - bytes) : bytes;
+    uint32_t remaining = repeated ? (address32 ? c->r[B86_CX] : (uint16_t)c->r[B86_CX]) : 1u;
+
+    /* REP with zero count does no data/I/O access, even if SI/DI are invalid. */
+    while (remaining) {
+        const uint32_t si = address32 ? c->r[B86_SI] : (uint16_t)c->r[B86_SI];
+        const uint32_t di = address32 ? c->r[B86_DI] : (uint16_t)c->r[B86_DI];
+        B86RM1EA src, dst;
+        uint32_t a=0u, b=0u;
+        unsigned i;
+        memset(&src, 0, sizeof src);
+        memset(&dst, 0, sizeof dst);
+        src.seg = source_seg; src.off = si;
+        dst.seg = B86_ES; dst.off = di;
+        if (uses_src && !b86_rm1_memok(&src, bytes))
+            return b86_rm5c2_fault(s, source_seg == B86_SS ? 12u : 13u);
+        if (uses_dst && !b86_rm1_memok(&dst, bytes))
+            return b86_rm5c2_fault(s, 13u); /* string destination is always ES */
+
+        switch (op) {
+        case 0xA4: case 0xA5: /* MOVS */
+            a = b86_rm1_read(c, &src, bytes);
+            b86_rm1_write(c, &dst, bytes, a);
+            break;
+        case 0xA6: case 0xA7: /* CMPS: source - ES:destination */
+            a = b86_rm1_read(c, &src, bytes);
+            b = b86_rm1_read(c, &dst, bytes);
+            if (bytes == 4u) (void)b86_rm0_alu(c, 5, a, b);
+            else (void)sub_f(c, bytes == 2u, a, b, 0u);
+            break;
+        case 0xAA: case 0xAB: /* STOS */
+            b86_rm1_write(c, &dst, bytes, b86_rm1_regget(c, B86_AX, width));
+            break;
+        case 0xAC: case 0xAD: /* LODS */
+            b86_rm1_regput(c, B86_AX, width, b86_rm1_read(c, &src, bytes));
+            break;
+        case 0xAE: case 0xAF: /* SCAS: accumulator - ES:destination */
+            b = b86_rm1_read(c, &dst, bytes);
+            a = b86_rm1_regget(c, B86_AX, width);
+            if (bytes == 4u) (void)b86_rm0_alu(c, 5, a, b);
+            else (void)sub_f(c, bytes == 2u, a, b, 0u);
+            break;
+        case 0x6C: case 0x6D: /* INS; destination preflight before port read */
+            for (i=0; i<bytes; ++i)
+                a |= (uint32_t)(c->in8 ? c->in8(c, (uint16_t)(port+i)) : 0xFFu) << (8u*i);
+            b86_rm1_write(c, &dst, bytes, a);
+            break;
+        case 0x6E: case 0x6F: /* OUTS; source preflight before port write */
+            a = b86_rm1_read(c, &src, bytes);
+            if (c->out8) for (i=0; i<bytes; ++i)
+                c->out8(c, (uint16_t)(port+i), (uint8_t)(a >> (8u*i)));
+            break;
+        default: /* dispatch guarantees only supported string opcodes */
+            c->ip = s->fip0;
+            return B86_UNSUPPORTED;
+        }
+
+        /* Index updates commit after the completed iteration, even on a
+         * subsequent fault. 16-bit addressing preserves the upper half. */
+        if (uses_src) {
+            if (address32) c->r[B86_SI] += delta;
+            else c->r[B86_SI] = (c->r[B86_SI] & 0xFFFF0000u) |
+                 (uint16_t)((uint16_t)c->r[B86_SI] + delta);
+        }
+        if (uses_dst) {
+            if (address32) c->r[B86_DI] += delta;
+            else c->r[B86_DI] = (c->r[B86_DI] & 0xFFFF0000u) |
+                 (uint16_t)((uint16_t)c->r[B86_DI] + delta);
+        }
+        --remaining;
+        if (repeated) {
+            if (address32) c->r[B86_CX] = remaining;
+            else c->r[B86_CX] = (c->r[B86_CX] & 0xFFFF0000u) | (uint16_t)remaining;
+        }
+        if (!repeated) break;
+        if (op == 0xA6 || op == 0xA7 || op == 0xAE || op == 0xAF) {
+            const int equal = (c->flags & B86_ZF) != 0;
+            if (s->rep == 0xF3 && !equal) break;
+            if (s->rep == 0xF2 && equal) break;
+        }
+        /* Permit a host interrupt request between completed REP iterations.
+         * Prefix IP and remaining ECX/CX make the instruction restartable. */
+        if (remaining && c->irq) { c->ip = s->fip0; return B86_OK; }
+    }
+    c->ip = s->ip;
+    return B86_OK;
+}
+
 B86_HOT static int b86_step_internal(B86Cpu *c)
 {
     St st, *s = &st;
@@ -749,6 +937,10 @@ B86_HOT static int b86_step_internal(B86Cpu *c)
     c->icount++;
     int w = op & 1;
     if (c->model >= B86_CPU_386) {
+        if ((op >= 0xA4 && op <= 0xA7) ||
+            (op >= 0xAA && op <= 0xAF) ||
+            (op >= 0x6C && op <= 0x6F))
+            return b86_rm5c3d_string(s, op, operand32, address32);
         /* BB_386_RM3_V1: intercept only new 386 encodings. */
         { int r3 = b86_rm3_dispatch(s, op, operand32, address32);
           if (r3 >= 0) return r3; }
@@ -766,6 +958,9 @@ B86_HOT static int b86_step_internal(B86Cpu *c)
             c->ip = s->fip0; return B86_UNSUPPORTED;
         }
         if (operand32) return b86_rm0_66(s, op);
+        /* Existing preflighted 386 decoders already returned above. */
+        { int fault = b86_rm5c3c_preflight16(s, op);
+          if (fault >= 0) return fault; }
     }
 
     if (op < 0x40 && (op & 7) < 6) {      /* ALU r/m,r  r,r/m  acc,imm */
@@ -792,7 +987,12 @@ B86_HOT static int b86_step_internal(B86Cpu *c)
         case 0xFE: ud = reg > 1; break;
         default:   ud = reg == 7 || ((reg == 3 || reg == 5) && mod == 3); break;   /* FF */
         }
-        if (ud) { c->ip = s->fip0; b86_interrupt(c, 6); return B86_OK; }
+        if (ud) {
+            if (c->model >= B86_CPU_386) return b86_rm5c2_fault(s, 6u);
+            c->ip = s->fip0;
+            b86_interrupt(c, 6);
+            return B86_OK;
+        }
     }
     if (c->model >= B86_CPU_186) {
         int r = step186(s, op, w);
@@ -977,28 +1177,44 @@ static __attribute__((noinline, cold, section(".text.bb386_flash"))) int b86_386
     uint32_t hi[8];
     for (unsigned i = 0; i < 8; ++i) hi[i] = c->r[i] & 0xFFFF0000u;
     uint16_t ip = (uint16_t)c->ip;
-    int operand32 = 0;
+    int operand32 = 0, address32 = 0;
+    uint8_t final_op = 0;
     for (unsigned k = 0; k < 15; ++k) {
         uint8_t op = rd8(c, B86_CS, ip++);
         if (op == 0x66) { operand32 = 1; continue; }
-        if (op == 0x67 || op == 0x64 || op == 0x65 || op == 0x26 || op == 0x2E || op == 0x36 ||
+        if (op == 0x67) { address32 = 1; continue; }
+        if (op == 0x64 || op == 0x65 || op == 0x26 || op == 0x2E || op == 0x36 ||
             op == 0x3E || op == 0xF0 || op == 0xF1 || op == 0xF2 || op == 0xF3)
             continue;
+        final_op = op;
         break;
     }
     int rc = b86_step_internal(c);
-    if (!operand32) for (unsigned i = 0; i < 8; ++i) c->r[i] = (c->r[i] & 0xFFFFu) | hi[i];
+    /* 67h string instructions update full ESI/EDI/ECX even with the default
+     * 16-bit operand size. Keep their updated high halves, but preserve the
+     * usual legacy word-register masking for all other 386 instructions. */
+    const int wide_index = address32 &&
+        ((final_op >= 0xA4 && final_op <= 0xA7) ||
+         (final_op >= 0xAA && final_op <= 0xAF) ||
+         (final_op >= 0x6C && final_op <= 0x6F));
+    if (!operand32) for (unsigned i = 0; i < 8; ++i) {
+        if (wide_index && (i == B86_CX || i == B86_SI || i == B86_DI)) continue;
+        c->r[i] = (c->r[i] & 0xFFFFu) | hi[i];
+    }
     return rc;
 }
 
 B86_HOT int b86_step(B86Cpu *c)
 {
+    /* BB_386_STAGE5C4A_V1: shutdown precedes fetch and all guest side effects. */
+    if (c->model >= B86_CPU_386 && c->shutdown386) return B86_SHUTDOWN;
     if (c->model < B86_CPU_386) return b86_step_internal(c);
     return b86_386_step_flash(c);
 }
 
 B86_HOT int b86_run_interp(B86Cpu *c, uint64_t max)
 {
+    if (c->model >= B86_CPU_386 && c->shutdown386) return B86_SHUTDOWN;
     for (uint64_t i = 0; i < max; ++i) {
         int r = b86_step(c);
         if (r != B86_OK) return r;

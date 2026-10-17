@@ -68,7 +68,7 @@ enum {
 };
 
 /* Return codes from b86_step / b86_run. */
-enum { B86_OK = 0, B86_HALT = 1, B86_EXIT = 2, B86_BUDGET = 3, B86_TRAP = 4, B86_UNSUPPORTED = 5 };
+enum { B86_OK = 0, B86_HALT = 1, B86_EXIT = 2, B86_BUDGET = 3, B86_TRAP = 4, B86_UNSUPPORTED = 5, B86_SHUTDOWN = 6 };
 
 struct B86Cpu;
 typedef uint8_t (*B86In8)(struct B86Cpu *, uint16_t port);
@@ -147,6 +147,7 @@ typedef struct B86Cpu {
 #endif
     /* BB_386_RM3_V1: appended only; old generated-code offsets unchanged. */
     uint16_t seg386[2];   /* FS and GS selectors, real mode */
+    uint32_t shutdown386; /* BB_386_STAGE5C4A_V1: sticky 386 shutdown until b86_init */
 } B86Cpu;
 
 /* Host pointer for a guest linear address (honours mapped pages). */

@@ -109,6 +109,7 @@ static __attribute__((noinline, cold, section(".text.bb386_flash"))) int b86_rm2
     return 1;
 }
 
+/* BB_386_STAGE5C3B_V1: preflighted real-mode data memory faults. */
 static __attribute__((noinline, cold, section(".text.bb386_flash"))) int b86_rm2_0f(St *s, int operand32, int address32)
 {
     B86Cpu *c = s->c;
@@ -123,7 +124,8 @@ static __attribute__((noinline, cold, section(".text.bb386_flash"))) int b86_rm2
         if (cond(c, op & 15u)) {
             uint32_t target = (uint32_t)s->ip + (uint32_t)delta;
             /* Real-mode CS has a 64-KiB default limit in this milestone. */
-            if (operand32 && target > 0xFFFFu) goto unsupported;
+            if (operand32 && target > 0xFFFFu)
+                return b86_rm5c2_fault(s, 13u);
             s->ip = (uint16_t)target;
         }
         goto done;
@@ -131,7 +133,8 @@ static __attribute__((noinline, cold, section(".text.bb386_flash"))) int b86_rm2
 
     if (op >= 0x90 && op <= 0x9F) {                 /* SETcc r/m8 */
         form = b86_rm2_operand(s, address32, &ea);
-        if (!form && !b86_rm1_memok(&ea, 1)) goto unsupported;
+        if (!form && !b86_rm1_memok(&ea, 1))
+            return b86_rm5c2_fault(s, ea.seg == B86_SS ? 12u : 13u);
         b86_rm1_rmput(c, &ea, 0, cond(c, op & 15u) ? 1u : 0u);
         goto done;
     }
@@ -142,7 +145,8 @@ static __attribute__((noinline, cold, section(".text.bb386_flash"))) int b86_rm2
            same-width moves. Destination remains 16-bit; upper half
            of the 32-bit register is preserved by regput(). */
         form = b86_rm2_operand(s, address32, &ea);
-        if (!form && !b86_rm1_memok(&ea, 1u << sw)) goto unsupported;
+        if (!form && !b86_rm1_memok(&ea, 1u << sw))
+            return b86_rm5c2_fault(s, ea.seg == B86_SS ? 12u : 13u);
         src = b86_rm1_rmget(c, &ea, sw);
         if (op == 0xBE) src = (uint32_t)(int32_t)(int8_t)src;
         if (op == 0xBF) src = (uint32_t)(int32_t)(int16_t)src;
@@ -152,7 +156,8 @@ static __attribute__((noinline, cold, section(".text.bb386_flash"))) int b86_rm2
 
     if (op == 0xAF) {                              /* IMUL r16/32, r/m */
         form = b86_rm2_operand(s, address32, &ea);
-        if (!form && !b86_rm1_memok(&ea, 1u << width)) goto unsupported;
+        if (!form && !b86_rm1_memok(&ea, 1u << width))
+            return b86_rm5c2_fault(s, ea.seg == B86_SS ? 12u : 13u);
         src = b86_rm1_rmget(c, &ea, width);
         dst = b86_rm1_regget(c, ea.reg, width);
         int64_t prod;
@@ -175,7 +180,8 @@ static __attribute__((noinline, cold, section(".text.bb386_flash"))) int b86_rm2
 
     if (op == 0xBC || op == 0xBD) {                 /* BSF / BSR */
         form = b86_rm2_operand(s, address32, &ea);
-        if (!form && !b86_rm1_memok(&ea, 1u << width)) goto unsupported;
+        if (!form && !b86_rm1_memok(&ea, 1u << width))
+            return b86_rm5c2_fault(s, ea.seg == B86_SS ? 12u : 13u);
         src = b86_rm1_rmget(c, &ea, width);
         if (!src) { c->flags |= B86_ZF; goto done; }
         c->flags &= ~(uint32_t)B86_ZF;
@@ -207,7 +213,8 @@ static __attribute__((noinline, cold, section(".text.bb386_flash"))) int b86_rm2
         form = b86_rm2_operand(s, address32, &ea);
         unsigned count = (op & 1) ? (c->r[B86_CX] & 255u) : f8(s);
         count &= 31u;
-        if (count && form == 0 && !b86_rm1_memok(&ea, 1u << width)) goto unsupported;
+        if (count && form == 0 && !b86_rm1_memok(&ea, 1u << width))
+            return b86_rm5c2_fault(s, ea.seg == B86_SS ? 12u : 13u);
         src = b86_rm1_regget(c, ea.reg, width);
         if (!b86_rm2_double_shift(c, &ea, width, src, op >= 0xAC, count)) goto unsupported;
         goto done;

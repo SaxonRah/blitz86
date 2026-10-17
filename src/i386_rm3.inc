@@ -56,6 +56,18 @@ static BB386RM3_FLASH int b86_rm3_stack_pop(B86Cpu *c, uint32_t *value)
 /* Near control flow with 32-bit operands. Explicitly reject a destination
  * past real-mode CS.limit before changing stack/IP. Return unsupported for
  * currently-unimplemented instruction forms, not a made-up #UD. */
+/* BB_386_STAGE5C4A_V1: explicit persistent 386 real-mode shutdown.
+ * Only called when the target exception/interrupt cannot enter atomically.
+ * Real-address mode has no recoverable handler when vector 8 also fails.
+ * A host must reset the CPU with b86_init() to leave shutdown. */
+static BB386RM3_FLASH int b86_rm5c4a_shutdown(St *s)
+{
+    s->c->shutdown386 = 1u;
+    s->c->ip = s->fip0;
+    return B86_SHUTDOWN;
+}
+
+/* BB_386_STAGE5C3A_V1: IDTR-limit vector 8 and FLAGS stack #SS. */
 /* BB_386_STAGE5C2_V1: bounded real-mode vector 12/13 fault entry.
  * Only preflighted 32-bit operand/address forms invoke this helper.
  * Real-address mode pushes WORD FLAGS, CS, faulting IP. No error code.
@@ -66,15 +78,23 @@ static BB386RM3_FLASH int b86_rm3_stack_pop(B86Cpu *c, uint32_t *value)
 static BB386RM3_FLASH int b86_rm5c2_fault(St *s, unsigned vector)
 {
     B86Cpu *c = s->c;
-    const uint32_t slot = vector * 4u;
-    const uint64_t phys = (uint64_t)c->idt_base + slot;
+    uint32_t slot = vector * 4u;
+    uint64_t phys = (uint64_t)c->idt_base + slot;
     const uint16_t sp = (uint16_t)c->r[B86_SP];
     const uint16_t a = (uint16_t)(sp - 2u);
     const uint16_t b = (uint16_t)(sp - 4u);
     const uint16_t d = (uint16_t)(sp - 6u);
     uint16_t ip, cs, flags;
-    if ((vector != 12u && vector != 13u) ||
-        slot + 3u > c->idt_limit || phys + 3u >= B86_MEM_BYTES ||
+    if (vector != 6u && vector != 8u && vector != 12u && vector != 13u) goto unsupported;
+    /* 80386 real-address mode: an IVT entry beyond IDTR.limit raises
+     * interrupt 8 (NOT the protected-mode double-fault frame). */
+    if (slot + 3u > c->idt_limit) {
+        if (vector == 8u) goto unsupported;  /* cannot vector #8 itself */
+        vector = 8u;
+        slot = 8u * 4u;
+        phys = (uint64_t)c->idt_base + slot;
+    }
+    if (slot + 3u > c->idt_limit || phys + 3u >= B86_MEM_BYTES ||
         a > 0xFFFEu || b > 0xFFFEu || d > 0xFFFEu)
         goto unsupported;
     ip = (uint16_t)(*b86_host(c, (uint32_t)phys & c->amask) |
@@ -94,8 +114,7 @@ static BB386RM3_FLASH int b86_rm5c2_fault(St *s, unsigned vector)
     c->ip = ip;
     return B86_OK;
 unsupported:
-    c->ip = s->fip0;
-    return B86_UNSUPPORTED;
+    return b86_rm5c4a_shutdown(s);
 }
 
 static BB386RM3_FLASH int b86_rm3_near32(St *s, uint8_t op, int address32)
@@ -145,6 +164,14 @@ unsupported:
     return B86_UNSUPPORTED;
 }
 
+/* BB_386_STAGE5C4B_V1: one dword must fit inside the 64-KiB SS limit.
+ * The ADDRESS of each later PUSHAD/POPAD slot wraps at 16 bits; the four
+ * bytes of any individual operand may not cross the segment limit. */
+static BB386RM3_FLASH int b86_rm5c4b_dword_slot(uint16_t off)
+{
+    return off <= 0xFFFCu;
+}
+
 static BB386RM3_FLASH int b86_rm3_stack32(St *s, uint8_t op)
 {
     B86Cpu *c = s->c;
@@ -153,34 +180,41 @@ static BB386RM3_FLASH int b86_rm3_stack32(St *s, uint8_t op)
     if (op == 0x60) {                              /* PUSHAD */
         uint32_t save[8];
         for (unsigned i = 0; i < 8; ++i) save[i] = c->r[i];
-        if (sp < 32u || sp > 0xFFFCu) goto unsupported;
+        /* Preflight ALL eight operand slots before the first write. SP
+         * wraps between DWORD pushes, but an individual DWORD cannot. */
+        for (unsigned i = 0; i < 8u; ++i)
+            if (!b86_rm5c4b_dword_slot((uint16_t)(sp - (i + 1u) * 4u))) goto ss;
         static const uint8_t order[8] = {B86_AX,B86_CX,B86_DX,B86_BX,B86_SP,B86_BP,B86_SI,B86_DI};
         for (unsigned i = 0; i < 8; ++i) {
-            if (!b86_rm3_stack_push(c, save[order[i]])) goto unsupported;
+            if (!b86_rm3_stack_push(c, save[order[i]])) goto ss;
         }
     } else if (op == 0x61) {                       /* POPAD */
-        if (sp > 0x10000u - 32u) goto unsupported;
+        /* POPAD may wrap SP between valid DWORD reads. */
+        for (unsigned i = 0; i < 8u; ++i)
+            if (!b86_rm5c4b_dword_slot((uint16_t)(sp + i * 4u))) goto ss;
         static const uint8_t order[8] = {B86_DI,B86_SI,B86_BP,B86_SP,B86_BX,B86_DX,B86_CX,B86_AX};
         uint32_t save[8];
         for (unsigned i = 0; i < 8; ++i) {
-            if (!b86_rm3_stack_read(c, sp + i * 4u, &save[i])) goto unsupported;
+            if (!b86_rm3_stack_read(c, (uint16_t)(sp + i * 4u), &save[i])) goto ss;
         }
         c->r[B86_SP] = (c->r[B86_SP] & 0xFFFF0000u) | (uint16_t)(sp + 32u);
         for (unsigned i = 0; i < 8; ++i) if (order[i] != B86_SP) c->r[order[i]] = save[i];
     } else if (op == 0xC9) {                       /* LEAVE with 32-bit operand */
         /* SS has a 16-bit stack-address attribute in 386 real mode. */
-        if (!b86_rm3_stack_read(c, (uint16_t)c->r[B86_BP], &v)) goto unsupported;
+        if (!b86_rm3_stack_read(c, (uint16_t)c->r[B86_BP], &v)) goto ss;
         c->r[B86_SP] = (c->r[B86_SP] & 0xFFFF0000u) | (uint16_t)(c->r[B86_BP] + 4u);
         c->r[B86_BP] = v;
     } else if (op == 0x9C) {                       /* PUSHFD (subset: 16 flag bits) */
         v = b86_get_flags(c);
-        if (!b86_rm3_stack_push(c, v)) goto unsupported;
+        if (!b86_rm3_stack_push(c, v)) goto ss;
     } else if (op == 0x9D) {                       /* POPFD (subset: 16 flag bits) */
-        if (!b86_rm3_stack_pop(c, &v)) goto unsupported;
+        if (!b86_rm3_stack_pop(c, &v)) goto ss;
         b86_set_flags(c, (uint16_t)v);
     } else goto unsupported;
     c->ip = s->ip;
     return B86_OK;
+ss:
+    return b86_rm5c2_fault(s, 12u);
 unsupported:
     c->ip = s->fip0;
     return B86_UNSUPPORTED;
@@ -256,13 +290,21 @@ static BB386RM3_FLASH int b86_rm3_pushpop_seg(St *s, uint8_t subop, int operand3
     if ((subop & 1u) == 0u) {                       /* PUSH FS/GS */
         uint32_t v = b86_rm3_segvalue(c, index);
         if (operand32) {
-            if (!b86_rm3_stack_push(c, v)) goto unsupported;
-        } else push(c, (uint16_t)v);
+            if (!b86_rm3_stack_push(c, v)) return b86_rm5c2_fault(s, 12u);
+        } else {
+            uint16_t dest = (uint16_t)(c->r[B86_SP] - 2u);
+            if (dest > 0xFFFEu) return b86_rm5c2_fault(s, 12u);
+            push(c, (uint16_t)v);
+        }
     } else {                                       /* POP FS/GS */
         uint32_t v;
         if (operand32) {
-            if (!b86_rm3_stack_pop(c, &v)) goto unsupported;
-        } else v = pop(c);
+            if (!b86_rm3_stack_pop(c, &v)) return b86_rm5c2_fault(s, 12u);
+        } else {
+            if ((uint16_t)c->r[B86_SP] > 0xFFFEu)
+                return b86_rm5c2_fault(s, 12u);
+            v = pop(c);
+        }
         b86_rm3_set_extra(c, index, (uint16_t)v);
     }
     c->ip = s->ip;
@@ -272,6 +314,7 @@ unsupported:
     return B86_UNSUPPORTED;
 }
 
+/* BB_386_STAGE5C3B_V1: preflighted real-mode data memory faults. */
 /* FS/GS with 16-bit addressing. 67h forms are already handled by RM1/RM2;
  * this deliberately covers only validated real-mode 16-bit-EA data forms. */
 static BB386RM3_FLASH int b86_rm3_fs16(St *s, uint8_t op, int operand32)
@@ -283,7 +326,8 @@ static BB386RM3_FLASH int b86_rm3_fs16(St *s, uint8_t op, int operand32)
         ea.mod = 0;
         ea.seg = s->seg;
         ea.off = f16(s);
-        if (!b86_rm1_memok(&ea, 1u << width)) goto unsupported;
+        if (!b86_rm1_memok(&ea, 1u << width))
+            return b86_rm5c2_fault(s, ea.seg == B86_SS ? 12u : 13u);
         if (op & 2u) b86_rm1_write(c, &ea, 1u << width, b86_rm1_regget(c, B86_AX, width));
         else b86_rm1_regput(c, B86_AX, width, b86_rm1_read(c, &ea, 1u << width));
     } else if (op < 0x40 && (op & 7u) >= 4u && (op & 7u) <= 5u) {
@@ -309,7 +353,9 @@ static BB386RM3_FLASH int b86_rm3_fs16(St *s, uint8_t op, int operand32)
             c->ip = s->ip;
             return B86_OK;
         }
-        if (ea.mod != 3 && !b86_rm1_memok(&ea, 1u << width)) goto unsupported;
+        if ((op == 0xC6 || op == 0xC7) && ea.reg != 0) goto unsupported;
+        if (ea.mod != 3 && !b86_rm1_memok(&ea, 1u << width))
+            return b86_rm5c2_fault(s, ea.seg == B86_SS ? 12u : 13u);
         if ((op < 0x40 && (op & 7u) <= 3u) ||
             op == 0x80 || op == 0x81 || op == 0x83) {
             /* 386 FS/GS with 16-bit effective addressing. The segment
@@ -461,7 +507,8 @@ static BB386RM3_FLASH int b86_rm3_shift386(St *s, uint8_t op,
     unsigned n = (op == 0xD0 || op == 0xD1) ? 1u :
                  (op == 0xD2 || op == 0xD3) ? (c->r[B86_CX] & 255u) : f8(s);
     n &= 31u; /* 80186+ architecturally masks the raw shift count */
-    if (ea.mod != 3 && !b86_rm1_memok(&ea, 1u << width)) goto unsupported;
+    if (ea.mod != 3 && !b86_rm1_memok(&ea, 1u << width))
+        return b86_rm5c2_fault(s, ea.seg == B86_SS ? 12u : 13u);
     if (n) {
         uint32_t a = b86_rm1_rmget(c, &ea, width);
         uint32_t r = b86_rm3_shift_value(c, ea.reg, width, a, n);
@@ -644,12 +691,13 @@ static BB386RM3_FLASH int b86_rm5b_int(St *s, uint8_t op)
         c->ip = s->ip;
         if (c->int_hook(c, vector)) return B86_OK;
     }
-    if (slot + 3u > c->idt_limit || phys + 3u >= B86_MEM_BYTES) goto unsupported;
+    if (slot + 3u > c->idt_limit) return b86_rm5c2_fault(s, 8u);
+    if (phys + 3u >= B86_MEM_BYTES) return b86_rm5c4a_shutdown(s);
     /* The stack address-size remains 16, so each push wraps SP separately.
      * Check all three WORD destinations before touching memory. */
     if (!b86_rm5b_word_slot((uint16_t)(sp - 2u)) ||
         !b86_rm5b_word_slot((uint16_t)(sp - 4u)) ||
-        !b86_rm5b_word_slot((uint16_t)(sp - 6u))) goto unsupported;
+        !b86_rm5b_word_slot((uint16_t)(sp - 6u))) return b86_rm5c4a_shutdown(s);
     destip = (uint16_t)(*b86_host(c, (uint32_t)phys & c->amask) |
              ((uint16_t)*b86_host(c, (uint32_t)(phys + 1u) & c->amask) << 8));
     destcs = (uint16_t)(*b86_host(c, (uint32_t)(phys + 2u) & c->amask) |
@@ -673,23 +721,27 @@ static BB386RM3_FLASH int b86_rm5b_iret(St *s, int operand32)
     uint16_t sp = (uint16_t)c->r[B86_SP];
     uint32_t eip, cs, flags;
     if (operand32) {  /* IRETD: three DWORDs; CS high 16 bits discarded */
-        if (sp > 0xFFF4u ||
-            !b86_rm3_stack_read(c, sp, &eip) ||
-            !b86_rm3_stack_read(c, sp + 4u, &cs) ||
-            !b86_rm3_stack_read(c, sp + 8u, &flags)) goto unsupported;
-        if (eip > 0xFFFFu) goto unsupported;
+        /* Independent DWORD reads wrap the 16-bit SP between operands.
+         * Each individual operand must still fit within SS.limit. */
+        if (!b86_rm5c4b_dword_slot(sp) ||
+            !b86_rm5c4b_dword_slot((uint16_t)(sp + 4u)) ||
+            !b86_rm5c4b_dword_slot((uint16_t)(sp + 8u))) goto ss;
+        if (!b86_rm3_stack_read(c, sp, &eip) ||
+            !b86_rm3_stack_read(c, (uint16_t)(sp + 4u), &cs) ||
+            !b86_rm3_stack_read(c, (uint16_t)(sp + 8u), &flags)) goto ss;
+        if (eip > 0xFFFFu) goto gp;
         /* Stage 5C1: preserve 386 IOPL/NT and RF, reject VM and new-mode bits. */
         if (flags & ~(uint32_t)(0x7FD5u | 0x0002u | 0x00010000u)) goto unsupported;
         c->r[B86_SP] = (c->r[B86_SP] & 0xFFFF0000u) |
                         (uint16_t)(sp + 12u);
     } else { /* IRET: three WORDs, including after 67h address override */
-        if (sp > 0xFFFAu ||
-            !b86_rm5b_word_slot(sp) ||
-            !b86_rm5b_word_slot(sp + 2u) ||
-            !b86_rm5b_word_slot(sp + 4u)) goto unsupported;
+        /* Three separate WORD reads may wrap SP between operands. */
+        if (!b86_rm5b_word_slot(sp) ||
+            !b86_rm5b_word_slot((uint16_t)(sp + 2u)) ||
+            !b86_rm5b_word_slot((uint16_t)(sp + 4u))) goto ss;
         eip = b86_rm5b_word(c, sp);
-        cs = b86_rm5b_word(c, sp + 2u);
-        flags = b86_rm5b_word(c, sp + 4u);
+        cs = b86_rm5b_word(c, (uint16_t)(sp + 2u));
+        flags = b86_rm5b_word(c, (uint16_t)(sp + 4u));
         /* Stage 5C1: 16-bit IRET restores IOPL/NT. */
         if (flags & ~(uint32_t)(0x7FD5u | 0x0002u)) goto unsupported;
         c->r[B86_SP] = (c->r[B86_SP] & 0xFFFF0000u) |
@@ -700,6 +752,10 @@ static BB386RM3_FLASH int b86_rm5b_iret(St *s, int operand32)
     if (operand32) c->flags = (c->flags & ~0x00010000u) | (flags & 0x00010000u);
     c->ip = (uint16_t)eip;
     return B86_OK;
+gp:
+    return b86_rm5c2_fault(s, 13u);
+ss:
+    return b86_rm5c2_fault(s, 12u);
 unsupported:
     c->ip = s->fip0;
     return B86_UNSUPPORTED;
@@ -721,17 +777,17 @@ static BB386RM3_FLASH int b86_rm5c_flags(St *s, uint8_t op, int operand32)
          * because virtual-8086 mode is not implemented. */
         image = (uint32_t)b86_get_flags(c);
         if (operand32) {
-            if (!b86_rm3_stack_push(c, image)) goto unsupported;
+            if (!b86_rm3_stack_push(c, image)) goto ss;
         } else {
-            if (!b86_rm5b_word_slot((uint16_t)(sp - 2u))) goto unsupported;
+            if (!b86_rm5b_word_slot((uint16_t)(sp - 2u))) goto ss;
             b86_rm5b_push_word(c, (uint16_t)image);
         }
     } else if (op == 0x9D) {
         if (operand32) {
-            if (!b86_rm3_stack_read(c, sp, &image)) goto unsupported;
+            if (!b86_rm3_stack_read(c, sp, &image)) goto ss;
             c->r[B86_SP] = (c->r[B86_SP] & 0xFFFF0000u) | (uint16_t)(sp + 4u);
         } else {
-            if (!b86_rm5b_word_slot(sp)) goto unsupported;
+            if (!b86_rm5b_word_slot(sp)) goto ss;
             image = b86_rm5b_word(c, sp);
             c->r[B86_SP] = (c->r[B86_SP] & 0xFFFF0000u) | (uint16_t)(sp + 2u);
         }
@@ -742,6 +798,8 @@ static BB386RM3_FLASH int b86_rm5c_flags(St *s, uint8_t op, int operand32)
     } else goto unsupported;
     c->ip = s->ip;
     return B86_OK;
+ss:
+    return b86_rm5c2_fault(s, 12u);
 unsupported:
     c->ip = s->fip0;
     return B86_UNSUPPORTED;
@@ -754,30 +812,8 @@ unsupported:
  * machine state, return UNSUPPORTED without partial stack modification. */
 static BB386RM3_FLASH int b86_rm5c_ud(St *s)
 {
-    B86Cpu *c = s->c;
-    uint32_t slot = 6u * 4u;
-    uint64_t phys = (uint64_t)c->idt_base + slot;
-    uint16_t sp = (uint16_t)c->r[B86_SP];
-    uint16_t ip, cs, old_flags;
-    if (slot + 3u > c->idt_limit || phys + 3u >= B86_MEM_BYTES ||
-        !b86_rm5b_word_slot((uint16_t)(sp - 2u)) ||
-        !b86_rm5b_word_slot((uint16_t)(sp - 4u)) ||
-        !b86_rm5b_word_slot((uint16_t)(sp - 6u))) goto unsupported;
-    ip = (uint16_t)(*b86_host(c, (uint32_t)phys & c->amask) |
-                    ((uint16_t)*b86_host(c, (uint32_t)(phys + 1u) & c->amask) << 8));
-    cs = (uint16_t)(*b86_host(c, (uint32_t)(phys + 2u) & c->amask) |
-                    ((uint16_t)*b86_host(c, (uint32_t)(phys + 3u) & c->amask) << 8));
-    old_flags = b86_get_flags(c);
-    b86_rm5b_push_word(c, old_flags);
-    c->flags &= ~(uint32_t)(B86_IF | B86_TF);
-    b86_rm5b_push_word(c, (uint16_t)c->seg[B86_CS]);
-    b86_rm5b_push_word(c, s->fip0);  /* restart at FIRST PREFIX */
-    b86_set_seg(c, B86_CS, cs);
-    c->ip = ip;
-    return B86_OK;
-unsupported:
-    c->ip = s->fip0;
-    return B86_UNSUPPORTED;
+    /* One real-mode frame path, including IDTR-vector8 and shutdown. */
+    return b86_rm5c2_fault(s, 6u);
 }
 
 static BB386RM3_FLASH int b86_rm3_dispatch(St *s, uint8_t op,

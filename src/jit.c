@@ -3726,6 +3726,8 @@ B86_HOT static int MPF(cold_run)(J *j, B86Cpu *c, uint32_t key, int force)
    registers.  Cold interpreter is deliberately in flash, not SRAM. */
 B86_COLD static int b86_386_rm0_run(B86Cpu *c, uint64_t budget)
 {
+    /* BB_386_STAGE5C4A_V1: no IRQ, trap or budget result can bypass shutdown. */
+    if (c->shutdown386) return B86_SHUTDOWN;
     for (uint64_t i = 0; i < budget; ++i) {
         if (c->irq & 0x80000000u) { c->irq &= 0x7FFFFFFFu; return B86_HALT; }
         if (c->irq) return B86_EXIT;

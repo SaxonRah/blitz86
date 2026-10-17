@@ -119,6 +119,8 @@ static __attribute__((noinline, cold, section(".text.bb386_flash"))) uint32_t b8
 
 /* 67h changes only effective address calculation and moffs width, not the
  * default 16-bit operand size of real mode. It has no JIT lowering yet. */
+/* BB_386_STAGE5C3B_V1: preflighted real-mode data memory faults. */
+static int b86_rm5c2_fault(St *s, unsigned vector);
 static __attribute__((noinline, cold, section(".text.bb386_flash"))) int b86_rm1_67(St *s, uint8_t op, int operand32)
 {
     B86Cpu *c = s->c;
@@ -144,7 +146,8 @@ static __attribute__((noinline, cold, section(".text.bb386_flash"))) int b86_rm1
         m.mod = 0; m.seg = s->seg >= 0 ? s->seg : B86_DS;
         m.off = b86_rm1_f32(s);
         width = (op & 1) ? (operand32 ? 2u : 1u) : 0u;
-        if (!b86_rm1_memok(&m, 1u << width)) goto unsupported;
+        if (!b86_rm1_memok(&m, 1u << width))
+            return b86_rm5c2_fault(s, m.seg == B86_SS ? 12u : 13u);
         if (op & 2) b86_rm1_write(c, &m, 1u << width, b86_rm1_regget(c, B86_AX, width));
         else b86_rm1_regput(c, B86_AX, width, b86_rm1_read(c, &m, 1u << width));
         goto done;
@@ -170,7 +173,9 @@ static __attribute__((noinline, cold, section(".text.bb386_flash"))) int b86_rm1
             goto done;
         }
         width = (op & 1) ? (operand32 ? 2u : 1u) : 0u;
-        if (!reg_form && !b86_rm1_memok(&m, 1u << width)) goto unsupported;
+        if ((op == 0xC6 || op == 0xC7) && m.reg) goto unsupported;
+        if (!reg_form && !b86_rm1_memok(&m, 1u << width))
+            return b86_rm5c2_fault(s, m.seg == B86_SS ? 12u : 13u);
         if (op >= 0x88 && op <= 0x8B) {          /* MOV */
             if (op & 2) b86_rm1_regput(c, m.reg, width, b86_rm1_rmget(c, &m, width));
             else b86_rm1_rmput(c, &m, width, b86_rm1_regget(c, m.reg, width));
