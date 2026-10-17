@@ -13,6 +13,8 @@
  *    live block's guarded range invalidate it.
  */
 #include "backend.h"
+/* 5C5E protected far transfer boundary */
+#include "b86_pm3.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -3728,6 +3730,11 @@ B86_COLD static int b86_386_rm0_run(B86Cpu *c, uint64_t budget)
 {
     /* BB_386_STAGE5C4A_V1: no IRQ, trap or budget result can bypass shutdown. */
     if (c->shutdown386) return B86_SHUTDOWN;
+    /* 5C5F: 386 has no native PM JIT. All post-transition PE steps
+     * remain in the cold interpreter through b86_step(). For synthetic
+     * PE without any CS cache, refuse even a zero-budget dispatch. */
+    if ((c->msw & 1u) && !c->pm386.seg[B86_CS].valid)
+        return B86_UNSUPPORTED;
     for (uint64_t i = 0; i < budget; ++i) {
         if (c->irq & 0x80000000u) { c->irq &= 0x7FFFFFFFu; return B86_HALT; }
         if (c->irq) return B86_EXIT;

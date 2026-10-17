@@ -81,6 +81,19 @@ typedef void    (*B86CodeHook)(struct B86Cpu *, uint32_t lin, uint32_t len);
 
 enum { B86_CPU_8086 = 0, B86_CPU_186 = 1, B86_CPU_286 = 2, B86_CPU_386 = 3 }; /* BB_386_RM0_V1: 386 real mode */   /* B86Cpu.model (286: real mode) */
 
+/* BB_386_STAGE5C5C_V1: appended shadow caches, no native-hot offsets changed. */
+typedef struct B86PM1Cache {
+    uint32_t base, limit;
+    uint16_t selector;
+    uint8_t access, flags, valid, reserved;
+} B86PM1Cache;
+typedef struct B86PM1State {
+    B86PM1Cache seg[6]; /* ES,CS,SS,DS,FS,GS; CS not activated in 5C5C */
+    uint32_t ldtr_base, ldtr_limit;
+    uint16_t ldtr_selector;
+    uint8_t ldtr_valid, reserved;
+} B86PM1State;
+
 typedef struct B86Cpu {
     /* --- hot block: generated code touches these ------------------------ */
     uint32_t r[8];          /* GPRs; only bits 0..15 are meaningful        */
@@ -148,6 +161,7 @@ typedef struct B86Cpu {
     /* BB_386_RM3_V1: appended only; old generated-code offsets unchanged. */
     uint16_t seg386[2];   /* FS and GS selectors, real mode */
     uint32_t shutdown386; /* BB_386_STAGE5C4A_V1: sticky 386 shutdown until b86_init */
+    B86PM1State pm386; /* Not active in interpreter/JIT until PE is implemented. */
 } B86Cpu;
 
 /* Host pointer for a guest linear address (honours mapped pages). */

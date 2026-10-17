@@ -7,6 +7,16 @@
  * lazy state from generated code is materialized on entry. */
 #include "b86.h"
 #include <string.h>
+/* 5C5E: forward declaration for CR0 dispatch before PM3 implementation. */
+#include "b86_pm3.h"
+/* 5C5F protected fetch/decode API */
+#include "b86_pm4.h"
+/* 5C5G: arithmetic and relative control flow */
+#include "b86_pm5.h"
+/* 5C5H: protected ModR/M register and memory execution */
+#include "b86_pm6.h"
+/* Stage5C5I: protected CPL0 near stack/flow */
+#include "b86_pm7.h"
 
 const uint8_t b86_parity[256] = {
 #define P2(n) n, n ^ 4, n ^ 4, n
@@ -765,6 +775,20 @@ static uint32_t b86_rm3_segvalue(B86Cpu *c, int which);
 #include "i386_rm3.inc"
 /* BB_386_PM0_V1: GDT descriptor helpers in flash, no PE switch. */
 #include "i386_pm0.inc"
+/* BB_386_STAGE5C5C_V1: shadow cache + checked address helpers, inert in RM. */
+#include "i386_pm1.inc"
+/* BB_386_STAGE5C5D_V1: transactional protected selector loaders, PE blocked. */
+#include "i386_pm2.inc"
+/* BB_386_STAGE5C5E_V1: first PE transition, one far JMP, then fail-closed. */
+#include "i386_pm3.inc"
+/* 5C5F: bounded post-far-JMP descriptor-backed instruction execution */
+#include "i386_pm4.inc"
+/* 5C5G cold protected-mode ALU/branch subset */
+#include "i386_pm5.inc"
+/* 5C5H: CPL0 descriptor-backed ModR/M */
+#include "i386_pm6.inc"
+/* Stage5C5I: protected CPL0 near stack/flow */
+#include "i386_pm7.inc"
 
 /* BB_386_STAGE5C3C_V1: model-386-only legacy word memory limit preflight. */
 /* The 8086/186/286 interpreter and JIT memory primitives are intentionally
@@ -1226,6 +1250,10 @@ static __attribute__((noinline, cold, section(".text.bb386_flash"))) int b86_386
         final_op = op;
         break;
     }
+    /* BB_386_STAGE5C5B_V2_IMPLICIT_R32: 0F 20/22 use r32 even without 66h.
+     * Inspect extension before execution; exception entry can change CS. */
+    const int implicit_control32 = final_op == 0x0Fu &&
+        (rd8(c, B86_CS, ip) == 0x20u || rd8(c, B86_CS, ip) == 0x22u);
     int rc = b86_step_internal(c);
     /* 67h string instructions update full ESI/EDI/ECX even with the default
      * 16-bit operand size. Keep their updated high halves, but preserve the
@@ -1234,7 +1262,7 @@ static __attribute__((noinline, cold, section(".text.bb386_flash"))) int b86_386
         ((final_op >= 0xA4 && final_op <= 0xA7) ||
          (final_op >= 0xAA && final_op <= 0xAF) ||
          (final_op >= 0x6C && final_op <= 0x6F));
-    if (!operand32) for (unsigned i = 0; i < 8; ++i) {
+    if (!operand32 && !implicit_control32) for (unsigned i = 0; i < 8; ++i) {
         if (wide_index && (i == B86_CX || i == B86_SI || i == B86_DI)) continue;
         c->r[i] = (c->r[i] & 0xFFFFu) | hi[i];
     }
@@ -1245,6 +1273,10 @@ B86_HOT int b86_step(B86Cpu *c)
 {
     /* BB_386_STAGE5C4A_V1: shutdown precedes fetch and all guest side effects. */
     if (c->model >= B86_CPU_386 && c->shutdown386) return B86_SHUTDOWN;
+    /* 5C5F: always use descriptor-backed protected execution while PE=1.
+     * PM4 also delegates the initial single far-JMP transition to PM3. */
+    if (c->model >= B86_CPU_386 && (c->msw & 1u))
+        return b86_pm7_step(c);
     if (c->model < B86_CPU_386) return b86_step_internal(c);
     return b86_386_step_flash(c);
 }

@@ -868,6 +868,54 @@ static BB386RM3_FLASH int b86_rm5c5a_system_66(St *s, int address32)
     return B86_OK;
 }
 
+/* BB_386_STAGE5C5B_V1: 80386 real-mode MOV r32,CR0 / MOV CR0,r32.
+ * Use the existing 286 MSW low bits, leaving B86Cpu layout and the native
+ * Thumb-2 JIT ABI untouched. CR0.ET is a fixed 386 bit here (bit4).
+ * PE, PG, NE and other unrepresented CR0 bits cannot be enabled yet;
+ * return UNSUPPORTED atomically rather than fabricating protected mode.
+ * CR2/CR3 encodings are architecturally valid and therefore unsupported,
+ * NOT invalid-opcode exceptions. The other CR indexes are #UD on 386.
+ * ModRM register form is mandatory and 66/67 do not alter the r32 width.
+ */
+static BB386RM3_FLASH int b86_rm5c5b_cr0(St *s, uint8_t op2)
+{
+    B86Cpu *c = s->c;
+    uint8_t second = f8(s); /* 20h or 22h */
+    uint8_t modrm = f8(s);
+    unsigned cr = (modrm >> 3) & 7u;
+    unsigned rm = modrm & 7u;
+    uint32_t value;
+    (void)second;
+    if ((modrm & 0xC0u) != 0xC0u)
+        return b86_rm5c2_fault(s, 6u); /* MOV CR cannot use memory */
+    if (cr == 2u || cr == 3u) {
+        c->ip = s->fip0; return B86_UNSUPPORTED; /* valid CR2/CR3 */
+    }
+    if (cr != 0u)
+        return b86_rm5c2_fault(s, 6u); /* CR1,CR4..7 undefined on 386 */
+    if (op2 == 0x20u) { /* MOV r32, CR0 */
+        c->r[rm] = 0x10u | (uint32_t)(c->msw & 0xFu);
+    } else { /* MOV CR0, r32 */
+        value = c->r[rm];
+        /* Only MP/EM/TS and the hardwired ET bit are representable.
+         * No PE transition, paging, numeric-exception mode or reserved bits. */
+        /* 5C5E: accept an isolated PE transition, never PG or unsupported
+         * control bits; keep legacy MP/EM/TS handling byte-exact. */
+        if ((c->msw & 1u) || (value & ~0x1Fu)) {
+            c->ip = s->fip0; return B86_UNSUPPORTED;
+        }
+        if (value & 1u) {
+            if (b86_pm3_enter(c, value) != B86_PM3_OK) {
+                c->ip = s->fip0; return B86_UNSUPPORTED;
+            }
+        } else {
+            c->msw = (uint16_t)((c->msw & ~(uint16_t)0xEu) | (value & 0xEu));
+        }
+    }
+    c->ip = s->ip;
+    return B86_OK;
+}
+
 static BB386RM3_FLASH int b86_rm3_dispatch(St *s, uint8_t op,
                                              int operand32, int address32)
 {
@@ -888,6 +936,8 @@ static BB386RM3_FLASH int b86_rm3_dispatch(St *s, uint8_t op,
         return b86_rm3_mov_seg(s, op, operand32, address32);
     if (op == 0x0F) {
         uint8_t op2 = rd8(c, B86_CS, s->ip);
+        if (op2 == 0x20 || op2 == 0x22)
+            return b86_rm5c5b_cr0(s, op2);
         if (op2 == 0x01 && operand32)
             return b86_rm5c5a_system_66(s, address32);
         /* RM2 does not own 0F 01; legacy step0f uses a 4-segment array. */
