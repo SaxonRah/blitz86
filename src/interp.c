@@ -21,6 +21,8 @@
 #include "b86_pm8.h"
 /* Stage5C5K: protected selectors, LEA and XCHG */
 #include "b86_pm9.h"
+/* Stage5C5L: protected direct far transfers */
+#include "b86_pm10.h"
 
 const uint8_t b86_parity[256] = {
 #define P2(n) n, n ^ 4, n ^ 4, n
@@ -797,6 +799,8 @@ static uint32_t b86_rm3_segvalue(B86Cpu *c, int which);
 #include "i386_pm8.inc"
 /* Stage5C5K: protected selectors, LEA and XCHG */
 #include "i386_pm9.inc"
+/* Stage5C5L: protected direct far transfers */
+#include "i386_pm10.inc"
 
 /* BB_386_STAGE5C3C_V1: model-386-only legacy word memory limit preflight. */
 /* The 8086/186/286 interpreter and JIT memory primitives are intentionally
@@ -1284,7 +1288,7 @@ B86_HOT int b86_step(B86Cpu *c)
     /* 5C5F: always use descriptor-backed protected execution while PE=1.
      * PM4 also delegates the initial single far-JMP transition to PM3. */
     if (c->model >= B86_CPU_386 && (c->msw & 1u))
-        return b86_pm9_step(c);
+        return b86_pm10_step(c);
     if (c->model < B86_CPU_386) return b86_step_internal(c);
     return b86_386_step_flash(c);
 }
