@@ -85,7 +85,9 @@ static BB386RM3_FLASH int b86_rm5c2_fault(St *s, unsigned vector)
     const uint16_t b = (uint16_t)(sp - 4u);
     const uint16_t d = (uint16_t)(sp - 6u);
     uint16_t ip, cs, flags;
-    if (vector != 6u && vector != 8u && vector != 12u && vector != 13u) goto unsupported;
+    /* Stage5C4D: vector 0 #DE and vector 5 #BR also use this bounded entry. */
+    if (vector != 0u && vector != 5u && vector != 6u &&
+        vector != 8u && vector != 12u && vector != 13u) goto unsupported;
     /* 80386 real-address mode: an IVT entry beyond IDTR.limit raises
      * interrupt 8 (NOT the protected-mode double-fault frame). */
     if (slot + 3u > c->idt_limit) {
@@ -816,6 +818,56 @@ static BB386RM3_FLASH int b86_rm5c_ud(St *s)
     return b86_rm5c2_fault(s, 6u);
 }
 
+/* BB_386_STAGE5C5A_V1: 386 real-mode, 32-bit operand-size 0F 01.
+ * 66 changes the GDTR/IDTR base transfer from 24 bits to 32 bits.
+ * Even with 67, the entire six-byte pseudo-descriptor must fit the
+ * currently 64-KiB real-mode segment limit. No protected-mode entry.
+ * The legacy 16-bit operand-size 0F 01 implementation is unchanged.
+ */
+static BB386RM3_FLASH int b86_rm5c5a_system_66(St *s, int address32)
+{
+    B86Cpu *c = s->c;
+    B86RM1EA ea;
+    uint32_t base;
+    uint16_t limit;
+    int form;
+    (void)f8(s); /* consume second opcode byte 01h (0Fh already consumed) */
+    form = b86_rm2_operand(s, address32, &ea);
+    if (ea.reg <= 3u) {
+        if (form != 0) return b86_rm5c2_fault(s, 6u); /* no register form */
+        if (ea.off > 0xFFFAu)
+            return b86_rm5c2_fault(s, ea.seg == B86_SS ? 12u : 13u);
+        if (ea.reg < 2u) {   /* SGDT/SIDT: full base 32 and limit 16 */
+            base = ea.reg == 0u ? c->gdt_base : c->idt_base;
+            limit = ea.reg == 0u ? c->gdt_limit : c->idt_limit;
+            b86_rm1_write(c, &ea, 2u, limit);
+            ea.off += 2u;
+            b86_rm1_write(c, &ea, 4u, base);
+        } else {             /* LGDT/LIDT: full base 32 and limit 16 */
+            limit = (uint16_t)b86_rm1_read(c, &ea, 2u);
+            ea.off += 2u;
+            base = b86_rm1_read(c, &ea, 4u);
+            if (ea.reg == 2u) { c->gdt_limit = limit; c->gdt_base = base; }
+            else { c->idt_limit = limit; c->idt_base = base; }
+        }
+    } else if (ea.reg == 4u || ea.reg == 6u) {
+        /* SMSW/LMSW memory is still 16 bits. SMSW r32 zero-extends. */
+        if (form == 0 && !b86_rm1_memok(&ea, 2u))
+            return b86_rm5c2_fault(s, ea.seg == B86_SS ? 12u : 13u);
+        if (ea.reg == 4u) {
+            if (form != 0) b86_rm1_regput(c, ea.rm, 2u, c->msw);
+            else b86_rm1_write(c, &ea, 2u, c->msw);
+        } else {
+            uint16_t v = (uint16_t)b86_rm1_rmget(c, &ea, 1u);
+            /* PE=1 is legal but remains unimplemented, not a fake #UD. */
+            if (v & 1u) { c->ip = s->fip0; return B86_UNSUPPORTED; }
+            c->msw = (uint16_t)((c->msw & 1u) | (v & 0x000Eu));
+        }
+    } else return b86_rm5c2_fault(s, 6u); /* reserved group extensions */
+    c->ip = s->ip;
+    return B86_OK;
+}
+
 static BB386RM3_FLASH int b86_rm3_dispatch(St *s, uint8_t op,
                                              int operand32, int address32)
 {
@@ -836,6 +888,8 @@ static BB386RM3_FLASH int b86_rm3_dispatch(St *s, uint8_t op,
         return b86_rm3_mov_seg(s, op, operand32, address32);
     if (op == 0x0F) {
         uint8_t op2 = rd8(c, B86_CS, s->ip);
+        if (op2 == 0x01 && operand32)
+            return b86_rm5c5a_system_66(s, address32);
         /* RM2 does not own 0F 01; legacy step0f uses a 4-segment array. */
         if (s->seg >= B86_FS && op2 == 0x01) {
             c->ip = s->fip0; return B86_UNSUPPORTED;

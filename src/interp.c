@@ -512,28 +512,42 @@ B86_HOT static int group3(St *s, int w)
     case 6: /* DIV */
         if (!w) {
             uint32_t n = g16(c, B86_AX);
-            if (v == 0 || n / v > 0xFF) { c->ip = DE_IP(s); b86_interrupt(c, 0); return 1; }
+            if (v == 0 || n / v > 0xFF) { if (c->model >= B86_CPU_386)
+                return b86_rm5c2_fault(s, 0u) + 1;
+            c->ip = DE_IP(s); b86_interrupt(c, 0); return 1; }
             p8(c, 0, (uint8_t)(n / v)); p8(c, 4, (uint8_t)(n % v));
         } else {
             uint32_t n = ((uint32_t)g16(c, B86_DX) << 16) | g16(c, B86_AX);
-            if (v == 0 || n / v > 0xFFFF) { c->ip = DE_IP(s); b86_interrupt(c, 0); return 1; }
+            if (v == 0 || n / v > 0xFFFF) { if (c->model >= B86_CPU_386)
+                return b86_rm5c2_fault(s, 0u) + 1;
+            c->ip = DE_IP(s); b86_interrupt(c, 0); return 1; }
             p16(c, B86_AX, (uint16_t)(n / v)); p16(c, B86_DX, (uint16_t)(n % v));
         }
         break;
     case 7: /* IDIV */
         if (!w) {
             int32_t n = (int16_t)g16(c, B86_AX), d = (int8_t)v;
-            if (d == 0) { c->ip = DE_IP(s); b86_interrupt(c, 0); return 1; }
+            if (d == 0) { if (c->model >= B86_CPU_386)
+                return b86_rm5c2_fault(s, 0u) + 1;
+            c->ip = DE_IP(s); b86_interrupt(c, 0); return 1; }
             int32_t q = n / d, r = n % d;
-            if (q < (s->c->model >= B86_CPU_286 ? -128 : -127) || q > 127) { c->ip = DE_IP(s); b86_interrupt(c, 0); return 1; }
+            if (q < (s->c->model >= B86_CPU_286 ? -128 : -127) || q > 127) { if (c->model >= B86_CPU_386)
+                return b86_rm5c2_fault(s, 0u) + 1;
+            c->ip = DE_IP(s); b86_interrupt(c, 0); return 1; }
             if (s->rep) q = -q;
             p8(c, 0, (uint8_t)q); p8(c, 4, (uint8_t)r);
         } else {
             int32_t n = (int32_t)(((uint32_t)g16(c, B86_DX) << 16) | g16(c, B86_AX)), d = (int16_t)v;
-            if (d == 0) { c->ip = DE_IP(s); b86_interrupt(c, 0); return 1; }
-            if (n == INT32_MIN && d == -1) { c->ip = DE_IP(s); b86_interrupt(c, 0); return 1; }
+            if (d == 0) { if (c->model >= B86_CPU_386)
+                return b86_rm5c2_fault(s, 0u) + 1;
+            c->ip = DE_IP(s); b86_interrupt(c, 0); return 1; }
+            if (n == INT32_MIN && d == -1) { if (c->model >= B86_CPU_386)
+                return b86_rm5c2_fault(s, 0u) + 1;
+            c->ip = DE_IP(s); b86_interrupt(c, 0); return 1; }
             int32_t q = n / d, r = n % d;
-            if (q < (s->c->model >= B86_CPU_286 ? -32768 : -32767) || q > 32767) { c->ip = DE_IP(s); b86_interrupt(c, 0); return 1; }
+            if (q < (s->c->model >= B86_CPU_286 ? -32768 : -32767) || q > 32767) { if (c->model >= B86_CPU_386)
+                return b86_rm5c2_fault(s, 0u) + 1;
+            c->ip = DE_IP(s); b86_interrupt(c, 0); return 1; }
             if (s->rep) q = -q;
             p16(c, B86_AX, (uint16_t)q); p16(c, B86_DX, (uint16_t)r);
         }
@@ -590,6 +604,10 @@ static __attribute__((noinline, cold, section(".text.bb386_flash"))) int step0f(
         int reg = s->reg;
         if (reg <= 3) {                             /* SGDT SIDT LGDT LIDT: memory only */
             if (s->mod == 3) goto ud;
+            /* BB_386_STAGE5C4E_V1: all SIX bytes must fit before any write
+             * or descriptor read. A 16-bit EA does not wrap mid-operand. */
+            if (c->model >= B86_CPU_386 && s->ea_off > 0xFFFAu)
+                return b86_rm5c2_fault(s, s->ea_seg == B86_SS ? 12u : 13u);
             uint16_t o = s->ea_off; int sg = s->ea_seg;
             uint32_t *base = (reg & 1) ? &c->idt_base : &c->gdt_base;
             uint16_t *lim = (reg & 1) ? &c->idt_limit : &c->gdt_limit;
@@ -603,8 +621,12 @@ static __attribute__((noinline, cold, section(".text.bb386_flash"))) int step0f(
                 *base = rd16(c, sg, (uint16_t)(o + 2)) | (uint32_t)rd8(c, sg, (uint16_t)(o + 4)) << 16;
             }
         } else if (reg == 4) {                      /* SMSW */
+            if (c->model >= B86_CPU_386 && s->mod != 3 && s->ea_off > 0xFFFEu)
+                return b86_rm5c2_fault(s, s->ea_seg == B86_SS ? 12u : 13u);
             rm_put(s, 1, (uint16_t)(0xFFF0u | c->msw));
         } else if (reg == 6) {                      /* LMSW: PE can be set, not cleared */
+            if (c->model >= B86_CPU_386 && s->mod != 3 && s->ea_off > 0xFFFEu)
+                return b86_rm5c2_fault(s, s->ea_seg == B86_SS ? 12u : 13u);
             uint16_t v = (uint16_t)rm_get(s, 1);
             /* Setting PE requests a mode transition this engine cannot perform.
              * Do not fabricate #UD for an architecturally valid 386 LMSW. */
@@ -651,9 +673,16 @@ B86_HOT static int step186(St *s, uint8_t op, int w)
             b86_interrupt(c, 6);
             return B86_OK;
         }
+        /* A boundary fault takes priority over the BOUND range comparison.
+         * The m16&16 pair is ONE four-byte memory operand. */
+        if (c->model >= B86_CPU_386 && s->ea_off > 0xFFFCu)
+            return b86_rm5c2_fault(s, s->ea_seg == B86_SS ? 12u : 13u);
         int16_t v = (int16_t)reg_get(s, 1);
         int16_t lo = (int16_t)rd16(c, s->ea_seg, s->ea_off), hi = (int16_t)rd16(c, s->ea_seg, (uint16_t)(s->ea_off + 2));
-        if (v < lo || v > hi) { c->ip = s->fip0; b86_interrupt(c, 5); return B86_OK; }   /* IP of the first prefix */
+        if (v < lo || v > hi) {
+            if (c->model >= B86_CPU_386) return b86_rm5c2_fault(s, 5u);
+            c->ip = s->fip0; b86_interrupt(c, 5); return B86_OK;
+        }   /* IP of the first prefix */
         break; }
     case 0x68: push(c, f16(s)); break;              /* PUSH imm16 */
     case 0x6A: push(c, (uint16_t)(int16_t)(int8_t)f8(s)); break;   /* PUSH imm8 (sign-extended) */
@@ -1093,7 +1122,11 @@ B86_HOT static int b86_step_internal(B86Cpu *c)
         if (n) rm_put(s, w, r);
         break; }
     case 0xD4: { uint8_t b = f8(s), al = g8(c, 0);
-        if (!b) { szp(c, 0, 0); c->ip = DE_IP(s); b86_interrupt(c, 0); return B86_OK; }
+        if (!b) {
+            /* BB_386_STAGE5C4D_V1: #DE is fault-atomic. AAM 0 must not change FLAGS. */
+            if (c->model >= B86_CPU_386) return b86_rm5c2_fault(s, 0u);
+            szp(c, 0, 0); c->ip = DE_IP(s); b86_interrupt(c, 0); return B86_OK;
+        }
         p8(c, 4, al / b); p8(c, 0, al % b); szp(c, 0, al % b); break; }
     case 0xD5: { uint8_t b = f8(s);
         uint32_t r = add_f(c, 0, g8(c, 0), (uint8_t)(g8(c, 4) * b), 0);
@@ -1134,7 +1167,11 @@ B86_HOT static int b86_step_internal(B86Cpu *c)
         break; }
     case 0xF4: c->ip = s->ip; return B86_HALT;
     case 0xF5: FL ^= B86_CF; break;
-    case 0xF6: case 0xF7: modrm(s); if (group3(s, w)) return B86_OK; break;
+    case 0xF6: case 0xF7: {
+        modrm(s);
+        int gr = group3(s, w);
+        if (gr) return c->model >= B86_CPU_386 ? gr - 1 : B86_OK;
+        break; }
     case 0xF8: FL &= ~(uint32_t)B86_CF; break;
     case 0xF9: FL |= B86_CF; break;
     case 0xFA: FL &= ~(uint32_t)B86_IF; break;
