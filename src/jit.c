@@ -3741,6 +3741,8 @@ B86_COLD static int b86_386_rm0_run(B86Cpu *c, uint64_t budget)
         if (c->seg[B86_CS] == c->trap_cs) return B86_TRAP;
         int r = b86_step(c);
         if (r != B86_OK) return r;
+        /* BB386_SLICES_COUNTED_V1: report guest instruction retirement to blitzBUS. */
+        ++c->icnt;
     }
     return B86_BUDGET;
 }

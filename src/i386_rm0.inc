@@ -92,6 +92,24 @@ static __attribute__((noinline, cold, section(".text.bb386_flash"))) int b86_rm0
         b86_rm0_push(c, b86_rm0_f32(s));
     } else if (op == 0x6A) {
         b86_rm0_push(c, (uint32_t)(int32_t)(int8_t)f8(s));
+    } else if (op == 0x69 || op == 0x6B) {
+        /* B86_386_IMUL_IMM_V1: 386 operand-size IMUL r32,r/m32,imm8/imm32 */
+        /* Decode the ModR/M operand BEFORE the immediate, as on an 80386.
+           A 6Bh immediate is signed byte; 69h is a signed DWORD. */
+        modrm(s);
+        int32_t multiplicand = (int32_t)b86_rm0_rmget(s);
+        int32_t immediate = op == 0x69 ? (int32_t)b86_rm0_f32(s)
+                                       : (int32_t)(int8_t)f8(s);
+        /* Full 32x32 signed product fits int64_t. Truncation is defined
+           after conversion to uint32_t; no signed 32-bit overflow UB. */
+        int64_t product = (int64_t)multiplicand * (int64_t)immediate;
+        uint32_t low = (uint32_t)product;
+        c->r[s->reg] = low;
+        /* x86 defines CF and OF for IMUL; other arithmetic flags undefined.
+           Preserve those flags rather than manufacturing ALU flags. */
+        uint32_t overflow = (product < (-2147483647LL - 1LL) || product > 2147483647LL);
+        c->flags = (c->flags & ~(uint32_t)(B86_CF | B86_OF))
+                 | (overflow ? (B86_CF | B86_OF) : 0u);
     } else if (op == 0x98) {                           /* CWDE */
         c->r[B86_AX] = (uint32_t)(int32_t)(int16_t)c->r[B86_AX];
     } else if (op == 0x99) {                           /* CDQ */
