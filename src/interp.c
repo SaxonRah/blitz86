@@ -38,6 +38,9 @@
 #include "b86_pm18.h"
 #include "b86_pm19.h"
 #include "b86_pm20.h"
+#include "b86_pm21.h"
+#include "b86_pm22.h"
+#include "b86_pm23.h"
 
 const uint8_t b86_parity[256] = {
 #define P2(n) n, n ^ 4, n ^ 4, n
@@ -831,6 +834,9 @@ static uint32_t b86_rm3_segvalue(B86Cpu *c, int which);
 #include "i386_pm18.inc"
 #include "i386_pm19.inc"
 #include "i386_pm20.inc"
+#include "i386_pm21.inc"
+#include "i386_pm22.inc"
+#include "i386_pm23.inc"
 
 /* BB_386_STAGE5C3C_V1: model-386-only legacy word memory limit preflight. */
 /* The 8086/186/286 interpreter and JIT memory primitives are intentionally
@@ -1321,7 +1327,7 @@ B86_HOT int b86_step(B86Cpu *c)
         /* SS interrupt/debug shadow is retired by one completed *following*
          * protected instruction. The loader arms it with value 2. */
         uint8_t before = c->pm386.seg[B86_SS].reserved;
-        int rc = b86_pm20_step(c);
+        int rc = b86_pm23_step(c);
         if (rc == B86_OK || rc == B86_HALT) {
             if (c->pm386.seg[B86_SS].reserved == B86_PM11_SHADOW_ARMED)
                 c->pm386.seg[B86_SS].reserved = B86_PM11_SHADOW_NEXT;
