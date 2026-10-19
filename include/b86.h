@@ -64,6 +64,7 @@ enum {
     LZ_ADC8, LZ_ADC16, LZ_SBB8, LZ_SBB16,                       /* explicit lz_b */
     LZ_SZPC8, LZ_SZPC16,  /* SF/ZF/PF from lz_res, CF/OF bits in lz_b, AF=0
                              (a shift by 1 followed by RCL/RCR by 1) */
+    LZ_ADD32, LZ_SUB32, LZ_LOG32, LZ_INC32, LZ_DEC32,   /* r56: 386 32-bit records */
     LZ_COUNT
 };
 
@@ -270,6 +271,9 @@ void     b86_jit_set_sparse_shadow(struct B86Jit *j, uint16_t *index,
 /* Memory in [lin, lin+len) may have been written by someone else: kill only
    translations whose bytes actually changed. Returns lines that differed. */
 uint32_t b86_jit_sync_external(struct B86Jit *j, uint32_t lin, uint32_t len);
+/* r56: the n most frequent forms the interpreter still steps in 386 real
+   mode since the last call, e.g. "66F7:1234 0FA4:99" (then cleared). */
+int b86_jit_386_top(struct B86Jit *j, char *buf, int len, int n);
 const B86JitStats *b86_jit_stats(struct B86Jit *j);
 /* v49: map a sampled Thumb-2 PC to the containing live translated block. */
 int b86_jit_pc_lookup(struct B86Jit *j, uintptr_t pc, uint32_t *key, uint32_t *offset);

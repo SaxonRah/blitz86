@@ -144,10 +144,17 @@ static BB386RM3_FLASH int b86_rm3_near32(St *s, uint8_t op, int address32)
             ea.mod = s->mod; ea.rm = s->rm; ea.reg = s->reg;
             ea.off = s->ea_off; ea.seg = s->ea_seg;
         }
-        if (ea.reg != 2 && ea.reg != 4 && ea.reg != 6) goto unsupported;
+        if (ea.reg != 0 && ea.reg != 1 && ea.reg != 2 && ea.reg != 4 && ea.reg != 6) goto unsupported;
         if (ea.mod != 3 && !b86_rm1_memok(&ea, 4u))
             return b86_rm5c2_fault(s, ea.seg == B86_SS ? 12u : 13u);
         v = b86_rm1_rmget(c, &ea, 2);
+        if (ea.reg <= 1) {                        /* r57: INC/DEC r/m32 (CF kept) */
+            uint32_t cf = c->flags & B86_CF;
+            b86_rm1_rmput(c, &ea, 2, b86_rm0_alu(c, ea.reg ? 5 : 0, v, 1));
+            c->flags = (c->flags & ~(uint32_t)B86_CF) | cf;
+            c->ip = s->ip;
+            return B86_OK;
+        }
         if (ea.reg == 6) {
             if (!b86_rm3_stack_push(c, v)) goto ss;
             c->ip = s->ip;
@@ -201,7 +208,9 @@ static BB386RM3_FLASH int b86_rm3_stack32(St *s, uint8_t op)
         for (unsigned i = 0; i < 8; ++i) {
             if (!b86_rm3_stack_read(c, (uint16_t)(sp + i * 4u), &save[i])) goto ss;
         }
-        c->r[B86_SP] = (c->r[B86_SP] & 0xFFFF0000u) | (uint16_t)(sp + 32u);
+        /* r57: silicon takes the upper half of ESP from the popped ESP slot
+           (16-bit stack: only SP itself advances by 32) */
+        c->r[B86_SP] = (save[3] & 0xFFFF0000u) | (uint16_t)(sp + 32u);
         for (unsigned i = 0; i < 8; ++i) if (order[i] != B86_SP) c->r[order[i]] = save[i];
     } else if (op == 0xC9) {                       /* LEAVE with 32-bit operand */
         /* SS has a 16-bit stack-address attribute in 386 real mode. */
@@ -279,7 +288,9 @@ static BB386RM3_FLASH int b86_rm3_load_far(St *s, uint8_t opcode,
     ea.off += offset_bytes;
     uint16_t selector = (uint16_t)b86_rm1_read(c, &ea, 2u);
     b86_rm1_regput(c, ea.reg, operand32 ? 2u : 1u, value);
-    b86_rm3_set_extra(c, opcode == 0xB4 ? B86_FS : B86_GS, selector);
+    if (opcode == 0xB2) b86_set_seg(c, B86_SS, selector);          /* r57: LSS */
+    else if (opcode == 0xC4 || opcode == 0xC5) b86_set_seg(c, opcode == 0xC4 ? B86_ES : B86_DS, selector);
+    else b86_rm3_set_extra(c, opcode == 0xB4 ? B86_FS : B86_GS, selector);
     c->ip = s->ip;
     return B86_OK;
 unsupported:
@@ -950,9 +961,56 @@ static BB386RM3_FLASH int b86_rm3_dispatch(St *s, uint8_t op,
             (void)f8(s);
             return b86_rm3_pushpop_seg(s, op2, operand32);
         }
-        if (op2 == 0xB4 || op2 == 0xB5) {
+        if (op2 == 0xB2 || op2 == 0xB4 || op2 == 0xB5) {
             (void)f8(s);
             return b86_rm3_load_far(s, op2, operand32, address32);
+        }
+    }
+    if (operand32 && (op == 0xC4 || op == 0xC5)) {                     /* r57: LES/LDS r32 */
+        if (((rd8(c, B86_CS, s->ip) >> 6) & 3u) == 3u) { c->ip = s->fip0; b86_interrupt(c, 6); return B86_OK; }
+        return b86_rm3_load_far(s, op, operand32, address32);
+    }
+    if (operand32 && !address32) {
+        /* r57: remaining 66h forms without an effective address */
+        if (op == 0x06 || op == 0x0E || op == 0x16 || op == 0x1E) {       /* PUSH sreg (32-bit slot) */
+            if (!b86_rm3_stack_push(c, (uint16_t)c->seg[op >> 3])) return b86_rm5c2_fault(s, 12u);
+            c->ip = s->ip; return B86_OK;
+        }
+        if (op == 0x07 || op == 0x17 || op == 0x1F) {                    /* POP sreg (32-bit slot) */
+            uint32_t v;
+            if (!b86_rm3_stack_pop(c, &v)) return b86_rm5c2_fault(s, 12u);
+            b86_set_seg(c, op >> 3, (uint16_t)v);
+            c->ip = s->ip; return B86_OK;
+        }
+        if ((op >= 0x70 && op <= 0x7F) || op == 0xEB || op == 0xE2 || op == 0xE3 || op == 0xE0 || op == 0xE1) {
+            int8_t rel = (int8_t)f8(s);
+            int take;
+            if (op == 0xEB) take = 1;
+            else if (op <= 0x7F) { b86_flags_materialize(c); take = cond(c, op & 15); }
+            else if (op == 0xE3) take = (uint16_t)c->r[B86_CX] == 0;
+            else {                                                         /* LOOP/LOOPE/LOOPNE (CX) */
+                uint16_t cx = (uint16_t)(c->r[B86_CX] - 1u);
+                c->r[B86_CX] = (c->r[B86_CX] & 0xFFFF0000u) | cx;
+                b86_flags_materialize(c);
+                take = cx != 0 && (op == 0xE2 || (op == 0xE1 ? (c->flags & B86_ZF) != 0 : (c->flags & B86_ZF) == 0));
+            }
+            if (take) {
+                uint32_t target = (uint32_t)s->ip + (uint32_t)(int32_t)rel;
+                if (target > 0xFFFFu) return b86_rm5c2_fault(s, 13u);
+                c->ip = (uint16_t)target;
+            } else c->ip = s->ip;
+            return B86_OK;
+        }
+        if (op == 0xE5 || op == 0xED || op == 0xE7 || op == 0xEF) {      /* IN/OUT EAX */
+            uint16_t port = (op & 8) ? (uint16_t)c->r[B86_DX] : f8(s);
+            if (op == 0xE5 || op == 0xED) {
+                uint32_t v = 0;
+                for (unsigned k = 0; k < 4; ++k) v |= (uint32_t)(c->in8 ? c->in8(c, (uint16_t)(port + k)) : 0xFFu) << (8 * k);
+                c->r[B86_AX] = v;
+            } else if (c->out8) {
+                for (unsigned k = 0; k < 4; ++k) c->out8(c, (uint16_t)(port + k), (uint8_t)(c->r[B86_AX] >> (8 * k)));
+            }
+            c->ip = s->ip; return B86_OK;
         }
     }
     if (operand32) {

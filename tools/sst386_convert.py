@@ -21,7 +21,9 @@ def main(src, csvf, dst, per, rx):
         if not fn.endswith(".json"): continue
         name = fn[:-5]
         if pat and not pat.search(name): continue
-        fm = mk.get(name, mk.get(name.split(".")[0], 0xFFFF))
+        base = name
+        while base[:2] in ("66", "67") and len(base) > 2: base = base[2:]           # prefix forms share the row
+        fm = mk.get(name, mk.get(name.split(".")[0], mk.get(base, mk.get(base.split(".")[0], 0xFFFF))))
         tests = json.load(open(os.path.join(src, fn)))
         tests = tests["tests"] if isinstance(tests, dict) else tests
         for t in tests[:per]:

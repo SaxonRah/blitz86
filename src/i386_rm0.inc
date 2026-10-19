@@ -155,6 +155,63 @@ static __attribute__((noinline, cold, section(".text.bb386_flash"))) int b86_rm0
                 if (kind != 7) c->r[s->reg] = result;
             }
         }
+    } else if (op == 0x85 || op == 0xA9) {             /* r57: TEST r/m32,r32 / EAX,imm32 */
+        if (op == 0xA9) { a = c->r[B86_AX]; b = b86_rm0_f32(s); }
+        else { modrm(s); a = b86_rm0_rmget(s); b = c->r[s->reg]; }
+        (void)b86_rm0_alu(c, 4, a, b);
+    } else if (op >= 0x91 && op <= 0x97) {             /* r57: XCHG EAX, r32 */
+        a = c->r[B86_AX]; c->r[B86_AX] = c->r[op & 7]; c->r[op & 7] = a;
+    } else if (op == 0x87) {                           /* r57: XCHG r/m32, r32 */
+        modrm(s);
+        a = b86_rm0_rmget(s); b = c->r[s->reg];
+        b86_rm0_rmput(s, b); c->r[s->reg] = a;
+    } else if (op == 0x8D) {                           /* r57: LEA r32, m (16-bit address) */
+        modrm(s);
+        if (s->mod == 3) { c->ip = s->fip0; b86_interrupt(c, 6); return B86_OK; }
+        c->r[s->reg] = (uint16_t)s->ea_off;
+    } else if (op == 0xF7) {                           /* r57: group 3, 32-bit */
+        modrm(s);
+        uint32_t v = b86_rm0_rmget(s);
+        switch (s->reg) {
+        case 0: case 1: (void)b86_rm0_alu(c, 4, v, b86_rm0_f32(s)); break;      /* TEST */
+        case 2: b86_rm0_rmput(s, ~v); break;                                   /* NOT */
+        case 3: b86_rm0_rmput(s, b86_rm0_alu(c, 5, 0, v)); break;              /* NEG */
+        case 4: case 5: {                                                       /* MUL / IMUL */
+            uint64_t pr; int ov;
+            if (s->reg == 4) { pr = (uint64_t)c->r[B86_AX] * v; ov = (pr >> 32) != 0; }
+            else { int64_t sp = (int64_t)(int32_t)c->r[B86_AX] * (int32_t)v; pr = (uint64_t)sp; ov = sp != (int64_t)(int32_t)sp; }
+            c->r[B86_AX] = (uint32_t)pr; c->r[B86_DX] = (uint32_t)(pr >> 32);
+            c->flags = (c->flags & ~(uint32_t)(B86_CF | B86_OF)) | (ov ? (B86_CF | B86_OF) : 0u);
+            break; }
+        default: {                                                              /* DIV / IDIV */
+            uint64_t n = (uint64_t)c->r[B86_DX] << 32 | c->r[B86_AX];
+            if (!v) { c->ip = s->fip0; b86_interrupt(c, 0); return B86_OK; }
+            if (s->reg == 6) {
+                uint64_t q = n / v;
+                if (q > 0xFFFFFFFFull) { c->ip = s->fip0; b86_interrupt(c, 0); return B86_OK; }
+                c->r[B86_AX] = (uint32_t)q; c->r[B86_DX] = (uint32_t)(n % v);
+            } else {
+                int64_t sn = (int64_t)n, sd = (int32_t)v;
+                if (sn == INT64_MIN && sd == -1) { c->ip = s->fip0; b86_interrupt(c, 0); return B86_OK; }
+                int64_t q = sn / sd;
+                if (q > 2147483647LL || q < -2147483648LL) { c->ip = s->fip0; b86_interrupt(c, 0); return B86_OK; }
+                c->r[B86_AX] = (uint32_t)q; c->r[B86_DX] = (uint32_t)(sn % sd);
+            }
+            break; }
+        }
+    } else if (op == 0xFF) {                           /* r57: INC/DEC/PUSH r/m32 */
+        modrm(s);
+        if (s->reg == 0 || s->reg == 1) {
+            uint32_t cf = c->flags & B86_CF;
+            b86_rm0_rmput(s, b86_rm0_alu(c, s->reg ? 5 : 0, b86_rm0_rmget(s), 1));
+            c->flags = (c->flags & ~(uint32_t)B86_CF) | cf;
+        } else if (s->reg == 6) b86_rm0_push(c, b86_rm0_rmget(s));
+        else goto unsupported;
+    } else if (op == 0x8F) {                           /* r57: POP r/m32 */
+        modrm(s);
+        if (s->reg != 0) goto unsupported;
+        a = b86_rm0_pop(c);
+        b86_rm0_rmput(s, a);
     } else goto unsupported;
     c->ip = s->ip;
     return B86_OK;

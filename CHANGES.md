@@ -1,5 +1,84 @@
 # Changes
 
+## 2026-10-19 (r57) — 386 real mode: interpreter gaps filled, 32-bit MUL native
+
+Full 80386 v1_ex_real_mode gap map (941 forms, 60 vectors each): the JIT
+fails no form more often than the interpreter; ~92 forms the interpreter did
+not support at all are now handled:
+* 66h: TEST r/m32 / EAX,imm32; XCHG r/m32,r32 and EAX,r32; LEA r32; the whole
+  F7 group (TEST NOT NEG MUL IMUL DIV IDIV, #DE at the faulting IP); INC/DEC
+  r/m32 (66 FF /0 /1 - the near32 path rejected them); PUSH r/m32; POP r/m32;
+  PUSH/POP sreg with 32-bit slots; Jcc/JMP/LOOP*/JCXZ rel8 (#GP past FFFF);
+  IN/OUT EAX; LES/LDS r32 (66 and 66 67, #UD for the register form).
+* LSS (0F B2) with and without 66/67.
+* 67h: F6/F7 groups at all widths, 82, POP r/m, LES/LDS, IMUL r,r/m,imm,
+  XLAT (EBX+AL), LOOP*/JECXZ with ECX; 67 83 immediate trimmed to the
+  operand width (CF was wrong); 67 LEA register form raises #UD.
+* POPAD with a 16-bit stack takes ESP's upper half from the popped slot
+  (silicon behaviour).
+* Native (Thumb-2): 66 F7 /4 /5 MUL/IMUL -> EDX:EAX via UMULL/SMULL (flags
+  dead); backend be_mull.
+* Tests: sst386 handles vectors with up to 8192 memory bytes (one 66 A7
+  vector stopped every earlier gap run, hiding ~186 forms); per-form
+  "stepped" count (SST386_ALL=1); sst386_convert strips all 66/67 prefixes
+  for the undefined-flag mask.
+* Still open in the interpreter: SHLD/SHRD with counts above the operand
+  size, BT* with 67 segment-limit faults, SHR OF with 66/67 and CL counts,
+  BOUND with 66/67, 66 ENTER.
+* Regression: 386 16-bit 23038/23038, 66h set 11772/11772, 286 suite
+  83809/83809, 8086 vectors 10973/10973; FUZZ_386 0 mismatches (Thumb-2
+  paged/non-paged, hot 1, AArch64); 8086 and 286 fuzz 0 mismatches.
+* Note: make does not track src/i386_*.inc; touch src/interp.c after
+  editing them.
+
+## 2026-10-19 (r56b) — more native 386 forms
+
+* Jcc rel16 (0F 80-8F) native, through the 70-7F Jcc machinery (chaining,
+  fusion, inner branches).
+* Read-modify-write memory destinations for ADD OR AND SUB XOR r/m32,r32
+  and 81/83 (address kept in rep_tmp[0] across the operation).
+* MOV r/m32,imm32 (66 C7); TEST r/m32,imm32, NOT, NEG r/m32 (66 F7 /0,2,3;
+  the 386 interpreter has no 66 F7 at all); CWDE, CDQ; XCHG r32,r32;
+  LEA r32 (16-bit address, zero-extended); SHL/SHR/SAR r32,1 and
+  IMUL r32,r/m32 (flags dead).
+* 80386 vectors for these forms (38 files, 150 each), JIT scored against
+  silicon directly: every native vector passes; the remaining misses are
+  exceptions (#UD/#GP) or prefix orders/forms that are not native and that
+  the interpreter does not support either (66 F7 /1 /4-/7, XCHG with
+  memory, 67h). Regression: 386 16-bit 23038/23038, 66h set 11651/11651,
+  286 suite, 8086 vectors, FUZZ_386 unchanged (0 mismatches).
+
+## 2026-10-19 (r56) — 386 tier 2: native 32-bit operand forms
+
+* Native (Thumb-2) 386 forms, 16-bit addressing: MOV r32,imm32 /
+  r32,r/m32 / m32,r32; ADD OR AND SUB XOR CMP r32,r/m32 and r/m32,r32
+  (memory destination only for CMP), 81/83 with imm (memory only for CMP),
+  TEST r/m32,r32; INC/DEC r32; PUSH/POP r32 (not ESP); SHL/SHR/SAR r32,imm8
+  (flags dead); MOVZX/MOVSX r16/r32, r/m8 / r/m16. They decode to op 0xF2
+  (a prefix value, never a decoded op) with x386/o32/x0f. Everything else
+  with 66h/67h/64h/65h/0F still ends the block and is stepped.
+* 32-bit registers in generated code: host register = low half, ctx rhi[r]
+  = upper half (g32_load: LDR + BFI, g32_store: STR + MOV). r386_merge
+  now masks rhi (its low half may hold anything).
+* 32-bit lazy flag records LZ_ADD32/SUB32/LOG32/INC32/DEC32 (lazy_eval
+  width 2), same formulas as the 386 interpreter.
+* Backend: be_load/be_store width 2 (LDR/STR, SMC slow path length 4).
+* Fix (tier 1 too): the 386 keeps AF across SHL/SHR/SAR, the record cleared
+  it. In 386 mode D0/D1 shifts no longer count as defining AF in the flag
+  analysis (so the previous producer's AF reaches e.g. a following AAS) and
+  are native only while AF is dead.
+* b86_jit_386_top(): the forms the interpreter still steps in 386 real mode,
+  most frequent first ("66F7:1234 0FA4:99 ..."), cleared on read.
+* Tests: tests/t386u.c (one instruction sequence, random 32-bit state,
+  interpreter vs JIT); tools/sst386_convert.py uses the base opcode's
+  undefined-flag mask for 66h/67h forms; SST386_JITALL=1 also scores the JIT
+  where the interpreter fails. 80386 vectors: 16-bit forms 23038/23038,
+  66h/0F forms (91 files, 150 each) 11651/11651 of the interpreter-passing
+  vectors. The interpreter lacks 66 85 (TEST r/m32,r32: 141/150 fail); the
+  native JIT form passes those vectors against silicon. FUZZ_386: 0
+  mismatches (Thumb-2 paged/non-paged, hot 1, AArch64). 8086 vectors, 286
+  suite, 8086/286 fuzz unchanged.
+
 ## 2026-10-18 (r55) — 386 real mode runs through the Thumb-2 JIT (tier 1)
 
 b86_jit_run no longer hands 386 real mode to b86_386_rm0_run (one

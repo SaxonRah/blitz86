@@ -163,12 +163,12 @@ static __attribute__((noinline, cold, section(".text.bb386_flash"))) int b86_rm1
         goto done;
     }
     if ((op < 0x40 && (op & 7u) <= 3u) ||
-        op == 0x80 || op == 0x81 || op == 0x83 ||
+        op == 0x80 || op == 0x81 || op == 0x82 || op == 0x83 ||
         (op >= 0x84 && op <= 0x8B) || op == 0x8D ||
         op == 0xC6 || op == 0xC7) {
         reg_form = b86_rm1_ea(s, &m);
         if (op == 0x8D) {                        /* LEA: no memory access/check */
-            if (reg_form) goto unsupported;
+            if (reg_form) { c->ip = s->fip0; b86_interrupt(c, 6); return B86_OK; }   /* r57: #UD */
             b86_rm1_regput(c, m.reg, operand32 ? 2u : 1u, m.off);
             goto done;
         }
@@ -216,10 +216,110 @@ static __attribute__((noinline, cold, section(".text.bb386_flash"))) int b86_rm1
         /* Grp 1: 80=imm8, 81=imm16/32, 83=sign-extended imm8. */
         kind = m.reg;
         a = b86_rm1_rmget(c, &m, width);
-        if (op == 0x83) b = (uint32_t)(int32_t)(int8_t)f8(s);
+        if (op == 0x83) b = (uint32_t)(int32_t)(int8_t)f8(s) & (width == 2 ? 0xFFFFFFFFu : 0xFFFFu);   /* r57: to operand width */
         else b = width == 2 ? b86_rm1_f32(s) : width == 1 ? f16(s) : f8(s);
         r = b86_rm1_alu(c, width, kind, a, b);
         if (kind != 7) b86_rm1_rmput(c, &m, width, r);
+        goto done;
+    }
+    /* r57: the remaining 67h forms */
+    if (op == 0xF6 || op == 0xF7 || op == 0x8F || op == 0xC4 || op == 0xC5 || op == 0x69 || op == 0x6B) {
+        reg_form = b86_rm1_ea(s, &m);
+        width = (op == 0xF6) ? 0u : (operand32 ? 2u : 1u);
+        unsigned bytes = 1u << width;
+        if (op == 0xC4 || op == 0xC5) {                          /* LES / LDS */
+            if (reg_form) goto unsupported;
+            if (!b86_rm1_memok(&m, bytes + 2u)) return b86_rm5c2_fault(s, m.seg == B86_SS ? 12u : 13u);
+            a = b86_rm1_read(c, &m, bytes);
+            m.off += bytes;
+            b = b86_rm1_read(c, &m, 2u);
+            b86_rm1_regput(c, m.reg, width, a);
+            b86_set_seg(c, op == 0xC4 ? B86_ES : B86_DS, (uint16_t)b);
+            goto done;
+        }
+        if (!reg_form && !b86_rm1_memok(&m, bytes)) return b86_rm5c2_fault(s, m.seg == B86_SS ? 12u : 13u);
+        if (op == 0x8F) {                                        /* POP r/m */
+            if (m.reg) goto unsupported;
+            uint16_t sp = (uint16_t)c->r[B86_SP];
+            a = width == 2 ? (uint32_t)rd16(c, B86_SS, sp) | (uint32_t)rd16(c, B86_SS, (uint16_t)(sp + 2)) << 16 : rd16(c, B86_SS, sp);
+            c->r[B86_SP] = (c->r[B86_SP] & 0xFFFF0000u) | (uint16_t)(sp + bytes);
+            b86_rm1_rmput(c, &m, width, a);
+            goto done;
+        }
+        if (op == 0x69 || op == 0x6B) {                          /* IMUL r, r/m, imm */
+            int32_t x = width == 2 ? (int32_t)b86_rm1_rmget(c, &m, 2) : (int16_t)b86_rm1_rmget(c, &m, 1);
+            int32_t y = op == 0x6B ? (int8_t)f8(s) : width == 2 ? (int32_t)b86_rm1_f32(s) : (int16_t)f16(s);
+            int64_t pr = (int64_t)x * y;
+            int ov = width == 2 ? pr != (int64_t)(int32_t)pr : pr != (int64_t)(int16_t)pr;
+            b86_rm1_regput(c, m.reg, width, (uint32_t)pr);
+            b86_flags_materialize(c);
+            c->flags = (c->flags & ~(uint32_t)(B86_CF | B86_OF)) | (ov ? (B86_CF | B86_OF) : 0u);
+            goto done;
+        }
+        uint32_t mask = width == 2 ? 0xFFFFFFFFu : width ? 0xFFFFu : 0xFFu;
+        unsigned bits = 8u << width;
+        a = b86_rm1_rmget(c, &m, width);
+        switch (m.reg) {
+        case 0: case 1:
+            b = width == 2 ? b86_rm1_f32(s) : width ? f16(s) : f8(s);
+            (void)b86_rm1_alu(c, width, 4, a, b); break;
+        case 2: b86_rm1_rmput(c, &m, width, ~a & mask); break;
+        case 3: b86_rm1_rmput(c, &m, width, b86_rm1_alu(c, width, 5, 0, a)); break;
+        case 4: case 5: {
+            uint64_t acc = b86_rm1_regget(c, B86_AX, width), pr; int ov;
+            if (m.reg == 4) { pr = acc * a; ov = (pr >> bits) != 0; }
+            else {
+                int64_t sa = width == 2 ? (int32_t)acc : width ? (int16_t)acc : (int8_t)acc;
+                int64_t sb = width == 2 ? (int32_t)a : width ? (int16_t)a : (int8_t)a;
+                int64_t sp = sa * sb; pr = (uint64_t)sp;
+                ov = width == 2 ? sp != (int64_t)(int32_t)sp : width ? sp != (int64_t)(int16_t)sp : sp != (int64_t)(int8_t)sp;
+            }
+            if (width == 0) c->r[B86_AX] = (c->r[B86_AX] & 0xFFFF0000u) | (uint16_t)pr;
+            else { b86_rm1_regput(c, B86_AX, width, (uint32_t)pr); b86_rm1_regput(c, B86_DX, width, (uint32_t)(pr >> bits)); }
+            b86_flags_materialize(c);
+            c->flags = (c->flags & ~(uint32_t)(B86_CF | B86_OF)) | (ov ? (B86_CF | B86_OF) : 0u);
+            break; }
+        default: {                                               /* DIV / IDIV */
+            uint64_t n = width == 0 ? (uint16_t)c->r[B86_AX]
+                       : ((uint64_t)b86_rm1_regget(c, B86_DX, width) << bits) | b86_rm1_regget(c, B86_AX, width);
+            if (!a) { c->ip = s->fip0; b86_interrupt(c, 0); return B86_OK; }
+            uint64_t q, rmd;
+            if (m.reg == 6) { q = n / a; rmd = n % a; if (q > mask) { c->ip = s->fip0; b86_interrupt(c, 0); return B86_OK; } }
+            else {
+                int64_t sn = width == 2 ? (int64_t)n : width ? (int32_t)n : (int16_t)n;
+                int64_t sd = width == 2 ? (int32_t)a : width ? (int16_t)a : (int8_t)a;
+                int64_t sq = sn / sd, sr = sn % sd, lim = (int64_t)1 << (bits - 1);
+                if (sq >= lim || sq < -lim) { c->ip = s->fip0; b86_interrupt(c, 0); return B86_OK; }
+                q = (uint64_t)sq; rmd = (uint64_t)sr;
+            }
+            if (width == 0) c->r[B86_AX] = (c->r[B86_AX] & 0xFFFF0000u) | (uint16_t)((q & 0xFF) | (rmd & 0xFF) << 8);
+            else { b86_rm1_regput(c, B86_AX, width, (uint32_t)q); b86_rm1_regput(c, B86_DX, width, (uint32_t)rmd); }
+            break; }
+        }
+        goto done;
+    }
+    if (op == 0xD7) {                                            /* XLAT: [seg:EBX + AL] */
+        m.mod = 0; m.seg = s->seg >= 0 ? s->seg : B86_DS;
+        m.off = c->r[B86_BX] + (c->r[B86_AX] & 0xFFu);
+        if (!b86_rm1_memok(&m, 1u)) return b86_rm5c2_fault(s, m.seg == B86_SS ? 12u : 13u);
+        c->r[B86_AX] = (c->r[B86_AX] & ~0xFFu) | b86_rm1_read(c, &m, 1u);
+        goto done;
+    }
+    if (op >= 0xE0 && op <= 0xE3) {                             /* LOOPxx / JECXZ with ECX */
+        int8_t rel = (int8_t)f8(s);
+        int take;
+        if (op == 0xE3) take = c->r[B86_CX] == 0;
+        else {
+            c->r[B86_CX] -= 1u;
+            b86_flags_materialize(c);
+            take = c->r[B86_CX] != 0 && (op == 0xE2 || (op == 0xE1 ? (c->flags & B86_ZF) != 0 : (c->flags & B86_ZF) == 0));
+        }
+        if (take) {
+            uint32_t target = (operand32 ? (uint32_t)s->ip + (uint32_t)(int32_t)rel : (uint16_t)(s->ip + rel));
+            if (target > 0xFFFFu) return b86_rm5c2_fault(s, 13u);
+            c->ip = (uint16_t)target;
+            return B86_OK;
+        }
         goto done;
     }
 unsupported:

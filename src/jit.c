@@ -248,6 +248,8 @@ typedef struct B86Jit {
     int no_lookahead;
     int single_step;            /* testing: never enter a block from the fast table */
     int pm_seen;                /* r55: 386 left real mode since the last flush */
+    uint32_t *h386;             /* r56: interpreter steps in 386 real mode by form:
+                                   [op] plain, [256 + op] 66h, [512 + op2] 0F op2 */
     int no_chain;               /* testing: never patch chain exits */
     int hot_external;           /* fast/codemap supplied by the caller */
     uint8_t *cm_table;          /* codemap allocation (paged: 32 Ki entries)   */
@@ -310,6 +312,10 @@ typedef struct Insn {
     uint8_t runf;                       /* r52j: PUSH/POP emitted by the run leader */
     uint8_t x186;                       /* r53b: op 0xF1 = this 80186 opcode (PUSH imm, LEAVE) */
     uint8_t ximm;                       /* r53b: D2/D3 shift with an immediate count (186 C0/C1) */
+    uint8_t x386, o32, x0f;             /* r56: op 0xF2 = native 386 form: opcode (after 0F when
+                                           x0f), 32-bit operand size (66h) */
+    uint32_t imm32;                     /* r56: 32-bit immediate */
+    uint8_t m386;                       /* r56: decoded for the 386 model */
     uint8_t wm;                         /* guest GPRs (bit per reg16) written   */
     uint8_t pendb;                      /* INC/DEC overlay possibly live before */
     uint8_t inv;                        /* unrolled LOOP copy: exit when CX == 0 */
@@ -374,11 +380,76 @@ B86_HOT static int imm_size(uint8_t op, uint8_t reg)
     return 0;
 }
 
+/* r56 (386 tier 2): 66h operand-size and 0F forms translated natively get
+   op 0xF2 (a prefix value, never a decoded op) and x386/o32/x0f; anything
+   else ends the block and is stepped by the interpreter (op 0x0F, C_END).
+   16-bit addressing only (67h is not native yet). */
+B86_COLD static void decode386(B86Cpu *c, uint32_t cs, uint32_t p, uint8_t op, Insn *d)
+{
+    int o32 = 0, x0f = 0, ok = 0, modrm = 0, immn = 0;
+    if (op == 0x66) { o32 = 1; op = fb(c, cs, p++); }
+    if (op == 0x0F) { x0f = 1; op = fb(c, cs, p++); }
+    if (x0f && !o32 && op >= 0x80 && op <= 0x8F) {               /* Jcc rel16 -> the 70-7F machinery */
+        if (p + 2u > 0x10000u) { d->next = (uint16_t)p; d->op = 0x0F; d->cls = C_END; return; }
+        d->imm = (uint16_t)(fb(c, cs, p) | fb(c, cs, p + 1) << 8);
+        p += 2;
+        d->op = (uint8_t)(0x70 | (op & 15)); d->x0f = 1; d->next = (uint16_t)p;
+        return;
+    }
+    if (x0f) {
+        if (op == 0xB6 || op == 0xB7 || op == 0xBE || op == 0xBF) ok = modrm = 1;   /* MOVZX / MOVSX */
+        else if (op == 0xAF && o32) ok = modrm = 1;                                  /* IMUL r32, r/m32 */
+    } else if (o32) {
+        if (op >= 0xB8 && op <= 0xBF) { ok = 1; immn = 4; }
+        else if ((op < 0x40 && (op & 7) <= 3 && (op & 1) && ((op >> 3) == 0 || (op >> 3) == 1 || (op >> 3) >= 4))
+                 || op == 0x85 || op == 0x89 || op == 0x8B) ok = modrm = 1;
+        else if (op == 0x81 || op == 0x83) { ok = modrm = 1; immn = op == 0x81 ? 4 : 1; }
+        else if (op >= 0x40 && op <= 0x4F) ok = 1;
+        else if (op >= 0x50 && op <= 0x5F) ok = (op & 7) != B86_SP;
+        else if (op == 0xC1) { ok = modrm = 1; immn = 1; }
+        else if (op == 0xD1 || op == 0x87 || op == 0x8D) ok = modrm = 1;
+        else if (op == 0xC7) { ok = modrm = 1; immn = 4; }
+        else if (op == 0xF7) ok = modrm = 1;                      /* imm decided below */
+        else if (op == 0x98 || op == 0x99) ok = 1;                /* CWDE / CDQ */
+    }
+    if (ok && modrm) {
+        uint8_t m = fb(c, cs, p++);
+        d->has_modrm = 1;
+        d->mod = m >> 6; d->reg = (m >> 3) & 7; d->rm = m & 7;
+        if (d->mod == 0 && d->rm == 6) { d->disp = (int16_t)(fb(c, cs, p) | fb(c, cs, p + 1) << 8); p += 2; }
+        else if (d->mod == 1) { d->disp = (int8_t)fb(c, cs, p); p += 1; }
+        else if (d->mod == 2) { d->disp = (int16_t)(fb(c, cs, p) | fb(c, cs, p + 1) << 8); p += 2; }
+        int mem = d->mod != 3;
+        if (!x0f) {
+            /* memory destinations are read-modify-write (address kept in rep_tmp[0]) */
+            if ((op == 0x81 || op == 0x83) && (d->reg == 2 || d->reg == 3)) ok = 0;
+            if ((op == 0xC1 || op == 0xD1) && (mem || !(d->reg == 4 || d->reg == 5 || d->reg == 7))) ok = 0;
+            if (op == 0x87 && mem) ok = 0;
+            if (op == 0x8D && !mem) ok = 0;
+            if (op == 0xC7 && d->reg != 0) ok = 0;
+            if (op == 0xF7) {
+                if (d->reg == 0) immn = 4;                          /* TEST r/m32, imm32 */
+                else if (d->reg == 1 || d->reg >= 6) ok = 0;        /* DIV / IDIV: interpreter (#DE) */
+            }
+        }
+    }
+    if (ok && immn) {
+        uint32_t v = 0;
+        for (int k = 0; k < immn; ++k) v |= (uint32_t)fb(c, cs, p + (uint32_t)k) << (8 * k);
+        if (immn == 1 && op == 0x83) v = (uint32_t)(int32_t)(int8_t)v;
+        d->imm32 = v; p += (uint32_t)immn;
+    }
+    d->next = (uint16_t)p;
+    if (!ok || p > 0xFFFFu) { d->op = 0x0F; d->cls = C_END; return; }
+    d->op = 0xF2; d->x386 = op; d->o32 = (uint8_t)o32; d->x0f = (uint8_t)x0f;
+}
+
 B86_HOT static void decode(B86Cpu *c, uint32_t cs, uint16_t ip, Insn *d)
 {
     memset(d, 0, sizeof *d);
     d->ip = ip;
     d->seg = 0xFF;
+    d->m386 = (uint8_t)(c->model >= B86_CPU_386);
     uint32_t p = ip;
     uint8_t op;
     for (;;) {
@@ -388,6 +459,7 @@ B86_HOT static void decode(B86Cpu *c, uint32_t cs, uint16_t ip, Insn *d)
         if (op == 0xF0 || op == 0xF1) { d->nprefix++; continue; }
         break;
     }
+    if (c->model >= B86_CPU_386 && (op == 0x66 || op == 0x0F)) { decode386(c, cs, p, op, d); return; }
     int ximm = 0;
     if (c->model >= B86_CPU_186 && (op == 0x68 || op == 0x6A || op == 0xC9)) {
         /* r53b: native 186 ops get the unused prefix value 0xF1 as their op
@@ -480,6 +552,16 @@ B86_HOT static void classify(Insn *d)
     }
     switch (op) {
     case 0xF1: d->fuse = 0; d->native = be_rep_inline; return;   /* r53b: 186 PUSH imm / LEAVE (Thumb-2) */
+    case 0xF2: {                                                   /* r56: native 386 form (Thumb-2) */
+        uint8_t x = d->x386;
+        d->fuse = 0; d->nzclob = 1; d->native = be_rep_inline;
+        if (!d->x0f && ((x < 0x40) || x == 0x85 || x == 0x81 || x == 0x83)) d->fdef = ALLF;
+        else if (!d->x0f && x == 0xF7 && (d->reg == 4 || d->reg == 5)) d->nfd = ALLF;   /* MUL/IMUL: flags dead */
+        else if (!d->x0f && x == 0xF7 && d->reg != 2) d->fdef = ALLF;   /* TEST / NEG (NOT: none) */
+        else if (!d->x0f && x >= 0x40 && x <= 0x4F) d->fdef = ALLF & ~B86_CF;
+        else if (!d->x0f && (x == 0xC1 || x == 0xD1)) d->nfd = ALLF;    /* flags only when dead */
+        else if (d->x0f && x == 0xAF) d->nfd = ALLF;
+        return; }
     case 0x06: case 0x0E: case 0x16: case 0x1E: d->fuse = 0; d->native = 1; return;
     case 0x07: case 0x17: case 0x1F: d->fuse = 0; d->native = 1; return;
     case 0x0F: d->cls = C_END; return;
@@ -546,6 +628,9 @@ B86_HOT static void classify(Insn *d)
                     (B86_RCX_MEM1 && !be_has_t2 && memop && (d->reg == 2 || d->reg == 3)) ||
                     (d->reg < 4 && d->mod == 3 && (d->w || d->rm < 4));   /* ROL/ROR/RCL/RCR r,1 */
         if (d->reg < 4) d->nzclob = 1;
+        /* r56: the 386 keeps AF across SHL/SHR/SAR (the record would clear it):
+           AF is not defined by them, and they are native only while AF is dead */
+        else if (d->m386) { d->nfd = B86_AF; d->fdef = ALLF & ~B86_AF; }
         return;
     case 0xD2: case 0xD3: /* count may be 0: defines nothing for sure */
         d->fuse = (d->reg == 2 || d->reg == 3) ? B86_CF : 0; d->fdef = 0;
@@ -576,7 +661,8 @@ B86_HOT static void classify(Insn *d)
     if (op >= 0x40 && op <= 0x4F) { d->fuse = 0; d->fdef = ALLF & ~B86_CF; d->native = 1; return; }
     if (op >= 0x50 && op <= 0x5F) { d->fuse = 0; d->native = 1; return; }
     if (op >= 0x60 && op <= 0x7F) {
-        d->cls = C_JCC; d->target = (uint16_t)(d->next + (int8_t)d->imm);
+        d->cls = C_JCC;
+        d->target = (uint16_t)(d->next + (d->x0f ? (int16_t)d->imm : (int8_t)d->imm));   /* r56: 0F 8x rel16 */
         d->fuse = cc_use[(op & 15) >> 1]; d->native = 1; return;
     }
     if (op >= 0xB0 && op <= 0xBF) { d->fuse = 0; d->native = 1; return; }
@@ -734,6 +820,12 @@ B86_COLD static int checked_store(const Insn *d)
         return 1;                                                          /* PUSH / CALL */
     if (op == 0xFF && (d->reg == 2 || d->reg >= 6)) return 1;
     if (op == 0xF1 && d->x186 != 0xC9) return 1;                         /* 186 PUSH imm */
+    if (op == 0xF2 && !d->x0f && d->has_modrm && d->mod != 3 &&
+        (d->x386 == 0xC7 || (d->x386 < 0x40 && !(d->x386 & 2) && (d->x386 >> 3) != 7) ||
+         ((d->x386 == 0x81 || d->x386 == 0x83) && d->reg != 7) || (d->x386 == 0xF7 && d->reg != 0)))
+        return 1;                                                          /* 386 r/m32 stores */
+    if (op == 0xF2 && !d->x0f && ((d->x386 == 0x89 && d->mod != 3) || (d->x386 >= 0x50 && d->x386 <= 0x57)))
+        return 1;                                                          /* 386 MOV m32 / PUSH r32 */
     if (!d->has_modrm || d->mod == 3) return 0;
     if (is_mem_dst_producer(d)) return 1;
     switch (op) {
@@ -1720,6 +1812,177 @@ B86_COLD static void load_rm(Tx *t, const Insn *d, int w, int dst)
 }
 
 /* Lower one instruction natively. Returns 0 to request the helper. */
+/* r56: 32-bit guest registers inside 386 native code. The host register
+   holds the low 16 bits (bits 16-31 undefined), ctx rhi[r] the upper half
+   (its low half undefined), see r386_merge. */
+#define OFF_RHI(r) (OFF(rhi) + 4u * (unsigned)(r))
+B86_COLD static void g32_load(Emit *e, int tmp, int r)
+{
+    be_ldctx(e, tmp, OFF_RHI(r));
+    be_bfi(e, tmp, r, 0, 16);
+}
+B86_COLD static void g32_store(Emit *e, int r, int src)
+{
+    be_stctx(e, src, OFF_RHI(r));
+    if (src != r) be_mov(e, r, src);
+}
+B86_COLD static void rec386(Tx *t, uint32_t kind, int incdec)
+{
+    Emit *e = t->e;
+    be_stctx_imm(e, kind, incdec ? OFF(lz_ikind) : OFF(lz_kind));   /* uses LR (V_T1) */
+    if (incdec) t->inc_pending = 1;
+    else if (t->inc_pending) { be_stctx_imm(e, LZ_NONE, OFF(lz_ikind)); t->inc_pending = 0; }
+}
+B86_COLD static int emit386(Tx *t, Insn *d)
+{
+    Emit *e = t->e;
+    uint8_t x = d->x386;
+    int lz = d->lazy && !d->defer;
+    int mem = d->has_modrm && d->mod != 3;
+    if (d->x0f) {                                  /* MOVZX / MOVSX r16/r32, r/m8 / r/m16 */
+        int word = x & 1, sx = x >= 0xBE;
+        if (mem) {
+            ea_modrm(t, d);
+            be_load(e, word, V_T1, V_T0);
+            if (sx) be_sbfx(e, V_T1, V_T1, 0, word ? 16 : 8);
+        } else if (word) {
+            if (sx) be_sbfx(e, V_T1, d->rm, 0, 16); else be_ubfx(e, V_T1, d->rm, 0, 16);
+        } else {
+            unsigned lsb = d->rm >= 4 ? 8u : 0u;
+            if (sx) be_sbfx(e, V_T1, d->rm & 3, lsb, 8); else be_ubfx(e, V_T1, d->rm & 3, lsb, 8);
+        }
+        if (d->o32) g32_store(e, d->reg, V_T1); else be_mov(e, d->reg, V_T1);
+        return 1;
+    }
+    if (x >= 0xB8 && x <= 0xBF) { be_movi(e, V_T1, d->imm32); g32_store(e, x & 7, V_T1); return 1; }
+    if (x == 0x89 || x == 0x8B) {
+        int dst = x == 0x89 ? d->rm : d->reg, src = x == 0x89 ? d->reg : d->rm;
+        if (!mem) { g32_load(e, V_T1, src); g32_store(e, dst, V_T1); return 1; }
+        ea_modrm(t, d);
+        if (x == 0x8B) { be_load(e, 2, V_T1, V_T0); g32_store(e, d->reg, V_T1); }
+        else { g32_load(e, V_T1, d->reg); be_store(e, 2, V_T1, V_T0, 1, d->next); }
+        return 1;
+    }
+    if (x >= 0x40 && x <= 0x4F) {                  /* INC / DEC r32: overlay record, CF kept */
+        int r = x & 7, dec = x >= 0x48;
+        g32_load(e, V_T0, r);
+        if (lz) be_stctx(e, V_T0, OFF(lz_ia));
+        be_opi(e, dec ? AOP_SUB : AOP_ADD, V_T0, V_T0, 1u);
+        if (lz) { be_stctx(e, V_T0, OFF(lz_ires)); rec386(t, dec ? LZ_DEC32 : LZ_INC32, 1); }
+        g32_store(e, r, V_T0);
+        return 1;
+    }
+    if (x >= 0x50 && x <= 0x57) {                  /* PUSH r32 */
+        g32_load(e, V_T1, x & 7);
+        be_opi(e, AOP_SUB, B86_SP, B86_SP, 4u);
+        be_ea(e, V_T0, B86_SS, B86_SP, -1, 0);
+        be_store(e, 2, V_T1, V_T0, 1, d->next);
+        return 1;
+    }
+    if (x >= 0x58 && x <= 0x5F) {                  /* POP r32 */
+        be_ea(e, V_T0, B86_SS, B86_SP, -1, 0);
+        be_load(e, 2, V_T1, V_T0);
+        be_opi(e, AOP_ADD, B86_SP, B86_SP, 4u);
+        g32_store(e, x & 7, V_T1);
+        return 1;
+    }
+    if (x == 0xC1) {                               /* SHL/SHR/SAR r32, imm8 (flags dead) */
+        unsigned n = d->imm32 & 31u;
+        if (!n) return 1;
+        g32_load(e, V_T0, d->rm);
+        be_shift_imm(e, d->reg == 4 ? 0 : d->reg == 5 ? 1 : 2, V_T0, V_T0, n);
+        g32_store(e, d->rm, V_T0);
+        return 1;
+    }
+    if (d->x0f && x == 0xAF) {                     /* IMUL r32, r/m32 (flags dead) */
+        if (mem) { ea_modrm(t, d); be_load(e, 2, V_T1, V_T0); } else g32_load(e, V_T1, d->rm);
+        g32_load(e, V_T0, d->reg);
+        be_mul(e, V_T0, V_T0, V_T1);
+        g32_store(e, d->reg, V_T0);
+        return 1;
+    }
+    if (x == 0x98) { be_sbfx(e, V_T0, B86_AX, 0, 16); g32_store(e, B86_AX, V_T0); return 1; }          /* CWDE */
+    if (x == 0x99) { g32_load(e, V_T0, B86_AX); be_shift_imm(e, 2, V_T0, V_T0, 31); g32_store(e, B86_DX, V_T0); return 1; } /* CDQ */
+    if (x == 0x87) {                               /* XCHG r32, r32 */
+        g32_load(e, V_T0, d->reg); g32_load(e, V_T1, d->rm);
+        g32_store(e, d->reg, V_T1); g32_store(e, d->rm, V_T0);
+        return 1;
+    }
+    if (x == 0x8D) {                               /* LEA r32, m (16-bit address, zero-extended) */
+        ea_off(t, d, V_T1);
+        be_ubfx(e, V_T1, V_T1, 0, 16);
+        g32_store(e, d->reg, V_T1);
+        return 1;
+    }
+    if (x == 0xD1) {                               /* SHL/SHR/SAR r32, 1 (flags dead) */
+        g32_load(e, V_T0, d->rm);
+        be_shift_imm(e, d->reg == 4 ? 0 : d->reg == 5 ? 1 : 2, V_T0, V_T0, 1);
+        g32_store(e, d->rm, V_T0);
+        return 1;
+    }
+    if (x == 0xC7) {                               /* MOV r/m32, imm32 */
+        if (!mem) { be_movi(e, V_T1, d->imm32); g32_store(e, d->rm, V_T1); return 1; }
+        ea_modrm(t, d);
+        be_movi(e, V_T1, d->imm32);
+        be_store(e, 2, V_T1, V_T0, 1, d->next);
+        return 1;
+    }
+    if (x == 0xF7 && (d->reg == 4 || d->reg == 5)) {   /* MUL / IMUL r/m32 -> EDX:EAX (flags dead) */
+        if (mem) { ea_modrm(t, d); be_load(e, 2, V_T1, V_T0); } else g32_load(e, V_T1, d->rm);
+        g32_load(e, V_T0, B86_AX);
+        be_mull(e, d->reg == 5, V_T0, V_T1, V_T0, V_T1);
+        g32_store(e, B86_AX, V_T0);
+        g32_store(e, B86_DX, V_T1);
+        return 1;
+    }
+    if (x == 0xF7 && (d->reg == 2 || d->reg == 3)) {   /* NOT / NEG r/m32 */
+        int neg = d->reg == 3;
+        if (mem) { ea_modrm(t, d); be_stctx(e, V_T0, OFF(rep_tmp[0])); be_load(e, 2, V_T0, V_T0); }
+        else g32_load(e, V_T0, d->rm);
+        if (neg) { be_movi(e, V_T1, 0); be_op(e, AOP_SUB, V_T0, V_T1, V_T0); }
+        else be_mvn(e, V_T0, V_T0);
+        if (neg && lz) {
+            be_stctx_imm(e, 0, OFF(lz_a));
+            be_stctx(e, V_T0, OFF(lz_res));
+            rec386(t, LZ_SUB32, 0);
+        }
+        if (mem) { be_ldctx(e, V_T1, OFF(rep_tmp[0])); be_store(e, 2, V_T0, V_T1, 1, d->next); }
+        else g32_store(e, d->rm, V_T0);
+        return 1;
+    }
+    /* ALU: ADD OR AND SUB XOR CMP (00-3B forms, 81/83), TEST (85, F7 /0) */
+    int xop, dst, imm = 0;
+    if (x == 0x81 || x == 0x83) { xop = d->reg; dst = d->rm; imm = 1; }
+    else if (x == 0xF7) { xop = 8; dst = d->rm; imm = 1; }
+    else if (x == 0x85) { xop = 8; dst = d->rm; }
+    else { xop = x >> 3; dst = (x & 2) ? d->reg : d->rm; }
+    int writes = xop != 7 && xop != 8;
+    int logic = xop == 1 || xop == 4 || xop == 6 || xop == 8;
+    int aop = xop == 0 ? AOP_ADD : (xop == 5 || xop == 7) ? AOP_SUB : (xop == 1) ? AOP_ORR : (xop == 6) ? AOP_EOR : AOP_AND;
+    if (!writes && !lz) return 1;                  /* dead CMP / TEST */
+    int rmw = mem && writes && (imm || !(x & 2));  /* r/m32 destination in memory */
+    if (mem) {
+        ea_modrm(t, d);
+        if (rmw) be_stctx(e, V_T0, OFF(rep_tmp[0]));
+        if (imm) { be_load(e, 2, V_T0, V_T0); be_movi(e, V_T1, d->imm32); }    /* a = m32, b = imm */
+        else if (x & 2) { be_load(e, 2, V_T1, V_T0); g32_load(e, V_T0, d->reg); } /* a = reg, b = m32 */
+        else { be_load(e, 2, V_T0, V_T0); g32_load(e, V_T1, d->reg); }        /* CMP/TEST m32, r32 */
+    } else {
+        g32_load(e, V_T0, dst);
+        if (imm) be_movi(e, V_T1, d->imm32);
+        else g32_load(e, V_T1, (x & 2) ? d->rm : d->reg);
+    }
+    if (lz && !logic) be_stctx(e, V_T0, OFF(lz_a));
+    be_op(e, aop, V_T0, V_T0, V_T1);
+    if (lz) {
+        be_stctx(e, V_T0, OFF(lz_res));
+        rec386(t, logic ? LZ_LOG32 : (xop == 0 ? LZ_ADD32 : LZ_SUB32), 0);
+    }
+    if (rmw) { be_ldctx(e, V_T1, OFF(rep_tmp[0])); be_store(e, 2, V_T0, V_T1, 1, d->next); }
+    else if (writes) g32_store(e, dst, V_T0);
+    return 1;
+}
+
 B86_COLD static int lower(Tx *t, Insn *d)
 {
     Emit *e = t->e;
@@ -1760,6 +2023,7 @@ B86_COLD static int lower(Tx *t, Insn *d)
     if ((op == 0xFE || op == 0xFF) && d->reg < 2) {
         return emit_alu(t, d, d->reg ? 5 : 0, w, op_rm(d, w), op_imm(1), d->reg ? 2 : 1);
     }
+    if (op == 0xF2) return emit386(t, d);          /* r56: 386 32-bit forms */
     if (op == 0xF1) {                              /* r53b: 80186 */
         if (d->x186 == 0xC9) {                     /* LEAVE: SP = BP; POP BP */
             be_mov(e, B86_SP, B86_BP);
@@ -3089,9 +3353,28 @@ B86_COLD static Block *translate_ex(J *j, uint32_t cs, uint16_t ip, const Insn *
 /* Helpers called from generated code                                       */
 /* ------------------------------------------------------------------------ */
 
+/* r56: which 386 forms still run in the interpreter (b86_jit_386_top) */
+B86_COLD static void h386_count(B86Cpu *c)
+{
+    J *j = c->jit;
+    if (!j) return;
+    if (!j->h386) { j->h386 = B86_CALLOC(768, sizeof(uint32_t)); if (!j->h386) return; }
+    uint32_t base = (c->seg[B86_CS] << 4), ip = c->ip & 0xFFFFu, k = 0;
+    uint8_t op = *b86_host(c, (base + ip) & c->amask);
+    int o32 = 0;
+    while (k++ < 6 && (op == 0x26 || op == 0x2E || op == 0x36 || op == 0x3E || op == 0x64 || op == 0x65 ||
+                       op == 0x66 || op == 0x67 || op == 0xF0 || op == 0xF2 || op == 0xF3)) {
+        if (op == 0x66) o32 = 1;
+        ip = (ip + 1) & 0xFFFFu;
+        op = *b86_host(c, (base + ip) & c->amask);
+    }
+    if (op == 0x0F) j->h386[512 + *b86_host(c, (base + ((ip + 1) & 0xFFFFu)) & c->amask)]++;
+    else j->h386[(o32 ? 256 : 0) + op]++;
+}
+
 static inline __attribute__((always_inline)) void r386_merge(B86Cpu *c)
 {
-    for (int i = 0; i < 8; ++i) c->r[i] = c->rhi[i] | (c->r[i] & 0xFFFFu);
+    for (int i = 0; i < 8; ++i) c->r[i] = (c->rhi[i] & 0xFFFF0000u) | (c->r[i] & 0xFFFFu);
 }
 static inline __attribute__((always_inline)) void r386_split(B86Cpu *c)
 {
@@ -3120,7 +3403,7 @@ B86_HOT uint32_t MPF(b86h_step)(B86Cpu *c, uint32_t ip_next, uint32_t blk)
     uint32_t cs0 = c->seg[B86_CS];
     c->ip = ip_next & 0xFFFFu;
     int m386 = c->model >= B86_CPU_386;
-    if (m386) r386_merge(c);
+    if (m386) { r386_merge(c); h386_count(c); }
     int r = b86_step(c);
     if (m386) {
         r386_split(c);
@@ -3556,7 +3839,32 @@ B86_HOT void b86_jit_destroy(J *j)
     if (j->plog) B86_FREE(j->plog);
     if (j->free_idx) B86_FREE(j->free_idx);
     if (j->dsnob) B86_FREE(j->dsnob);
+    if (j->h386) B86_FREE(j->h386);
     free(j);
+}
+
+/* r56: the n most frequent forms the interpreter stepped in 386 real mode
+   since the last call ("66F7:1234 0FA4:99 ..."; 0F forms as 0Fxx, 66h forms
+   as 66xx), then clear. Returns the number of characters written. */
+B86_COLD int b86_jit_386_top(struct B86Jit *jj, char *buf, int len, int n)
+{
+    J *j = (J *)jj;
+    int w = 0;
+    if (!buf || len <= 0) return 0;
+    buf[0] = 0;
+    if (!j || !j->h386) return 0;
+    for (int k = 0; k < n; ++k) {
+        int best = -1;
+        for (int i = 0; i < 768; ++i) if (j->h386[i] && (best < 0 || j->h386[i] > j->h386[best])) best = i;
+        if (best < 0) break;
+        int m = snprintf(buf + w, (size_t)(len - w), "%s%s%02X:%lu", k ? " " : "", best >= 512 ? "0F" : best >= 256 ? "66" : "",
+                         (unsigned)(best & 255), (unsigned long)j->h386[best]);
+        if (m < 0 || m >= len - w) break;
+        w += m;
+        j->h386[best] = 0;
+    }
+    for (int i = 0; i < 768; ++i) j->h386[i] = 0;
+    return w;
 }
 
 B86_HOT const B86JitStats *b86_jit_stats(J *j) { return &j->st; }
@@ -3710,7 +4018,7 @@ B86_HOT static int MPF(cold_run)(J *j, B86Cpu *c, uint32_t key, int force)
                 break;
             }
         }
-        if (c->model >= B86_CPU_386) r386_merge(c);
+        if (c->model >= B86_CPU_386) { r386_merge(c); h386_count(c); }
         int r = b86_step(c);
         if (c->model >= B86_CPU_386) {
             r386_split(c);

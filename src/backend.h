@@ -136,7 +136,8 @@ void be_ubfx(Emit *e, int d, int s, unsigned lsb, unsigned w);
 void be_sbfx(Emit *e, int d, int s, unsigned lsb, unsigned w);
 void be_bfi(Emit *e, int d, int s, unsigned lsb, unsigned w);
 void be_sxtb(Emit *e, int d, int s);
-void be_mul(Emit *e, int d, int a, int b);                 /* 32-bit low product */
+void be_mul(Emit *e, int d, int a, int b);
+void be_mull(Emit *e, int sgn, int lo, int hi, int a, int b);   /* r57: 32x32->64 (Thumb-2) */                 /* 32-bit low product */
 void be_udiv(Emit *e, int d, int a, int b);                /* d = a / b (unsigned 32) */
 void be_sdiv(Emit *e, int d, int a, int b);                /* d = a / b (signed 32, toward 0) */
 void be_mls(Emit *e, int d, int a, int b, int acc);        /* d = acc - a*b */

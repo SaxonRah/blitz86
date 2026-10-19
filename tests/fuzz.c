@@ -497,6 +497,7 @@ int main(int argc, char **argv)
             if (fuzz186 >= 3) for (int i = 0; i < 8; ++i)
                 ref.r[i] |= (uint32_t)((seed * 0x9E3779B97F4A7C15ull >> (8 + 4 * i)) & 0xFFFFu) << 16;
             b86_jit_set_no_fast(j, 1);
+            if (getenv("FUZZ_MAXB")) b86_jit_set_max_block(j, (unsigned)atoi(getenv("FUZZ_MAXB")));
             b86_jit_set_count_exits(j, 1);
             b86_jit_flush(j);
             { static uint8_t tframe_raw[0x200000] __attribute__((aligned(0x200000))); uint8_t *tframe = tframe_raw + 0x20000u;
@@ -517,11 +518,13 @@ int main(int argc, char **argv)
                 ref_steps += (uint64_t)steps;
                 int diff = ref.seg[B86_CS] != tmp.seg[B86_CS] || (uint16_t)ref.ip != (uint16_t)tmp.ip;
                 uint32_t tmask = fuzz186 >= 3 ? 0xFFFFFFFFu : 0xFFFFu;
+                if (getenv("FUZZ_FLAGCHK") && b86_get_flags(&ref) != b86_get_flags(&tmp)) diff = 1;
                 for (int i = 0; i < 8; ++i) if ((ref.r[i] ^ tmp.r[i]) & tmask) diff = 1;
                 long md = -1;
                 for (long k = 0; k < (long)B86_MEM_BYTES; ++k) if (snap[k] != *b86_host(&tmp, (uint32_t)k)) { md = k; diff = 1; break; }
                 if (diff) {
                     printf("diverge in block %04X:%04X -> %04X (ref %04X, %d steps):", cs0, ip0, (uint16_t)tmp.ip, (uint16_t)ref.ip, steps);
+                    printf(" fl %04X/%04X lz %u/%u ik %u/%u", b86_get_flags(&ref), b86_get_flags(&tmp), ref.lz_kind, tmp.lz_kind, ref.lz_ikind, tmp.lz_ikind);
                     for (int i = 0; i < 8; ++i) if ((ref.r[i] ^ tmp.r[i]) & tmask) printf(" r%d %08X/%08X", i, ref.r[i], tmp.r[i]);
                     if (md >= 0) printf(" mem[%05lX] %02X/%02X", md, snap[md], *b86_host(&tmp, (uint32_t)md));
                     printf("\n  bytes:");
@@ -587,6 +590,7 @@ int main(int argc, char **argv)
     printf("fuzz: %ld programs, %ld mismatches, %ld skipped (no HLT), %llu guest insns interpreted\n",
            iters, bad, skipped, (unsigned long long)total_insns);
     if (limitf) printf("fuzz: %ld programs skipped: 386 segment-limit fault in the reference\n", limitf);
+    if (fuzz186 >= 3) { char top[300]; b86_jit_386_top(j, top, sizeof top, 8); printf("fuzz: 386 forms still stepped: %s\n", top); }
     printf("jit: blocks %llu  insns %llu  helper %llu  chains %llu  smc hits %llu  invalidations %llu  bytes/insn %.1f\n",
            (unsigned long long)s->blocks, (unsigned long long)s->guest_insns, (unsigned long long)s->helper_insns,
            (unsigned long long)s->chains, (unsigned long long)s->smc_hits, (unsigned long long)s->smc_invalidations,

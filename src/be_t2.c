@@ -459,6 +459,11 @@ B86_HOT void be_sbfx(Emit *e, int d, int s, unsigned lsb, unsigned w) { bitfield
 B86_HOT void be_bfi(Emit *e, int d, int s, unsigned lsb, unsigned w) { bitfield(e, 0xF360u, hr(d), hr(s), lsb, lsb + w - 1); }
 B86_HOT void be_sxtb(Emit *e, int d, int s) { put32(e, 0xFA4Fu, 0xF080u | (uint32_t)hr(d) << 8 | (uint32_t)hr(s)); }
 
+/* r57: UMULL / SMULL lo, hi, a, b (64-bit product) */
+B86_HOT void be_mull(Emit *e, int sgn, int lo, int hi, int a, int b)
+{
+    put32(e, (sgn ? 0xFB80u : 0xFBA0u) | (uint32_t)hr(a), (uint32_t)hr(lo) << 12 | (uint32_t)hr(hi) << 8 | (uint32_t)hr(b));
+}
 B86_HOT void be_mul(Emit *e, int d, int a, int b) { put32(e, 0xFB00u | (uint32_t)hr(a), 0xF000u | (uint32_t)hr(d) << 8 | (uint32_t)hr(b)); }
 B86_HOT void be_shift_reg(Emit *e, int type, int d, int a, int cnt)
 {
@@ -664,11 +669,12 @@ B86_HOT void be_ea_off(Emit *e, int d, int b1, int b2, int32_t disp)
     if (disp) opi_raw(e, AOP_ADD, dd, dd, (uint32_t)disp);
 }
 
-B86_HOT void be_load(Emit *e, int w16, int d, int addr) { ldst(e, w16 ? LDRH : LDRB, hr(d), hr(addr), 0); }
+/* w16: 0 byte, 1 halfword, 2 word (r56: 386 32-bit operands) */
+B86_HOT void be_load(Emit *e, int w16, int d, int addr) { ldst(e, w16 == 2 ? LDRW : w16 ? LDRH : LDRB, hr(d), hr(addr), 0); }
 
 B86_HOT void be_store(Emit *e, int w16, int v, int addr, int check, uint16_t next_ip)
 {
-    ldst(e, w16 ? STRH : STRB, hr(v), hr(addr), 0);
+    ldst(e, w16 == 2 ? STRW : w16 ? STRH : STRB, hr(v), hr(addr), 0);
     if (!check) return;
 #ifdef B86_PAGED
     bitfield(e, 0xF3C0u, LR, hr(addr), 6, 14);                   /* lr = (addr >> 6) & 0x7FFF */
@@ -681,7 +687,7 @@ B86_HOT void be_store(Emit *e, int w16, int v, int addr, int check, uint16_t nex
     e->slow[e->nslow].site = emit_bcc(e, AC_NE, NULL);
     e->slow[e->nslow].resume = e->p;
     e->slow[e->nslow].next_ip = next_ip;
-    e->slow[e->nslow].len = (uint8_t)(w16 ? 2 : 1);
+    e->slow[e->nslow].len = (uint8_t)(w16 == 2 ? 4 : w16 ? 2 : 1);
     e->slow[e->nslow].retire = e->retire;
     e->slow[e->nslow].noexit = (uint8_t)(check == 2);
     e->nslow++;

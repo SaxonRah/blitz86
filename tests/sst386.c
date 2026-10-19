@@ -17,7 +17,7 @@ static uint8_t mem_raw[0xA0000u + B86_MEM_BYTES] __attribute__((aligned(0x200000
 static uint8_t mem[B86_MEM_BYTES] __attribute__((aligned(64)));
 #endif
 typedef struct { uint32_t a; uint8_t v; } Byte;
-typedef struct { char name[13]; uint32_t init[16], fin[16], fmask; uint16_t ni, nf; Byte ri[512], rf[512]; } Vec;
+typedef struct { char name[13]; uint32_t init[16], fin[16], fmask; uint16_t ni, nf; Byte ri[8192], rf[8192]; } Vec;
 enum { V_ES = 8, V_CS, V_SS, V_DS, V_FS, V_GS, V_IP, V_FL };
 
 static int rd(FILE *f, Vec *t)
@@ -26,7 +26,7 @@ static int rd(FILE *f, Vec *t)
     if (fread(t->name, 1, 12, f) != 12) return 0;
     if (fread(t->init, 4, 16, f) != 16 || fread(t->fin, 4, 16, f) != 16) return 0;
     if (fread(&t->fmask, 4, 1, f) != 1 || fread(&t->ni, 2, 1, f) != 1 || fread(&t->nf, 2, 1, f) != 1) return 0;
-    if (t->ni > 512 || t->nf > 512) { fprintf(stderr, "vector too large\n"); exit(2); }
+    if (t->ni > 8192 || t->nf > 8192) { fprintf(stderr, "vector too large\n"); exit(2); }
     for (int i = 0; i < t->ni; ++i) { if (fread(&t->ri[i].a, 4, 1, f) != 1 || fread(&t->ri[i].v, 1, 1, f) != 1) return 0; }
     for (int i = 0; i < t->nf; ++i) { if (fread(&t->rf[i].a, 4, 1, f) != 1 || fread(&t->rf[i].v, 1, 1, f) != 1) return 0; }
     return 1;
@@ -80,7 +80,7 @@ int main(int argc, char **argv)
     int verbose = getenv("SST386_VERBOSE") != NULL;
     void *code = mmap(NULL, 4 << 20, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     static Vec t;
-    char cur[13] = ""; unsigned fi = 0, fj = 0, ti = 0, tn = 0;
+    char cur[13] = ""; unsigned fi = 0, fj = 0, ti = 0, tn = 0, fh = 0;
     unsigned long n = 0, ibad = 0, jbad = 0, jn = 0, hma = 0, lfs = 0;
     B86Cpu c;
     b86_init(&c, mem);
@@ -89,8 +89,8 @@ int main(int argc, char **argv)
     b86_jit_set_hot_threshold(j, 0);
     while (rd(f, &t)) {
         if (strcmp(cur, t.name)) {
-            if (cur[0] && (fi || fj)) printf("  %-10s interp %u/%u failed, jit %u/%u failed\n", cur, fi, tn, fj, ti);
-            strcpy(cur, t.name); fi = fj = ti = tn = 0;
+            if (cur[0] && (fi || fj || getenv("SST386_ALL"))) printf("  %-10s interp %u/%u failed, jit %u/%u failed, stepped %u\n", cur, fi, tn, fj, ti, fh);
+            strcpy(cur, t.name); fi = fj = ti = tn = fh = 0;
         }
         n++; tn++;
         /* interpreter */
@@ -101,7 +101,7 @@ int main(int argc, char **argv)
         int limit_fault = b86_limit_faults != lf0;
         int iok = check(&c, &t, "interp", verbose && fi < 2);
         clear(&t); memset(mem + 0x100000, 0, B86_MEM_BYTES - 0x100000);
-        if (!iok) { fi++; ibad++; continue; }
+        if (!iok) { fi++; ibad++; if (!getenv("SST386_JITALL")) continue; }
         /* JIT */
         if (getenv("SST386_NOJIT")) continue;
         if (limit_fault) { lfs++; continue; }   /* 386 segment-limit fault: not raised by the JIT tier */
@@ -112,7 +112,9 @@ int main(int argc, char **argv)
         b86_jit_flush(j);
         setup(&c, &t);
         if (getenv("SST386_JITMODEL")) c.model = (uint32_t)atoi(getenv("SST386_JITMODEL"));
+        uint64_t h0 = b86_jit_stats(j)->helper_insns;
         b86_jit_run(&c, 8);
+        if (b86_jit_stats(j)->helper_insns != h0) fh++;
         c.model = B86_CPU_386;
         jn++; ti++;
         if (!check(&c, &t, "jit", verbose && fj < 2)) { fj++; jbad++; }

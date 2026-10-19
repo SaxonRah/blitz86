@@ -83,18 +83,21 @@ static const uint8_t lz_class[LZ_COUNT] = {
     [LZ_LOG8] = 2, [LZ_LOG16] = 2, [LZ_INC8] = 6, [LZ_INC16] = 6, [LZ_DEC8] = 7, [LZ_DEC16] = 7,
     [LZ_SHL8] = 3, [LZ_SHL16] = 3, [LZ_SHR8] = 4, [LZ_SHR16] = 4, [LZ_SAR8] = 5, [LZ_SAR16] = 5,
     [LZ_ADC8] = 8, [LZ_ADC16] = 8, [LZ_SBB8] = 9, [LZ_SBB16] = 9, [LZ_SZPC8] = 10, [LZ_SZPC16] = 10,
+    [LZ_ADD32] = 0, [LZ_SUB32] = 1, [LZ_LOG32] = 2, [LZ_INC32] = 6, [LZ_DEC32] = 7,
 };
 static const uint8_t lz_w16[LZ_COUNT] = {
     [LZ_ADD16] = 1, [LZ_SUB16] = 1, [LZ_LOG16] = 1, [LZ_INC16] = 1, [LZ_DEC16] = 1,
     [LZ_SHL16] = 1, [LZ_SHR16] = 1, [LZ_SAR16] = 1, [LZ_ADC16] = 1, [LZ_SBB16] = 1, [LZ_SZPC16] = 1,
+    [LZ_ADD32] = 2, [LZ_SUB32] = 2, [LZ_LOG32] = 2, [LZ_INC32] = 2, [LZ_DEC32] = 2,   /* 2: 32-bit */
 };
 
 B86_HOT static uint32_t lazy_eval(uint32_t k, uint32_t a0, uint32_t r0, uint32_t b0, uint32_t f)
 {
     unsigned cls = lz_class[k], w16 = lz_w16[k];
-    uint32_t m = w16 ? 0xFFFFu : 0xFFu, sb = w16 ? 0x8000u : 0x80u;
+    uint32_t m = w16 == 2 ? 0xFFFFFFFFu : w16 ? 0xFFFFu : 0xFFu;
+    uint32_t sb = w16 == 2 ? 0x80000000u : w16 ? 0x8000u : 0x80u;
     uint32_t a = a0 & m, r = r0 & m, b;
-    uint32_t zsp = (r ? 0u : (uint32_t)B86_ZF) | ((w16 ? (r >> 8) : r) & 0x80u) | b86_parity[r & 0xFFu];
+    uint32_t zsp = (r ? 0u : (uint32_t)B86_ZF) | ((r >> (w16 == 2 ? 24 : w16 ? 8 : 0)) & 0x80u) | b86_parity[r & 0xFFu];
     uint32_t out;                                   /* CF | AF | OF bits */
     switch (cls) {
     case 0: case 6: case 8:                         /* add, inc, adc */

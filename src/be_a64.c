@@ -364,6 +364,7 @@ B86_HOT void be_sbfx(Emit *e, int d, int s, unsigned lsb, unsigned w) { put(e, s
 B86_HOT void be_bfi(Emit *e, int d, int s, unsigned lsb, unsigned w) { put(e, bfm(hr(d), hr(s), (int)((32 - lsb) & 31), (int)(w - 1))); }
 B86_HOT void be_sxtb(Emit *e, int d, int s) { put(e, sbfm(hr(d), hr(s), 0, 7)); }
 
+void be_mull(Emit *e, int sgn, int lo, int hi, int a, int b) { (void)e; (void)sgn; (void)lo; (void)hi; (void)a; (void)b; }
 B86_HOT void be_mul(Emit *e, int d, int a, int b) { put(e, 0x1B007C00u | (uint32_t)hr(b) << 16 | (uint32_t)hr(a) << 5 | (uint32_t)hr(d)); }
 B86_HOT void be_shift_reg(Emit *e, int type, int d, int a, int cnt)
 {
