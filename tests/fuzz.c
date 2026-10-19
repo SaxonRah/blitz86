@@ -59,6 +59,7 @@ static void W(uint16_t v) { B((uint8_t)v); B((uint8_t)(v >> 8)); }
 
 /* forbidden destination registers (bit per reg16) */
 static unsigned forbid;
+static int fuzz186;
 #define F_SP (1u << B86_SP)
 #define F_CX (1u << B86_CX)
 
@@ -238,7 +239,7 @@ static void gen_fwd_branch(int depth)
 {
     int kind = (int)rn(4);
     uint32_t at;
-    if (kind == 0) { B((uint8_t)(rn(2) ? 0x70 | rn(16) : 0x60 | rn(16))); }
+    if (kind == 0) { B((uint8_t)(rn(2) || fuzz186 ? 0x70 | rn(16) : 0x60 | rn(16))); }   /* 60-6F: 8086 aliases only */
     else if (kind == 1) { B(0xE3); }                               /* JCXZ */
     else if (kind == 2) { B(0xEB); }                               /* JMP short */
     else { B((uint8_t)(0x70 | rn(16))); }
@@ -316,7 +317,6 @@ static void gen_smc_rep(void)
 }
 
 /* FUZZ_186: 80186 instructions (both CPUs run model 186) */
-static int fuzz186;
 static void gen_186(void)
 {
     int r = (int)rn(8);
@@ -344,6 +344,25 @@ static void gen_186(void)
     }
 }
 
+/* FUZZ_386: 32-bit forms mixed into 16-bit code (upper-half preservation
+   across native 16-bit code and interpreted 386 steps) */
+static void gen_386(void)
+{
+    int r = (int)rn(8), r2 = (int)rn(8);
+    if (r == B86_SP || !r16_ok(r)) { gen_simple(); return; }
+    switch (rn(9)) {
+    case 0: B(0x66); B(0x40 + r); break;                                  /* INC r32 */
+    case 1: B(0x66); B(0xB8 + r); W((uint16_t)rnd()); W((uint16_t)rnd()); break;   /* MOV r32, imm32 */
+    case 2: B(0x66); B(0x01); B(0xC0 | r2 << 3 | r); break;              /* ADD r32, r32 */
+    case 3: B(0x66); B(0xC1); B(0xE0 | r); B((uint8_t)rn(32)); break;    /* SHL r32, imm8 */
+    case 4: B(0x66); B(0x50 + r2); B(0x66); B(0x58 + r); break;          /* PUSH r32; POP r32 */
+    case 5: B(0x0F); B(0xB6); B(0xC0 | r << 3 | rn(8)); break;           /* MOVZX r16, r8 */
+    case 6: B(0x66); B(0x0F); B(0xBF); B(0xC0 | r << 3 | r2); break;     /* MOVSX r32, r16 */
+    case 7: B(0x66); B(0x31); B(0xC0 | r2 << 3 | r); break;              /* XOR r32, r32 */
+    default: B(0x66); B(0x29); B(0xC0 | r2 << 3 | r); break;              /* SUB r32, r32 */
+    }
+}
+
 static void gen_block(int depth, int n)
 {
     for (int i = 0; i < n; ++i) {
@@ -353,6 +372,7 @@ static void gen_block(int depth, int n)
         else if (depth < 3 && k == 2) gen_call();
         else if (k == 3) { if (getenv("FUZZ_SMC_REP") && rn(2)) gen_smc_rep(); else gen_smc(); }
         else if (k == 4 && depth < 3) gen_fwd_branch(depth);
+        else if (fuzz186 >= 3 && k >= 13) gen_386();
         else if (fuzz186 && k >= 15) gen_186();
         else gen_simple();
     }
@@ -415,11 +435,13 @@ int main(int argc, char **argv)
     long iters = argc > 1 ? atol(argv[1]) : 200;
     fuzz186 = getenv("FUZZ_186") != NULL ? 1 : 0;
     if (getenv("FUZZ_286")) fuzz186 = 2;
+    if (getenv("FUZZ_386")) fuzz186 = 3;
     uint64_t seed0 = argc > 2 ? strtoull(argv[2], 0, 0) : 1;
     void *buf = mmap(NULL, 8 << 20, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     B86Cpu a, b;
     long bad = 0, skipped = 0;
     uint64_t total_insns = 0;
+    long limitf = 0;
     signal(SIGALRM, on_alarm);
     B86Cpu tmp;
     b86_init(&tmp, memB);
@@ -433,16 +455,28 @@ int main(int argc, char **argv)
         memcpy(memA, init_img, B86_MEM_BYTES);
         init_cpu(&a, memA, seed);
         a.model = (uint32_t)fuzz186;
+        if (fuzz186 >= 3) for (int i = 0; i < 8; ++i)      /* random upper halves */
+            a.r[i] |= (uint32_t)((seed * 0x9E3779B97F4A7C15ull >> (8 + 4 * i)) & 0xFFFFu) << 16;
         static uint8_t aframe[0x20000 + 1] __attribute__((aligned(4096)));
         int amap = getenv("FUZZ_MAP") && b86_map_range(&a, 0x30000, 0x20000, aframe) == 0;
+        extern uint32_t b86_limit_faults;
+        uint32_t lf0 = b86_limit_faults;
         int ra = b86_run_interp(&a, 3000000);
+        if (b86_limit_faults != lf0) { limitf++; continue; }   /* 386 segment-limit fault: the JIT tier does not raise them */
         if (amap) b86_unmap_range(&a, 0x30000, 0x20000);
-        if (ra != B86_HALT) { skipped++; continue; }
+        if (ra != B86_HALT) {
+            if (getenv("FUZZ_WHY") && skipped < 5) printf("seed %llu: reference stopped rc=%d at %04X:%04X op %02X %02X %02X after %llu insns\n",
+                (unsigned long long)seed, ra, a.seg[B86_CS], a.ip, memA[(a.seg[B86_CS] << 4) + a.ip], memA[(a.seg[B86_CS] << 4) + a.ip + 1],
+                memA[(a.seg[B86_CS] << 4) + a.ip + 2], (unsigned long long)a.icount);
+            skipped++; continue;
+        }
         total_insns += a.icount;
         /* translator */
         memcpy(memB, init_img, B86_MEM_BYTES);
         init_cpu(&b, memB, seed);
         b.model = (uint32_t)fuzz186;
+        if (fuzz186 >= 3) for (int i = 0; i < 8; ++i)
+            b.r[i] |= (uint32_t)((seed * 0x9E3779B97F4A7C15ull >> (8 + 4 * i)) & 0xFFFFu) << 16;
         b.jit = j; b.codemap = tmp.codemap; b.codemap_host = tmp.codemap_host;
         b.fast = tmp.fast; b.smc_hook = tmp.smc_hook;
         /* the JIT keeps its cpu pointer; copy state into it */
@@ -459,6 +493,9 @@ int main(int argc, char **argv)
             static uint8_t snap[B86_MEM_BYTES];
             B86Cpu ref; memcpy(snap, init_img, B86_MEM_BYTES);
             init_cpu(&ref, snap, seed);
+            ref.model = (uint32_t)fuzz186;
+            if (fuzz186 >= 3) for (int i = 0; i < 8; ++i)
+                ref.r[i] |= (uint32_t)((seed * 0x9E3779B97F4A7C15ull >> (8 + 4 * i)) & 0xFFFFu) << 16;
             b86_jit_set_no_fast(j, 1);
             b86_jit_set_count_exits(j, 1);
             b86_jit_flush(j);
@@ -479,12 +516,13 @@ int main(int argc, char **argv)
                 for (uint32_t q = 0; q < tmp.retired && rr == B86_OK; ++q) { rr = b86_step(&ref); steps++; }
                 ref_steps += (uint64_t)steps;
                 int diff = ref.seg[B86_CS] != tmp.seg[B86_CS] || (uint16_t)ref.ip != (uint16_t)tmp.ip;
-                for (int i = 0; i < 8; ++i) if ((uint16_t)ref.r[i] != (uint16_t)tmp.r[i]) diff = 1;
+                uint32_t tmask = fuzz186 >= 3 ? 0xFFFFFFFFu : 0xFFFFu;
+                for (int i = 0; i < 8; ++i) if ((ref.r[i] ^ tmp.r[i]) & tmask) diff = 1;
                 long md = -1;
                 for (long k = 0; k < (long)B86_MEM_BYTES; ++k) if (snap[k] != *b86_host(&tmp, (uint32_t)k)) { md = k; diff = 1; break; }
                 if (diff) {
                     printf("diverge in block %04X:%04X -> %04X (ref %04X, %d steps):", cs0, ip0, (uint16_t)tmp.ip, (uint16_t)ref.ip, steps);
-                    for (int i = 0; i < 8; ++i) if ((uint16_t)ref.r[i] != (uint16_t)tmp.r[i]) printf(" r%d %04X/%04X", i, (uint16_t)ref.r[i], (uint16_t)tmp.r[i]);
+                    for (int i = 0; i < 8; ++i) if ((ref.r[i] ^ tmp.r[i]) & tmask) printf(" r%d %08X/%08X", i, ref.r[i], tmp.r[i]);
                     if (md >= 0) printf(" mem[%05lX] %02X/%02X", md, snap[md], *b86_host(&tmp, (uint32_t)md));
                     printf("\n  bytes:");
                     for (int k = 0; k < 48; ++k) printf(" %02X", cur[k]);
@@ -528,7 +566,8 @@ int main(int argc, char **argv)
         b = tmp;
         int ok = rb == B86_HALT;
         if ((uint32_t)a.icount != b.icnt) { ok = 0; printf("seed %llu: retired count %u != %llu\n", (unsigned long long)seed, b.icnt, (unsigned long long)a.icount); }
-        for (int i = 0; i < 8; ++i) if ((uint16_t)a.r[i] != (uint16_t)b.r[i]) ok = 0;
+        uint32_t rmask = fuzz186 >= 3 ? 0xFFFFFFFFu : 0xFFFFu;   /* 386: full 32-bit registers */
+        for (int i = 0; i < 8; ++i) if ((a.r[i] ^ b.r[i]) & rmask) ok = 0;
         for (int i = 0; i < 4; ++i) if (a.seg[i] != b.seg[i]) ok = 0;
         if ((uint16_t)a.ip != (uint16_t)b.ip) ok = 0;
         uint16_t fa = b86_get_flags(&a), fb = b86_get_flags(&b);
@@ -538,7 +577,7 @@ int main(int argc, char **argv)
         if (!ok) {
             bad++;
             printf("seed %llu: MISMATCH rb=%d ip %04X/%04X flags %04X/%04X", (unsigned long long)seed, rb, (uint16_t)a.ip, (uint16_t)b.ip, fa, fb);
-            for (int i = 0; i < 8; ++i) if ((uint16_t)a.r[i] != (uint16_t)b.r[i]) printf(" r%d %04X/%04X", i, (uint16_t)a.r[i], (uint16_t)b.r[i]);
+            for (int i = 0; i < 8; ++i) if ((a.r[i] ^ b.r[i]) & rmask) printf(" r%d %08X/%08X", i, a.r[i], b.r[i]);
             if (mdiff >= 0) printf(" mem[%05lX] %02X/%02X", mdiff, memA[mdiff], memB[mdiff]);
             printf("\n");
             if (bad > 10) break;
@@ -547,6 +586,7 @@ int main(int argc, char **argv)
     const B86JitStats *s = b86_jit_stats(j);
     printf("fuzz: %ld programs, %ld mismatches, %ld skipped (no HLT), %llu guest insns interpreted\n",
            iters, bad, skipped, (unsigned long long)total_insns);
+    if (limitf) printf("fuzz: %ld programs skipped: 386 segment-limit fault in the reference\n", limitf);
     printf("jit: blocks %llu  insns %llu  helper %llu  chains %llu  smc hits %llu  invalidations %llu  bytes/insn %.1f\n",
            (unsigned long long)s->blocks, (unsigned long long)s->guest_insns, (unsigned long long)s->helper_insns,
            (unsigned long long)s->chains, (unsigned long long)s->smc_hits, (unsigned long long)s->smc_invalidations,

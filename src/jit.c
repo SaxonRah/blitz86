@@ -247,6 +247,7 @@ typedef struct B86Jit {
     unsigned max_insns;
     int no_lookahead;
     int single_step;            /* testing: never enter a block from the fast table */
+    int pm_seen;                /* r55: 386 left real mode since the last flush */
     int no_chain;               /* testing: never patch chain exits */
     int hot_external;           /* fast/codemap supplied by the caller */
     uint8_t *cm_table;          /* codemap allocation (paged: 32 Ki entries)   */
@@ -413,6 +414,9 @@ B86_HOT static void decode(B86Cpu *c, uint32_t cs, uint16_t ip, Insn *d)
         default:   ud = reg == 7 || ((reg == 3 || reg == 5) && mod == 3) || m == 0xF4u; break;  /* FF; FF F4 = PUSH SP */
         }
         if (ud) { d->op = 0x0F; d->cls = C_END; d->next = (uint16_t)p; return; }
+    }
+    if (c->model >= B86_CPU_386 && (op == 0x9C || op == 0x9D)) {
+        d->op = 0x0F; d->cls = C_END; d->next = (uint16_t)p; return;   /* r55: 386 FLAGS (IOPL/NT, EFLAGS) */
     }
     if (c->model >= B86_CPU_286 && op == 0x54) {
         d->op = 0x0F; d->cls = C_END; d->next = (uint16_t)p; return;   /* 286 PUSH SP pushes the old SP */
@@ -2846,7 +2850,10 @@ B86_COLD static Block *translate_ex(J *j, uint32_t cs, uint16_t ip, const Insn *
         classify(d);
         if (d->next < pc) { if (n == npre) { d->cls = C_END; d->native = 0; } else break; } /* wraps */
         if (n > npre && base + d->next - glo > MAX_SPAN) break;
-        ghi = base + d->next;
+        /* r55: an instruction that wraps past the segment end (next < pc,
+           only as a lone instruction) guards [glo, glo + 16): ghi below glo
+           (ghi = 0 for CS 0) made the line loops run over the whole map */
+        ghi = d->next < pc ? glo + 16u : base + d->next;
         n++;
         if (ends_block(d)) break;
         pc = d->next;
@@ -3082,6 +3089,15 @@ B86_COLD static Block *translate_ex(J *j, uint32_t cs, uint16_t ip, const Insn *
 /* Helpers called from generated code                                       */
 /* ------------------------------------------------------------------------ */
 
+static inline __attribute__((always_inline)) void r386_merge(B86Cpu *c)
+{
+    for (int i = 0; i < 8; ++i) c->r[i] = c->rhi[i] | (c->r[i] & 0xFFFFu);
+}
+static inline __attribute__((always_inline)) void r386_split(B86Cpu *c)
+{
+    for (int i = 0; i < 8; ++i) c->rhi[i] = c->r[i] & 0xFFFF0000u;
+}
+
 #ifdef B86_HELPER_HISTO
 uint64_t b86_helper_histo[256];
 uint64_t b86_helper_histo2[32];   /* [F6/F7 ? 16 : 0] + w*8 + reg */
@@ -3103,7 +3119,13 @@ B86_HOT uint32_t MPF(b86h_step)(B86Cpu *c, uint32_t ip_next, uint32_t blk)
     J *j = c->jit;
     uint32_t cs0 = c->seg[B86_CS];
     c->ip = ip_next & 0xFFFFu;
+    int m386 = c->model >= B86_CPU_386;
+    if (m386) r386_merge(c);
     int r = b86_step(c);
+    if (m386) {
+        r386_split(c);
+        if (c->msw & 1u) return 1;         /* entered protected mode: leave native code */
+    }
     if (r == B86_HALT) { c->irq |= 0x80000000u; return 1; }
     if (c->irq) return 1;                 /* host asked to stop (e.g. from an INT hook) */
     if (c->seg[B86_CS] != cs0 || c->ip != (ip_next >> 16)) return 1;
@@ -3688,7 +3710,12 @@ B86_HOT static int MPF(cold_run)(J *j, B86Cpu *c, uint32_t key, int force)
                 break;
             }
         }
+        if (c->model >= B86_CPU_386) r386_merge(c);
         int r = b86_step(c);
+        if (c->model >= B86_CPU_386) {
+            r386_split(c);
+            if (c->msw & 1u) { steps++; break; }  /* protected mode: back to the dispatcher */
+        }
         steps++;
         /* the step reports its opcode and where it sat (after prefixes) */
         uint8_t op = c->step_op;
@@ -3724,8 +3751,14 @@ B86_HOT static int MPF(cold_run)(J *j, B86Cpu *c, uint32_t key, int force)
     return 1;
 }
 
+/* r55: 386 real mode runs through the JIT. Generated code is the 16-bit
+   translation; every instruction it cannot do exactly (66/67/64/65
+   prefixes, 0F, PUSHF/POPF, ...) is stepped by the interpreter. Around
+   every such step the 32-bit register file is made exact (merge) and the
+   upper halves are re-captured afterwards (split). */
 /* BB_386_RM0_V1: never run the 16-bit Thumb-2/A64 JIT with 386
-   registers.  Cold interpreter is deliberately in flash, not SRAM. */
+   registers.  Cold interpreter is deliberately in flash, not SRAM.
+   r55: only protected mode still runs here. */
 B86_COLD static int b86_386_rm0_run(B86Cpu *c, uint64_t budget)
 {
     /* BB_386_STAGE5C4A_V1: no IRQ, trap or budget result can bypass shutdown. */
@@ -3747,12 +3780,31 @@ B86_COLD static int b86_386_rm0_run(B86Cpu *c, uint64_t budget)
     return B86_BUDGET;
 }
 
+#define B86_PM_ENTER 100                /* r55: internal, never returned to the embedder */
+B86_HOT static int b86_jit_run16(B86Cpu *c, uint64_t max_dispatch);
 B86_HOT int b86_jit_run(B86Cpu *c, uint64_t max_dispatch)
 {
 #ifdef B86_PAGED
     if (be_paged && c->jit && c->jit->cm_table) c->pt = (int32_t *)(void *)c->jit->cm_table;   /* struct copies */
 #endif
-    if (c->model >= B86_CPU_386) return b86_386_rm0_run(c, max_dispatch);
+    if (c->model >= B86_CPU_386) {
+        if (c->shutdown386) return B86_SHUTDOWN;
+        if ((c->msw & 1u) || !c->jit) return b86_386_rm0_run(c, max_dispatch);
+        if (c->jit->pm_seen) { b86_jit_flush(c->jit); c->jit->pm_seen = 0; }   /* back from PM */
+        r386_split(c);
+        int r = b86_jit_run16(c, max_dispatch);
+        r386_merge(c);
+        if (r == B86_PM_ENTER) {               /* switched to protected mode mid-run */
+            c->jit->pm_seen = 1;
+            return b86_386_rm0_run(c, max_dispatch);
+        }
+        return r;
+    }
+    return b86_jit_run16(c, max_dispatch);
+}
+
+B86_HOT static int b86_jit_run16(B86Cpu *c, uint64_t max_dispatch)
+{
     J *j = c->jit;
     uint64_t n = 0;
     uint8_t *patch_site = NULL, *rf_site = NULL;
@@ -3762,6 +3814,7 @@ B86_HOT int b86_jit_run(B86Cpu *c, uint64_t max_dispatch)
         if (c->irq) return B86_EXIT;
         if (c->seg[B86_CS] == c->trap_cs) return B86_TRAP;
         if (n >= max_dispatch) return B86_BUDGET;
+        if (c->msw & 1u) return B86_PM_ENTER;          /* 386: PE set by an interpreted step */
         n++;
         uint32_t key = (c->seg[B86_CS] << 16) | (c->ip & 0xFFFFu);
         uint32_t f = fast_hash(key);

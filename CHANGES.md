@@ -1,5 +1,45 @@
 # Changes
 
+## 2026-10-18 (r55) — 386 real mode runs through the Thumb-2 JIT (tier 1)
+
+b86_jit_run no longer hands 386 real mode to b86_386_rm0_run (one
+b86_step per guest instruction). Protected mode (CR0.PE / MSW.PE = 1) still
+does; that is the next tier.
+
+* Generated code is the existing 16-bit translation. In 386 mode the
+  decoder ends a block at, and the interpreter steps, everything the 16-bit
+  translator cannot do exactly: 66/67/64/65 prefixes, every 0F opcode,
+  PUSHF/POPF (IOPL/NT), MOV to/from FS/GS (8C/8E reg 4/5), plus what the
+  286 tier already sends there (INT, IRET, far transfers, PUSHA, ENTER, ...).
+* Upper register halves: generated code treats r[] as 16-bit and may leave
+  anything in bits 16-31. B86Cpu.rhi[8] (appended, no hot offsets moved)
+  holds the authoritative upper halves while b86_jit_run is executing 386
+  code. They are captured on entry, merged into r[] around every
+  interpreter step (b86h_step, cold runs) and re-captured after it, and
+  merged back when b86_jit_run returns - outside b86_jit_run r[] is always
+  the exact 32-bit register file (blitzBUS to_b86/to_md unchanged).
+* A step that sets PE leaves native code; b86_jit_run continues in the
+  protected-mode interpreter. Coming back to real mode flushes the cache.
+* Fixed (all models): a lone instruction that wraps past the segment end at
+  CS:FFFF with CS = 0 gave the block a guard end of 0, and the SMC line loop
+  then ran over the whole map (segfault). Found by the 386 vectors.
+* Tests:
+  - tools/sst386_convert.py + tests/sst386.c: SingleStepTests 80386
+    v1_ex_real_mode (moo2json output). Runs interpreter and JIT on each
+    vector and compares 32-bit GPRs, segments incl. FS/GS, IP, FLAGS
+    (f_umask from 80386.csv), memory. Forms without 66/67 (271 files, 100
+    each): interpreter 26363/27100 vs silicon; JIT 23038/23038 of the
+    interpreter-passing vectors (skipped: 3260 with code above 1 MiB, which
+    the JIT does not translate; 65 that raise a 386 segment-limit fault,
+    which the JIT tier does not model - same as the 286 tier).
+  - FUZZ_386=1: model 386, random upper halves, 32-bit forms (INC/MOV/ADD/
+    SUB/XOR/SHL/PUSH/POP r32, MOVZX, MOVSX) mixed into the 16-bit programs;
+    registers compared as 32-bit. 0 mismatches on Thumb-2 (paged and not),
+    hot threshold 1, AArch64. Programs whose reference raised a segment-limit
+    fault are counted and skipped (b86_limit_faults).
+  - The fuzzer no longer emits 8086 Jcc aliases (60-6F) for 186+ models.
+  - 8086 vectors, 286 suite (83809/83809), 8086/286 fuzz unchanged.
+
 ## 2026-10-10 (r51c) — interpreter instruction fetch window
 
 Pico sampling with r51b (38.4 fps): outside generated code, the interpreter

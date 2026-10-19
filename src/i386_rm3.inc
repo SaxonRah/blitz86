@@ -75,9 +75,11 @@ static BB386RM3_FLASH int b86_rm5c4a_shutdown(St *s)
  * If the IDT entry or exception frame is itself inaccessible, the CPU's
  * current shutdown/double-fault state cannot be represented: fail closed.
  */
+uint32_t b86_limit_faults;   /* r55: 386 real-mode #SS/#GP segment-limit faults raised (tests) */
 static BB386RM3_FLASH int b86_rm5c2_fault(St *s, unsigned vector)
 {
     B86Cpu *c = s->c;
+    if (vector == 12u || vector == 13u) b86_limit_faults++;
     uint32_t slot = vector * 4u;
     uint64_t phys = (uint64_t)c->idt_base + slot;
     const uint16_t sp = (uint16_t)c->r[B86_SP];

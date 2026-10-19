@@ -162,6 +162,12 @@ typedef struct B86Cpu {
     uint16_t seg386[2];   /* FS and GS selectors, real mode */
     uint32_t shutdown386; /* BB_386_STAGE5C4A_V1: sticky 386 shutdown until b86_init */
     B86PM1State pm386; /* Not active in interpreter/JIT until PE is implemented. */
+    /* r55 (386 JIT tier 1): while b86_jit_run executes 386 real-mode code
+       natively, generated code treats r[] as 16-bit registers and may leave
+       anything in bits 16-31. The authoritative upper halves of EAX..EDI
+       live here; they are merged back before any interpreter step and when
+       b86_jit_run returns, so outside b86_jit_run r[] is always exact. */
+    uint32_t rhi[8];
 } B86Cpu;
 
 /* Host pointer for a guest linear address (honours mapped pages). */
