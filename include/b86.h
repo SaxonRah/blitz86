@@ -65,6 +65,7 @@ enum {
     LZ_SZPC8, LZ_SZPC16,  /* SF/ZF/PF from lz_res, CF/OF bits in lz_b, AF=0
                              (a shift by 1 followed by RCL/RCR by 1) */
     LZ_ADD32, LZ_SUB32, LZ_LOG32, LZ_INC32, LZ_DEC32,   /* r56: 386 32-bit records */
+    LZ_SHL8A, LZ_SHL16A, LZ_SHR8A, LZ_SHR16A, LZ_SAR8A, LZ_SAR16A, /* r59: 386 shift by 1, AF kept from flags */
     LZ_COUNT
 };
 

@@ -872,9 +872,14 @@ static BB386RM3_FLASH int b86_rm5c5a_system_66(St *s, int address32)
             else b86_rm1_write(c, &ea, 2u, c->msw);
         } else {
             uint16_t v = (uint16_t)b86_rm1_rmget(c, &ea, 1u);
-            /* PE=1 is legal but remains unimplemented, not a fake #UD. */
-            if (v & 1u) { c->ip = s->fip0; return B86_UNSUPPORTED; }
-            c->msw = (uint16_t)((c->msw & 1u) | (v & 0x000Eu));
+            /* r60: LMSW with PE=1 enters protected mode through the same
+             * transactional path as MOV CR0 (DOS/4GW raw switch uses
+             * LMSW AX + far JMP). LMSW never clears PE. */
+            if ((v & 1u) && !(c->msw & 1u)) {
+                if (b86_pm3_enter(c, 0x10u | (uint32_t)(v & 0x000Fu)) != B86_PM3_OK) {
+                    c->ip = s->fip0; return B86_UNSUPPORTED;
+                }
+            } else c->msw = (uint16_t)((c->msw & 1u) | (v & 0x000Eu));
         }
     } else return b86_rm5c2_fault(s, 6u); /* reserved group extensions */
     c->ip = s->ip;
@@ -933,6 +938,19 @@ static BB386RM3_FLASH int b86_rm3_dispatch(St *s, uint8_t op,
                                              int operand32, int address32)
 {
     B86Cpu *c = s->c;
+    /* r61: x87 ESC (D8-DF) and WAIT on a 386 without a coprocessor.
+     * CR0.EM=1 -> #NM (INT 7); WAIT with MP=1 and TS=1 -> #NM. Otherwise
+     * the coprocessor is absent: decode the full ModRM (16- or 32-bit
+     * addressing, any prefixes) and do nothing, so FNINIT/FNSTSW-style
+     * probes see "no FPU" (their memory operand stays untouched). */
+    if (op >= 0xD8 && op <= 0xDF) {
+        if (c->msw & 4u) return b86_rm5c2_fault(s, 7u);
+        if (address32) { B86RM1EA m; (void)b86_rm1_ea(s, &m); }
+        else modrm(s);
+        c->ip = s->ip;
+        return B86_OK;
+    }
+    if (op == 0x9B && (c->msw & 0xAu) == 0xAu) return b86_rm5c2_fault(s, 7u);
     /* Stage 5B intercepts 386 real-mode software INT and IRET first.
      * 66h does NOT widen a real-mode INT frame, but DOES widen IRET. */
     if (op == 0x9C || op == 0x9D)

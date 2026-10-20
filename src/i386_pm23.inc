@@ -99,6 +99,53 @@ B86_PM23_FLASH int b86_pm23_poll(B86Cpu *cpu,B86Pm23Hw *h,unsigned *vector)
     if(!h || h->pic_init_step)return B86_UNSUPPORTED;
     return b86_pm22_pic_poll(cpu,&h->pic,vector);
 }
+/* r61: x87 ESC (D8-DF) and WAIT in protected mode without a coprocessor.
+ * EM=1 (or WAIT with MP+TS) needs #NM through the IDT: left UNSUPPORTED.
+ * Otherwise decode prefixes + ModRM (+SIB/displacement, 16/32-bit
+ * addressing from CS.D xor 67h) and advance EIP: absent-FPU probes see no
+ * coprocessor. Returns -1 when the instruction is not ESC/WAIT. */
+B86_PM23_FLASH int b86_pm23_esc(B86Cpu *c)
+{
+    uint32_t ip, start;
+    uint8_t op, m, sib, b;
+    unsigned ad32, mod, rm, disp = 0u, i;
+    if (!c->pm386.seg[B86_CS].valid || c->ip > UINT32_MAX - 15u) return -1;
+    ad32 = (c->pm386.seg[B86_CS].flags & 4u) != 0u;
+    ip = start = c->ip;
+    for (;;) {
+        if (!b86_pm4_byte(c, &ip, start, &op)) return -1;
+        if (op == 0x67u) { ad32 ^= 1u; continue; }
+        if (op == 0x66u || op == 0x26u || op == 0x2Eu || op == 0x36u ||
+            op == 0x3Eu || op == 0x64u || op == 0x65u || op == 0xF0u ||
+            op == 0xF2u || op == 0xF3u) continue;
+        break;
+    }
+    if (op == 0x9Bu) {
+        if ((c->msw & 0xAu) == 0xAu) return B86_UNSUPPORTED;
+        c->ip = ip; ++c->icount; return B86_OK;
+    }
+    if (op < 0xD8u || op > 0xDFu) return -1;
+    if (c->msw & 4u) return B86_UNSUPPORTED;
+    if (!b86_pm4_byte(c, &ip, start, &m)) return B86_UNSUPPORTED;
+    mod = m >> 6; rm = m & 7u;
+    if (mod != 3u) {
+        if (ad32) {
+            if (rm == 4u) {
+                if (!b86_pm4_byte(c, &ip, start, &sib)) return B86_UNSUPPORTED;
+                if (mod == 0u && (sib & 7u) == 5u) disp = 4u;
+            } else if (mod == 0u && rm == 5u) disp = 4u;
+            if (mod == 1u) disp = 1u; else if (mod == 2u) disp = 4u;
+        } else {
+            if (mod == 0u && rm == 6u) disp = 2u;
+            else if (mod == 1u) disp = 1u; else if (mod == 2u) disp = 2u;
+        }
+        for (i = 0; i < disp; ++i)
+            if (!b86_pm4_byte(c, &ip, start, &b)) return B86_UNSUPPORTED;
+    }
+    c->ip = ip; ++c->icount;
+    return B86_OK;
+}
+
 /* CPU protected IN/OUT: byte/word/dword port-width transfer. We use the
  * existing byte-wide hooks, little-endian consecutive ports for wide I/O.
  * Instruction bytes are preflighted before any externally visible callback.

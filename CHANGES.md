@@ -1,5 +1,96 @@
 # Changes
 
+## 2026-10-19 (r62) — 32-bit protected-mode integer core complete (fuzzer-verified)
+
+* New tests/pmfz: differential fuzzer for flat CPL0 protected mode against
+  Unicorn (one instruction per case, undefined flags masked per template).
+  First run against r61: 268 of 666 cases UNSUPPORTED (OR/ADC/SBB/AND/XOR,
+  80/81/83 groups, SETcc, XCHG eAX, BCD, INC/DEC r/m, LOOP/JECXZ, AAM/AAD,
+  8/16-bit shift counts > width all missing).
+* New stage i386_pm24.inc (runs before the older PM chain): all eight ALU
+  ops in every encoding, 80/81/83, TEST (84/85/A8/A9/F6-F7 /0), XCHG r/m and
+  eAX, SETcc, DAA/DAS/AAA/AAS, AAM/AAD, INC/DEC r/m (CF kept), LOOP/LOOPE/
+  LOOPNE/JECXZ, and the full shift/rotate group (ROL/ROR/RCL/RCR/SHL/SHR/SAR
+  with 386 count semantics for 8/16/32-bit operands).
+* Result: 3 seeds x 138 templates x 25 cases = 10350 cases, 0 unsupported,
+  0 mismatches in 32-bit code segments.
+* Known gap: 16-bit protected-mode code segments are mostly unsupported by
+  the older stages (they require CS.D=1).
+* Regression: 386 vectors 23038/23038, 8086 58857/58857, LMSW/CR0 PM test.
+
+## 2026-10-19 (r61) — absent-coprocessor x87 handling (real and protected mode)
+
+* DESCENT.EXE stopped with "guest stopped: fault ... opcode=DF": x87 ESC
+  instructions were only handled by the 8086 table, so 386 forms with a
+  67h prefix (32-bit addressing) and every ESC in protected mode returned
+  UNSUPPORTED.
+* 386 real mode: D8-DF with any prefixes decode the full ModRM (16- or
+  32-bit addressing, SIB, displacement) and do nothing (no coprocessor);
+  CR0.EM=1 raises #NM (INT 7); WAIT with MP=1 and TS=1 raises #NM.
+* Protected mode: b86_pm23_esc() handles ESC/WAIT the same way (CS.D xor
+  67h address size) before the PM step chain; EM=1 / MP+TS WAIT stay
+  UNSUPPORTED until IDT exception delivery covers #NM.
+* tests/bb_386_lmsw_pm.c now runs FNINIT / FNSTSW [mem] / WAIT in 32-bit
+  protected mode and checks the memory operand is untouched.
+* Regression: 386 vectors 23038/23038, 8086 58857/58857, FUZZ_386 0.
+
+## 2026-10-19 (r60) — LMSW enters protected mode
+
+* Descent's SETUP.EXE and DESCENT.EXE (DOS/4GW) hung forever at
+  `LMSW AX` (0F 01 F0, AX=FFF1) followed by a far JMP: LMSW with PE=1
+  returned UNSUPPORTED and was retried at the same address. LMSW with PE=1
+  now enters protected mode through the same transactional path as
+  MOV CR0 (b86_pm3_enter), in both the 386 real-mode decoder and the
+  generic 0F 01 path. LMSW still never clears PE.
+* tests/bb_386_lmsw_pm.c: LMSW AX / MOV CR0 entry, far JMP into a 32-bit
+  flat code segment, store through a 4 GiB data segment above 1 MiB, HLT.
+* 386 vectors 23038/23038 unchanged.
+
+## 2026-10-19 (r59) — 386 SHL/SHR/SAR by 1 native with AF live
+
+* The DOS 6.22 profile showed D1 (shift by 1) as the top interpreter step in
+  386 mode (up to ~800k per 8 s in 3DBENCH): r56 kept them native only while
+  AF was dead, because the 386 leaves AF unchanged and the 8086 record
+  cleared it.
+* New lazy kinds LZ_SHL8A/16A, LZ_SHR8A/16A, LZ_SAR8A/16A (lazy_eval classes
+  11-13 = shift classes 3-5 that keep AF from the flags word). With AF live
+  after the shift the lowering materializes the previous flags (be_call_flags)
+  and writes the AF-keeping record; otherwise the plain record as before.
+  D0/D1 shifts are native in 386 mode again regardless of AF.
+* Regression: 386 16-bit vectors 23038/23038 (native 40095 of 46259, was
+  39672), 8086 full suite 58857/58857, FUZZ_386 0 mismatches (Thumb-2,
+  paged + hot 1), AArch64 fuzz 0 mismatches.
+
+## 2026-10-19 (r58b) — far pointer selector word: own effective address
+
+* LES/LDS and CALL/JMP FAR m16:16 (native since r58) read the selector word
+  through a second effective address (disp + 2) instead of host address + 2:
+  the word wraps inside the segment at offset FFFF and may live on another
+  guest page (paged builds remap e.g. bbuf/A000 pages to SRAM). The offset
+  of LES/LDS is kept in rep_tmp[0] until both loads are done (the base
+  register may be the destination).
+* Regression unchanged (8086 58857/58857, 286 83809/83809, 386 23038/23038,
+  FUZZ_386 paged 0 mismatches); host 3DBENCH 200M instructions in 8086 and
+  386 mode, no fault.
+
+## 2026-10-19 (r58) — native far transfers, LES/LDS, 386 PUSHF/POPF
+
+The DOS 6.22 profile ([bb-386-steps]) showed the JIT stepping RETF, IRET,
+far CALL/JMP through memory, LES/LDS and (in 386 mode) PUSHF/POPF through the
+interpreter hundreds of thousands of times per second (DOS kernel and
+TSR paths). Now native on Thumb-2 for every CPU model:
+* RETF, RETF imm16, IRET (FLAGS per model: 386 keeps IOPL/NT and EFLAGS
+  bits 16-31, older models mask 0FD5h|F002h), CALL FAR / JMP FAR m16:16
+  (FF /3, /5): new CS through be_set_seg, IP through ctx, dynamic exit (the
+  dispatcher re-checks interrupts after IRET).
+* LES/LDS r16, m16:16 (register forms stay with the interpreter: #UD).
+* 386: PUSHF/POPF native again with the 386 masks (r55 had sent them to the
+  interpreter).
+* INT n stays in the interpreter (embedder INT hooks).
+* Regression: 8086 full suite 58857/58857, 286 83809/83809, 386 16-bit
+  23038/23038, 386 66h 11772/11772, 8086/386 fuzz 0 mismatches, DOS
+  end-to-end (DOS2TEST, MDSTRESS) PASS.
+
 ## 2026-10-19 (r57) — 386 real mode: interpreter gaps filled, 32-bit MUL native
 
 Full 80386 v1_ex_real_mode gap map (941 forms, 60 vectors each): the JIT

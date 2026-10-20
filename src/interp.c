@@ -84,16 +84,19 @@ static const uint8_t lz_class[LZ_COUNT] = {
     [LZ_SHL8] = 3, [LZ_SHL16] = 3, [LZ_SHR8] = 4, [LZ_SHR16] = 4, [LZ_SAR8] = 5, [LZ_SAR16] = 5,
     [LZ_ADC8] = 8, [LZ_ADC16] = 8, [LZ_SBB8] = 9, [LZ_SBB16] = 9, [LZ_SZPC8] = 10, [LZ_SZPC16] = 10,
     [LZ_ADD32] = 0, [LZ_SUB32] = 1, [LZ_LOG32] = 2, [LZ_INC32] = 6, [LZ_DEC32] = 7,
+    [LZ_SHL8A] = 11, [LZ_SHL16A] = 11, [LZ_SHR8A] = 12, [LZ_SHR16A] = 12, [LZ_SAR8A] = 13, [LZ_SAR16A] = 13,
 };
 static const uint8_t lz_w16[LZ_COUNT] = {
     [LZ_ADD16] = 1, [LZ_SUB16] = 1, [LZ_LOG16] = 1, [LZ_INC16] = 1, [LZ_DEC16] = 1,
     [LZ_SHL16] = 1, [LZ_SHR16] = 1, [LZ_SAR16] = 1, [LZ_ADC16] = 1, [LZ_SBB16] = 1, [LZ_SZPC16] = 1,
     [LZ_ADD32] = 2, [LZ_SUB32] = 2, [LZ_LOG32] = 2, [LZ_INC32] = 2, [LZ_DEC32] = 2,   /* 2: 32-bit */
+    [LZ_SHL16A] = 1, [LZ_SHR16A] = 1, [LZ_SAR16A] = 1,
 };
 
 B86_HOT static uint32_t lazy_eval(uint32_t k, uint32_t a0, uint32_t r0, uint32_t b0, uint32_t f)
 {
-    unsigned cls = lz_class[k], w16 = lz_w16[k];
+    unsigned cls = lz_class[k], w16 = lz_w16[k], keep_af = 0;
+    if (cls >= 11) { cls -= 8; keep_af = 1; }       /* r59: 386 shifts keep AF */
     uint32_t m = w16 == 2 ? 0xFFFFFFFFu : w16 ? 0xFFFFu : 0xFFu;
     uint32_t sb = w16 == 2 ? 0x80000000u : w16 ? 0x8000u : 0x80u;
     uint32_t a = a0 & m, r = r0 & m, b;
@@ -120,6 +123,7 @@ B86_HOT static uint32_t lazy_eval(uint32_t k, uint32_t a0, uint32_t r0, uint32_t
     default: out = 0; break;                        /* logic */
     }
     if (cls == 6 || cls == 7) out = (out & ~(uint32_t)B86_CF) | (f & (uint32_t)B86_CF);   /* INC/DEC keep CF */
+    if (keep_af) out |= f & (uint32_t)B86_AF;
     return (f & ~(uint32_t)B86_ARITH) | out | zsp;
 }
 
@@ -668,7 +672,12 @@ static __attribute__((noinline, cold, section(".text.bb386_flash"))) int step0f(
             /* Setting PE requests a mode transition this engine cannot perform.
              * Do not fabricate #UD for an architecturally valid 386 LMSW. */
             if (v & 1u) {
-                if (c->model >= B86_CPU_386) {
+                if (c->model >= B86_CPU_386) {           /* r60: as MOV CR0, PE=1 */
+                    if (!(c->msw & 1u) &&
+                        b86_pm3_enter(c, 0x10u | (uint32_t)(v & 0x000Fu)) == B86_PM3_OK) {
+                        c->ip = s->ip;
+                        return B86_OK;
+                    }
                     c->ip = s->fip0;
                     return B86_UNSUPPORTED;
                 }
@@ -840,6 +849,7 @@ static uint32_t b86_rm3_segvalue(B86Cpu *c, int which);
 #include "i386_pm21.inc"
 #include "i386_pm22.inc"
 #include "i386_pm23.inc"
+#include "i386_pm24.inc"   /* r62: PM integer gap fill */
 
 /* BB_386_STAGE5C3C_V1: model-386-only legacy word memory limit preflight. */
 /* The 8086/186/286 interpreter and JIT memory primitives are intentionally
@@ -1330,7 +1340,11 @@ B86_HOT int b86_step(B86Cpu *c)
         /* SS interrupt/debug shadow is retired by one completed *following*
          * protected instruction. The loader arms it with value 2. */
         uint8_t before = c->pm386.seg[B86_SS].reserved;
-        int rc = b86_pm23_step(c);
+        int rc = c->pm386.seg[B86_CS].reserved == B86_PM3_TRANSITION_MARKER
+                 ? -1 : b86_pm23_esc(c);                         /* r61 */
+        if (rc < 0 && c->pm386.seg[B86_CS].reserved != B86_PM3_TRANSITION_MARKER)
+            rc = b86_pm24_step(c);                                   /* r62 */
+        if (rc < 0) rc = b86_pm23_step(c);
         if (rc == B86_OK || rc == B86_HALT) {
             if (c->pm386.seg[B86_SS].reserved == B86_PM11_SHADOW_ARMED)
                 c->pm386.seg[B86_SS].reserved = B86_PM11_SHADOW_NEXT;

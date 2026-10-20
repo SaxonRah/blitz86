@@ -487,9 +487,6 @@ B86_HOT static void decode(B86Cpu *c, uint32_t cs, uint16_t ip, Insn *d)
         }
         if (ud) { d->op = 0x0F; d->cls = C_END; d->next = (uint16_t)p; return; }
     }
-    if (c->model >= B86_CPU_386 && (op == 0x9C || op == 0x9D)) {
-        d->op = 0x0F; d->cls = C_END; d->next = (uint16_t)p; return;   /* r55: 386 FLAGS (IOPL/NT, EFLAGS) */
-    }
     if (c->model >= B86_CPU_286 && op == 0x54) {
         d->op = 0x0F; d->cls = C_END; d->next = (uint16_t)p; return;   /* 286 PUSH SP pushes the old SP */
     }
@@ -590,7 +587,8 @@ B86_HOT static void classify(Insn *d)
     case 0x8E: if ((d->reg & 3) == B86_CS) { d->cls = C_END; return; }
         d->fuse = 0; d->native = 1; return;
     case 0x8F: d->fuse = 0; d->native = d->reg == 0; return;      /* r52e: POP r/m16 */
-    case 0xC4: case 0xC5: case 0xD7: d->fuse = 0; return;
+    case 0xC4: case 0xC5: d->fuse = 0; d->native = be_rep_inline && d->mod != 3; return;   /* r58: LES/LDS */
+    case 0xD7: d->fuse = 0; return;
     case 0xD8: case 0xD9: case 0xDA: case 0xDB: case 0xDC: case 0xDD: case 0xDE: case 0xDF:
     case 0x9B: d->fuse = 0; return;
     case 0xE4: case 0xE5: case 0xE6: case 0xE7: case 0xEC: case 0xED: case 0xEE: case 0xEF:
@@ -618,7 +616,10 @@ B86_HOT static void classify(Insn *d)
         case 2: d->cls = C_IND; d->fuse = ALLF;      /* r52e: CALL reg also on Thumb-2 (2 temps suffice) */
             d->native = (be_has_t2 || d->mod == 3) && !(d->mod == 3 && d->rm == B86_SP); return;
         case 4: d->cls = C_IND; d->fuse = ALLF; d->native = 1; return;
-        case 3: case 5: d->cls = C_END; return;
+        case 3: case 5:                                  /* r58: CALL/JMP FAR m16:16 native (Thumb-2) */
+            if (be_rep_inline && d->mod != 3) { d->cls = C_IND; d->fuse = ALLF; d->native = 1; }
+            else d->cls = C_END;
+            return;
         default: d->fuse = 0; d->native = !(d->mod == 3 && d->rm == B86_SP); return;
         }
     case 0xD0: case 0xD1:
@@ -628,9 +629,10 @@ B86_HOT static void classify(Insn *d)
                     (B86_RCX_MEM1 && !be_has_t2 && memop && (d->reg == 2 || d->reg == 3)) ||
                     (d->reg < 4 && d->mod == 3 && (d->w || d->rm < 4));   /* ROL/ROR/RCL/RCR r,1 */
         if (d->reg < 4) d->nzclob = 1;
-        /* r56: the 386 keeps AF across SHL/SHR/SAR (the record would clear it):
-           AF is not defined by them, and they are native only while AF is dead */
-        else if (d->m386) { d->nfd = B86_AF; d->fdef = ALLF & ~B86_AF; }
+        /* r56/r59: the 386 keeps AF across SHL/SHR/SAR: AF is not defined by
+           them; with AF live the lowering materializes the previous flags and
+           writes an AF-keeping record (LZ_SHLxA..) */
+        else if (d->m386) d->fdef = ALLF & ~B86_AF;
         return;
     case 0xD2: case 0xD3: /* count may be 0: defines nothing for sure */
         d->fuse = (d->reg == 2 || d->reg == 3) ? B86_CF : 0; d->fdef = 0;
@@ -654,8 +656,13 @@ B86_HOT static void classify(Insn *d)
     case 0xEB: d->cls = C_JMP; d->target = (uint16_t)(d->next + (int8_t)d->imm); d->fuse = 0; d->native = 1; return;
     case 0xC2: case 0xC0: case 0xC3: case 0xC1: d->cls = C_RET; d->fuse = 0; d->native = 1; return;
     case 0xF4: d->cls = C_HLT; d->fuse = 0; d->native = 1; return;
-    case 0x9A: case 0xCA: case 0xC8: case 0xCB: case 0xC9: case 0xCC: case 0xCD:
-    case 0xCE: case 0xCF: case 0xEA:
+    case 0xCA: case 0xCB: case 0xCF:                     /* r58: RETF / IRET native (Thumb-2) */
+        if (!be_rep_inline) { d->cls = C_END; return; }
+        d->cls = C_IND; d->native = 1; d->nzclob = 1;
+        if (op == 0xCF) { d->fuse = 0; d->fdef = ALLF; } else d->fuse = ALLF;
+        return;
+    case 0x9A: case 0xC8: case 0xC9: case 0xCC: case 0xCD:
+    case 0xCE: case 0xEA:
         d->cls = C_END; return;
     }
     if (op >= 0x40 && op <= 0x4F) { d->fuse = 0; d->fdef = ALLF & ~B86_CF; d->native = 1; return; }
@@ -1983,6 +1990,78 @@ B86_COLD static int emit386(Tx *t, Insn *d)
     return 1;
 }
 
+/* r58: FLAGS word in v (T1) -> ctx flags, per model (POPF / IRET).
+   386: (old & 0xFFFF0000) | (v & 0x7FD5) | 2; else (v & 0x0FD5) | 0xF002.
+   Uses T0. */
+B86_COLD static void emit_flags_store(Tx *t, int v)
+{
+    Emit *e = t->e;
+    if (t->j->cpu->model >= B86_CPU_386) {
+        be_opi(e, AOP_AND, v, v, 0x7FD5u);
+        be_opi(e, AOP_ORR, v, v, 0x0002u);
+        be_ldctx(e, V_T0, OFF(flags));
+        be_shift_imm(e, 1, V_T0, V_T0, 16);
+        be_shift_imm(e, 0, V_T0, V_T0, 16);
+        be_op(e, AOP_ORR, v, v, V_T0);
+    } else {
+        be_opi(e, AOP_AND, v, v, 0x0FD5u);
+        be_opi(e, AOP_ORR, v, v, 0xF002u);
+    }
+    be_stctx(e, v, OFF(flags));
+}
+
+/* r58: native far transfers (Thumb-2). The new CS goes through be_set_seg,
+   IP through ctx->ip, and the block leaves with a dynamic exit (the
+   dispatcher looks up CS:IP and checks interrupts). */
+B86_COLD static int emit_far(Tx *t, Insn *d)
+{
+    Emit *e = t->e;
+    uint8_t op = d->op;
+    emit_deferred(t, t->cur - 1, d->live);
+    if (op == 0xCA || op == 0xCB || op == 0xCF) {               /* RETF [imm] / IRET */
+        be_ea(e, V_T0, B86_SS, B86_SP, -1, 0);
+        be_load(e, 1, V_T1, V_T0);
+        be_stctx(e, V_T1, OFF(ip));
+        if (op == 0xCF) {
+            be_ea(e, V_T0, B86_SS, B86_SP, -1, 4);
+            be_load(e, 1, V_T1, V_T0);
+            emit_flags_store(t, V_T1);
+            be_stctx_imm(e, LZ_NONE, OFF(lz_kind));
+            be_stctx_imm(e, LZ_NONE, OFF(lz_ikind));
+            t->inc_pending = 0;
+        }
+        be_ea(e, V_T0, B86_SS, B86_SP, -1, 2);
+        be_load(e, 1, V_T1, V_T0);
+        be_opi(e, AOP_ADD, B86_SP, B86_SP, op == 0xCF ? 6u : op == 0xCA ? (uint32_t)(4u + d->imm) : 4u);
+        be_set_seg(e, B86_CS, V_T1);
+        be_exit_dyn(e);
+        return 1;
+    }
+    /* FF /3 CALL FAR m16:16, FF /5 JMP FAR m16:16. The selector word gets
+       its own effective address (offset + 2 wraps in the segment and may sit
+       on another guest page). */
+    ea_modrm(t, d);
+    be_load(e, 1, V_T1, V_T0);
+    be_stctx(e, V_T1, OFF(ip));
+    {
+        Insn d2 = *d;
+        d2.disp = (uint16_t)(d->disp + 2u);
+        ea_modrm(t, &d2);
+    }
+    be_load(e, 1, V_T1, V_T0);
+    be_stctx(e, V_T1, OFF(rep_tmp[0]));
+    if (d->reg == 3) {
+        be_movi(e, V_T1, t->cs);
+        emit_push(t, V_T1, d->next, 1);
+        be_movi(e, V_T1, d->next);
+        emit_push(t, V_T1, d->next, 1);
+    }
+    be_ldctx(e, V_T1, OFF(rep_tmp[0]));
+    be_set_seg(e, B86_CS, V_T1);
+    be_exit_dyn(e);
+    return 1;
+}
+
 B86_COLD static int lower(Tx *t, Insn *d)
 {
     Emit *e = t->e;
@@ -2024,6 +2103,21 @@ B86_COLD static int lower(Tx *t, Insn *d)
         return emit_alu(t, d, d->reg ? 5 : 0, w, op_rm(d, w), op_imm(1), d->reg ? 2 : 1);
     }
     if (op == 0xF2) return emit386(t, d);          /* r56: 386 32-bit forms */
+    if (op == 0xCA || op == 0xCB || op == 0xCF || (op == 0xFF && (d->reg == 3 || d->reg == 5)))
+        return emit_far(t, d);                     /* r58 */
+    if (op == 0xC4 || op == 0xC5) {                /* r58: LES / LDS r16, m16:16 */
+        Insn d2 = *d;                              /* selector: own EA (wrap / page) */
+        d2.disp = (uint16_t)(d->disp + 2u);
+        ea_modrm(t, d);
+        be_load(e, 1, V_T1, V_T0);
+        be_stctx(e, V_T1, OFF(rep_tmp[0]));        /* the base register may be d->reg */
+        ea_modrm(t, &d2);
+        be_load(e, 1, V_T1, V_T0);
+        be_ldctx(e, V_T0, OFF(rep_tmp[0]));
+        be_mov(e, d->reg, V_T0);
+        be_set_seg(e, op == 0xC4 ? B86_ES : B86_DS, V_T1);
+        return 1;
+    }
     if (op == 0xF1) {                              /* r53b: 80186 */
         if (d->x186 == 0xC9) {                     /* LEAVE: SP = BP; POP BP */
             be_mov(e, B86_SP, B86_BP);
@@ -2444,6 +2538,10 @@ B86_COLD static int lower(Tx *t, Insn *d)
         int sh = w ? 16 : 24;
         unsigned bits = w ? 16 : 8;
         int kind = (d->reg == 4 ? LZ_SHL8 : d->reg == 5 ? LZ_SHR8 : LZ_SAR8) + w;
+        if (d->m386 && d->lazy && (d->live & B86_AF)) {          /* r59: AF read later */
+            (DBG_SITE(t, d), be_call_flags(e)); t->inc_pending = 0;
+            kind = (d->reg == 4 ? LZ_SHL8A : d->reg == 5 ? LZ_SHR8A : LZ_SAR8A) + w;
+        }
         int a, res, x = -1;
         if (mem) { a = res = V_T1; if (d->arm) { if (!be_has_t2) return 0; x = V_T2; } }
         else if (w) { a = res = d->rm; x = V_T0; }
@@ -2620,15 +2718,13 @@ B86_COLD static int lower(Tx *t, Insn *d)
     case 0x9C:                                   /* PUSHF */
         (DBG_SITE(t, d), be_call_flags(e)); t->inc_pending = 0;
         be_ldctx(e, V_T1, OFF(flags));
-        be_opi(e, AOP_AND, V_T1, V_T1, 0x0FD5u);
+        be_opi(e, AOP_AND, V_T1, V_T1, t->j->cpu->model >= B86_CPU_386 ? 0x7FD5u : 0x0FD5u);   /* r58: 386 IOPL/NT */
         be_opi(e, AOP_ORR, V_T1, V_T1, t->j->cpu->model >= B86_CPU_286 ? 0x0002u : 0xF002u);   /* 286: bits 12-15 read 0 */
         emit_push(t, V_T1, d->next, 1);
         return 1;
     case 0x9D:                                   /* POPF */
         emit_pop_to(t, V_T1);
-        be_opi(e, AOP_AND, V_T1, V_T1, 0x0FD5u);
-        be_opi(e, AOP_ORR, V_T1, V_T1, 0xF002u);
-        be_stctx(e, V_T1, OFF(flags));
+        emit_flags_store(t, V_T1);
         be_stctx_imm(e, LZ_NONE, OFF(lz_kind));
         be_stctx_imm(e, LZ_NONE, OFF(lz_ikind));
         t->inc_pending = 0;

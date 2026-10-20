@@ -30,6 +30,7 @@ int b86_pm23_port_out8(B86Pm23Hw *h, unsigned port, unsigned value);
 int b86_pm23_advance(B86Pm23Hw *h,uint32_t clocks,uint32_t *edges);
 int b86_pm23_poll(B86Cpu *cpu,B86Pm23Hw *h,unsigned *vector);
 int b86_pm23_step(B86Cpu *cpu);
+int b86_pm23_esc(B86Cpu *cpu);   /* r61: absent-FPU ESC/WAIT, -1 = not ESC */
 #ifdef __cplusplus
 }
 #endif
