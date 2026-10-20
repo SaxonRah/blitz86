@@ -4163,6 +4163,8 @@ B86_HOT static int MPF(cold_run)(J *j, B86Cpu *c, uint32_t key, int force)
 /* BB_386_RM0_V1: never run the 16-bit Thumb-2/A64 JIT with 386
    registers.  Cold interpreter is deliberately in flash, not SRAM.
    r55: only protected mode still runs here. */
+/* B86_PM_UNIFIED_V10: PE exit boundary; restore native JIT only after far JMP. */
+#define B86_PM29_EXIT_MARKER 0xA6u /* V9 PM25 exit marker; shared with this JIT dispatcher. */
 B86_COLD static int b86_386_rm0_run(B86Cpu *c, uint64_t budget)
 {
     /* BB_386_STAGE5C4A_V1: no IRQ, trap or budget result can bypass shutdown. */
@@ -4176,10 +4178,20 @@ B86_COLD static int b86_386_rm0_run(B86Cpu *c, uint64_t budget)
         if (c->irq & 0x80000000u) { c->irq &= 0x7FFFFFFFu; return B86_HALT; }
         if (c->irq) return B86_EXIT;
         if (c->seg[B86_CS] == c->trap_cs) return B86_TRAP;
+        /* V10: capture the pending far-JMP *before* executing it. The
+         * preceding MOV CR0 clears PE but must NOT end the cold run early. */
+        const int completing_pe_exit = !(c->msw & 1u) &&
+            c->pm386.seg[B86_CS].reserved == B86_PM29_EXIT_MARKER;
         int r = b86_step(c);
         if (r != B86_OK) return r;
         /* BB386_SLICES_COUNTED_V1: report guest instruction retirement to blitzBUS. */
         ++c->icnt;
+        if (completing_pe_exit &&
+            c->pm386.seg[B86_CS].reserved != B86_PM29_EXIT_MARKER) {
+            /* Fully reloaded real CS: resume via fresh native-JIT dispatch.
+             * Prevent same-slice cold execution from hiding a new HLT. */
+            return B86_EXIT;
+        }
     }
     return B86_BUDGET;
 }
@@ -4193,8 +4205,21 @@ B86_HOT int b86_jit_run(B86Cpu *c, uint64_t max_dispatch)
 #endif
     if (c->model >= B86_CPU_386) {
         if (c->shutdown386) return B86_SHUTDOWN;
-        if ((c->msw & 1u) || !c->jit) return b86_386_rm0_run(c, max_dispatch);
-        if (c->jit->pm_seen) { b86_jit_flush(c->jit); c->jit->pm_seen = 0; }   /* back from PM */
+        /* V10: CR0.PE may already be clear while old CS cache is still
+         * needed to fetch and complete the pending far JMP. Do NOT enter
+         * the native JIT until V9 clears its transition marker. */
+        if ((c->msw & 1u) ||
+            c->pm386.seg[B86_CS].reserved == B86_PM29_EXIT_MARKER ||
+            !c->jit) return b86_386_rm0_run(c, max_dispatch);
+/* B86_PM_UNIFIED_V11: first real-mode reentry slice stays in 386 interpreter. */
+        if (c->jit->pm_seen) {
+            /* A protected-mode exit can land in 386 real-mode system code
+             * (e.g. MOV FS/GS,r/m16). The legacy 16-bit native translator
+             * must not own the FIRST slice after the far-jump reload. */
+            b86_jit_flush(c->jit);
+            c->jit->pm_seen = 0;
+            return b86_386_rm0_run(c, max_dispatch);
+        }
         r386_split(c);
         int r = b86_jit_run16(c, max_dispatch);
         r386_merge(c);

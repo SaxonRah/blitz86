@@ -1,3 +1,4 @@
+/* B86_PM_UNIFIED_V5: i386_pm19.inc */
 /* PM19: CPL0 32-bit protected string opcodes.
  * A4-A7 / AA-AF MOVS/CMPS/STOS/LODS/SCAS; F2/F3 repeat; FC/FD CLD/STD.
  * 66h operand and 67h address overrides; DS/FS/GS/etc source overrides;
@@ -40,9 +41,9 @@ B86_PM19_FLASH int b86_pm19_step(B86Cpu *c)
     !c->pm386.seg[B86_CS].valid||
     c->pm386.seg[B86_CS].reserved==B86_PM3_TRANSITION_MARKER||
     !(c->pm386.seg[B86_CS].access&8u)||(c->seg[B86_CS]&3u)||
-    !(c->pm386.seg[B86_CS].flags&4u)||c->ip>UINT32_MAX-15u||
+    c->ip>UINT32_MAX-15u || (!(c->pm386.seg[B86_CS].flags&4u) && c->ip>0xFFFFu) ||
     c->lz_kind!=LZ_NONE||c->lz_ikind!=LZ_NONE||
-    (c->flags&(0x20000u|0x4000u)))return b86_pm18_step(c);
+    (c->flags&(0x20000u|0x4000u)))return (c->pm386.seg[B86_CS].flags&4u)?b86_pm18_step(c):b86_pm11_step(c);
  ip=start=c->ip;
  for(;;){
   if(!b86_pm4_byte(c,&ip,start,&op))return B86_UNSUPPORTED;
@@ -60,14 +61,15 @@ B86_PM19_FLASH int b86_pm19_step(B86Cpu *c)
   break;
  }
  if(op!=0xfcu&&op!=0xfdu&&!(op>=0xa4u&&op<=0xa7u)&&
-    !(op>=0xaau&&op<=0xafu))return b86_pm18_step(c);
+    !(op>=0xaau&&op<=0xafu))return (c->pm386.seg[B86_CS].flags&4u)?b86_pm18_step(c):b86_pm11_step(c);
  if(op==0xfcu||op==0xfdu){
   if(rep||segpref||p66||p67)return B86_UNSUPPORTED;
   if(op==0xfcu)c->flags&=~(uint32_t)B86_PM19_DF;
   else c->flags|=B86_PM19_DF;
-  c->ip=ip;++c->icount;return B86_OK;
+  c->ip=(c->pm386.seg[B86_CS].flags&4u)?ip:(ip&0xFFFFu);++c->icount;return B86_OK;
  }
- op32=1^(int)p66;ad32=1^(int)p67;
+ op32=!!(c->pm386.seg[B86_CS].flags&4u)^(int)p66;
+ ad32=!!(c->pm386.seg[B86_CS].flags&4u)^(int)p67;
  width=(op&1u)?(op32?4u:2u):1u;
  /* A4/A5 MOVS; A6/A7 CMPS; AA/AB STOS; AC/AD LODS; AE/AF SCAS. */
  use_src=(op>=0xa4u&&op<=0xa7u)||(op>=0xacu&&op<=0xadu);
@@ -78,7 +80,7 @@ B86_PM19_FLASH int b86_pm19_step(B86Cpu *c)
  si_used=use_src;di_used=use_dst;
  if(segpref&&!use_src)return B86_UNSUPPORTED;
  if(rep && ((ad32?c->r[B86_CX]:(c->r[B86_CX]&0xffffu))==0u)){
-  c->ip=ip;++c->icount;return B86_OK;
+  c->ip=(c->pm386.seg[B86_CS].flags&4u)?ip:(ip&0xFFFFu);++c->icount;return B86_OK;
  }
  do{
   uint32_t mask=ad32?UINT32_MAX:0xffffu;
@@ -117,5 +119,5 @@ B86_PM19_FLASH int b86_pm19_step(B86Cpu *c)
  if(rep && (ad32?c->r[B86_CX]:(c->r[B86_CX]&0xffffu))!=0u &&
     (!cmp || (rep==0xf3u?!!(c->flags&B86_ZF):!(c->flags&B86_ZF))) &&
     iterations>=64u) return B86_OK;
- c->ip=ip;++c->icount;return B86_OK;
+ c->ip=(c->pm386.seg[B86_CS].flags&4u)?ip:(ip&0xFFFFu);++c->icount;return B86_OK;
 }

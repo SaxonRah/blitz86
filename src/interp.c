@@ -1,3 +1,4 @@
+/* B86_PM_UNIFIED_V5: interp.c */
 /* Reference 8086 interpreter.
  *
  * Two jobs: (1) the oracle every translated instruction is checked against,
@@ -853,6 +854,11 @@ static uint32_t b86_rm3_segvalue(B86Cpu *c, int which);
 #include "i386_pm22.inc"
 #include "i386_pm23.inc"
 #include "i386_pm24.inc"   /* r62: PM integer gap fill */
+#include "i386_pm25.inc"   /* B86_PM_UNIFIED_V5: shared PM system decoder */
+#include "i386_pm26.inc"   /* B86_PM_UNIFIED_V6: segment stack + INT/IRET */
+#include "i386_pm27.inc"   /* B86_PM_UNIFIED_V7: LAR/LSL + 386 bit ops */
+#include "i386_pm28.inc"   /* B86_PM_UNIFIED_V8: data conversion + signed IMUL + far-pointer loads */
+#include "i386_pm29.inc" /* B86_PM_UNIFIED_V9 */
 
 /* BB_386_STAGE5C3C_V1: model-386-only legacy word memory limit preflight. */
 /* The 8086/186/286 interpreter and JIT memory primitives are intentionally
@@ -1345,9 +1351,20 @@ B86_HOT int b86_step(B86Cpu *c)
         uint8_t before = c->pm386.seg[B86_SS].reserved;
         int rc = c->pm386.seg[B86_CS].reserved == B86_PM3_TRANSITION_MARKER
                  ? -1 : b86_pm23_esc(c);                         /* r61 */
+
+        if (rc < 0 && c->pm386.seg[B86_CS].reserved != B86_PM3_TRANSITION_MARKER)
+            rc = b86_pm29_step(c); /* PM29 dispatch */
+        if (rc < 0 && c->pm386.seg[B86_CS].reserved != B86_PM3_TRANSITION_MARKER)
+            rc = b86_pm28_step(c); /* B86_PM_UNIFIED_V8 */
+        if (rc < 0 && c->pm386.seg[B86_CS].reserved != B86_PM3_TRANSITION_MARKER)
+            rc = b86_pm27_step(c); /* B86_PM_UNIFIED_V7 */
+        if (rc < 0 && c->pm386.seg[B86_CS].reserved != B86_PM3_TRANSITION_MARKER)
+            rc = b86_pm26_step(c); /* B86_PM_UNIFIED_V6 */
+        if (rc < 0 && c->pm386.seg[B86_CS].reserved != B86_PM3_TRANSITION_MARKER)
+            rc = b86_pm25_step(c); /* B86_PM_UNIFIED_V5 */
         if (rc < 0 && c->pm386.seg[B86_CS].reserved != B86_PM3_TRANSITION_MARKER)
             rc = b86_pm24_step(c);                                   /* r62 */
-        if (rc < 0) rc = b86_pm23_step(c);
+        if (rc < 0) rc = b86_pm23_step(c); /* B86_PM_UNIFIED_V5: PM19 delegates PM16 to PM11 */
         if (rc == B86_OK || rc == B86_HALT) {
             if (c->pm386.seg[B86_SS].reserved == B86_PM11_SHADOW_ARMED)
                 c->pm386.seg[B86_SS].reserved = B86_PM11_SHADOW_NEXT;
@@ -1357,6 +1374,9 @@ B86_HOT int b86_step(B86Cpu *c)
         }
         return rc;
     }
+    if (c->model >= B86_CPU_386 && !(c->msw&1u) &&
+        c->pm386.seg[B86_CS].reserved==B86_PM29_EXIT_MARKER)
+        return b86_pm29_finish_pe_exit(c);
     if (c->model < B86_CPU_386) return b86_step_internal(c);
     return b86_386_step_flash(c);
 }

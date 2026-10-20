@@ -1,3 +1,4 @@
+/* B86_PM_UNIFIED_V5: i386_pm20.inc */
 /* PM20: 80386 CPL0 32-bit CS frame/flag/utility instructions.
  * PUSHA/POPA, ENTER/LEAVE, PUSHF/POPF, LAHF/SAHF, conversion and carry.
  * All multi-slot stack accesses are checked before any register/memory change.
@@ -32,7 +33,7 @@ B86_PM20_FLASH int b86_pm20_step(B86Cpu*c)
     !c->pm386.seg[B86_CS].valid||
     c->pm386.seg[B86_CS].reserved==B86_PM3_TRANSITION_MARKER||
     !(c->pm386.seg[B86_CS].access&8u)||(c->seg[B86_CS]&3u)||
-    !(c->pm386.seg[B86_CS].flags&4u)||c->ip>UINT32_MAX-15u||
+    c->ip>UINT32_MAX-15u || (!(c->pm386.seg[B86_CS].flags&4u) && c->ip>0xFFFFu) ||
     c->lz_kind!=LZ_NONE||c->lz_ikind!=LZ_NONE||
     (c->flags&(0x20000u|0x4000u)))return b86_pm19_step(c);
  ip=start=c->ip;
@@ -56,7 +57,7 @@ B86_PM20_FLASH int b86_pm20_step(B86Cpu*c)
  if((p67 && op!=0xd7u) || (segpref && op!=0xd7u) ||
     (p66 && (op==0xd7u||op==0xf5u||op==0xf8u||op==0xf9u||op==0x9eu||op==0x9fu)))
    return B86_UNSUPPORTED;
- w=p66?2u:4u;sp=c->r[B86_SP];
+ w=(!!(c->pm386.seg[B86_CS].flags&4u) ^ (int)p66)?4u:2u;sp=c->r[B86_SP];
  if(op==0xf5u||op==0xf8u||op==0xf9u){
   if(op==0xf5u)c->flags^=B86_CF;
   else if(op==0xf8u)c->flags&=~(uint32_t)B86_CF;
@@ -74,8 +75,9 @@ B86_PM20_FLASH int b86_pm20_step(B86Cpu*c)
   uint32_t ah=(c->flags&0xd5u)|2u;
   c->r[B86_AX]=(c->r[B86_AX]&~0xff00u)|(ah<<8u);
  }else if(op==0xd7u){
-  uint32_t base=p67?(c->r[B86_BX]&0xffffu):c->r[B86_BX];
-  uint32_t off=(base+(c->r[B86_AX]&255u))&(p67?0xffffu:UINT32_MAX);
+  unsigned ad32=!!(c->pm386.seg[B86_CS].flags&4u) ^ (int)p67;
+  uint32_t base=ad32?c->r[B86_BX]:(c->r[B86_BX]&0xffffu);
+  uint32_t off=(base+(c->r[B86_AX]&255u))&(ad32?UINT32_MAX:0xffffu);
   if(b86_pm2_check_access(c,segment,off,1u,B86_PM1_READ,&at,&fault)!=B86_PM2_OK)return B86_UNSUPPORTED;
   b86_pm6_putreg(c,B86_AX,1u,b86_pm12_load(c,at,1u));
  }else if(op==0x9cu){
@@ -156,5 +158,5 @@ B86_PM20_FLASH int b86_pm20_step(B86Cpu*c)
   for(r=0;r<count;r++)b86_pm16_store(c,addr[r],word[r],w);
   b86_pm6_putreg(c,B86_BP,w,frame);c->r[B86_SP]=newsp;
  }
- c->ip=ip;++c->icount;return B86_OK;
+ c->ip=(c->pm386.seg[B86_CS].flags&4u)?ip:(ip&0xFFFFu);++c->icount;return B86_OK;
 }

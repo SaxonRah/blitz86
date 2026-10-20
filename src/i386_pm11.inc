@@ -42,6 +42,42 @@ B86_PM11_FLASH int b86_pm11_step(B86Cpu *c)
         }
         break;
     }
+    /* DESCENT_PM16_SYSTEM_V3: protected CPL0, 16-bit CS system opcodes.
+     * The DOS/4GW startup executes LLDT AX (0F 00 D0), SMSW AX
+     * (0F 01 E0), and LMSW AX (0F 01 F0) in succession.
+     * PM1 already performs descriptor validation and atomically installs
+     * the hidden LDTR. This path does not touch the 286 JIT or real mode.
+     * Restrict to unprefixed ModR/M REGISTER forms; all other forms retain
+     * their earlier fail-closed handling until implemented precisely.
+     */
+    if(!code32 && op==0x0Fu && !pref66 && !pref67 && !segpref){
+        uint8_t op2,m;
+        unsigned operation,rm;
+        uint16_t v;
+        int rc;
+        if(!b86_pm4_byte(c,&ip,start,&op2))return B86_UNSUPPORTED;
+        if(op2==0x00u || op2==0x01u){
+            if(!b86_pm4_byte(c,&ip,start,&m))return B86_UNSUPPORTED;
+            if((m&0xC0u)!=0xC0u)return B86_UNSUPPORTED;
+            operation=(m>>3)&7u;
+            rm=m&7u;
+            if((op2==0x00u && operation!=2u) ||
+               (op2==0x01u && operation!=4u && operation!=6u))
+                return B86_UNSUPPORTED;
+            v=(uint16_t)c->r[rm];
+            if(op2==0x00u){ /* LLDT r/m16: descriptor must be LDT in GDT */
+                rc=b86_pm1_prepare_ldtr(c,v);
+                if(rc!=B86_PM1_OK)return B86_UNSUPPORTED;
+            }else if(operation==4u){ /* SMSW r16: no flag effects */
+                c->r[rm]=(c->r[rm]&0xFFFF0000u)|(uint32_t)c->msw;
+            }else{ /* LMSW r16: write CR0[3:0], PE cannot clear in PM */
+                c->msw=(uint16_t)((c->msw&~0x000Eu)|(v&0x000Eu));
+            }
+            c->ip=ip&0xFFFFu;
+            ++c->icount;
+            return B86_OK;
+        }
+    }
     if(op!=0x8Eu && op!=0x17u)return b86_pm10_step(c);
     op32=code32^pref66;ad32=code32^pref67;
     if(op==0x8Eu){

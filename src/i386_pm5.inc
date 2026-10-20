@@ -56,7 +56,7 @@ static B86_PM5_FLASH uint32_t b86_pm5_arith_flags(uint32_t flags,
 B86_PM5_FLASH int b86_pm5_step(B86Cpu *c)
 {
     uint32_t start,next,offset=0u,old,imm=0u,result=0u,flags=0u,linear;
-    uint8_t op,b;
+    uint8_t op,b,op2=0u; /* DESCENT_PM16_JCC_V2 */
     B86PM2Fault fault;
     unsigned i,width=0u,reg=0u,bytes=0u,kind=0u;
     int code32,pref66=0,chosen=0;
@@ -77,11 +77,21 @@ B86_PM5_FLASH int b86_pm5_step(B86Cpu *c)
         if (!b86_pm4_byte(c,&next,start,&op)) return B86_UNSUPPORTED;
         if (op==0x66u) return B86_UNSUPPORTED;
     }
+    /* DESCENT_PM16_JCC_V2: decode the second opcode only for 0F 80..8F.
+     * Never commit the architectural IP while probing; PM4 sees the same
+     * unchanged state on fallback. Every opcode/operand byte is checked
+     * against the cached executable CS descriptor via b86_pm4_byte.
+     */
+    if (op==0x0Fu) {
+        if (!b86_pm4_byte(c,&next,start,&op2)) return B86_UNSUPPORTED;
+        if (op2<0x80u || op2>0x8Fu) return b86_pm4_step(c);
+    }
     /* The new subset has no segment override, address override, LOCK/REP
      * or ModR/M memory forms. PM4 handles its own prior instruction set. */
     if ((op==0x04u || op==0x05u || op==0x2Cu || op==0x2Du ||
          op==0x3Cu || op==0x3Du) ||
-        (op>=0x70u && op<=0x7Fu) || op==0xEBu || op==0xE9u ||
+        (op>=0x70u && op<=0x7Fu) || (op==0x0Fu && op2>=0x80u && op2<=0x8Fu) ||
+        op==0xEBu || op==0xE9u ||
         (op>=0x40u && op<=0x4Fu)) chosen=1;
     if (!chosen) return b86_pm4_step(c);
     /* In the 386 cold interpreter no arithmetic lazy producer can survive
@@ -90,6 +100,11 @@ B86_PM5_FLASH int b86_pm5_step(B86Cpu *c)
     if (op>=0x70u && op<=0x7Fu) {
         if (pref66) return B86_UNSUPPORTED;
         bytes=1u; kind=3u;
+    } else if (op==0x0Fu) { /* 0F 80..8F, near conditional branch */
+        /* Conservative PM16 scope: 66h rel32 needs wider EIP handling in
+         * other 16-bit-CS paths. Refuse rather than silently truncating. */
+        if (!code32 && pref66) return B86_UNSUPPORTED;
+        bytes=(code32^pref66)?4u:2u; kind=3u;
     } else if (op==0xEBu) {
         if (pref66) return B86_UNSUPPORTED;
         bytes=1u; kind=4u;
@@ -116,12 +131,13 @@ B86_PM5_FLASH int b86_pm5_step(B86Cpu *c)
     if (kind==3u || kind==4u) {
         int32_t disp = bytes==1u ? (int8_t)imm :
                        bytes==2u ? (int16_t)imm : (int32_t)imm;
-        if (kind==3u && !b86_pm5_condition(c->flags,op&15u)) {
+        if (kind==3u && !b86_pm5_condition(c->flags,
+                                               op==0x0Fu?(op2&15u):(op&15u))) {
             c->ip=next; ++c->icount; return B86_OK;
         }
         /* rel16 branch operand-size truncates target; rel8 inherits CS D. */
         offset=next+(uint32_t)disp;
-        if (kind==4u && op==0xE9u && bytes==2u) offset&=0xFFFFu;
+        if (bytes==2u && (op==0xE9u || op==0x0Fu)) offset&=0xFFFFu;
         if (!code32) offset&=0xFFFFu;
         if (b86_pm2_check_access(c,B86_CS,offset,1u,B86_PM1_EXEC,
                                  &linear,&fault)!=B86_PM2_OK) return B86_UNSUPPORTED;

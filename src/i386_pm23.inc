@@ -1,3 +1,4 @@
+/* B86_PM_UNIFIED_V5: i386_pm23.inc */
 /* PM23 protected port IO + host-side master PIC/PIT0 register model.
  * Intentional limits: 32-bit CPL0 code only; no I/O bitmap, slave PIC,
  * read-back/latch PIT, channel 1/2, wall-clock scheduling or VM86.
@@ -154,19 +155,19 @@ B86_PM23_FLASH int b86_pm23_step(B86Cpu *c)
 {
     uint32_t ip,start,oldax,v=0u,mask;
     uint8_t op,b;
-    unsigned op32=1u,n,i,port;
+    unsigned op32,n,i,port;
     if(!c || !c->mem || c->model!=B86_CPU_386 || !(c->msw&1u) ||
        c->shutdown386 || !c->pm386.seg[B86_CS].valid ||
        !(c->pm386.seg[B86_CS].access&8u) ||
-       !(c->pm386.seg[B86_CS].flags&4u) ||
+       (!(c->pm386.seg[B86_CS].flags&4u) && c->ip>0xFFFFu) ||
        c->pm386.seg[B86_CS].reserved==B86_PM3_TRANSITION_MARKER ||
        (c->seg[B86_CS]&3u) || c->lz_kind!=LZ_NONE || c->lz_ikind!=LZ_NONE ||
        (c->flags&(0x20000u|0x4000u)) || c->ip>UINT32_MAX-15u)
         return b86_pm21_step(c);
-    ip=start=c->ip;
+    ip=start=c->ip;op32=!!(c->pm386.seg[B86_CS].flags&4u);
     for(;;){
         if(!b86_pm4_byte(c,&ip,start,&op))return B86_UNSUPPORTED;
-        if(op==0x66u){op32=0u;continue;}
+        if(op==0x66u){op32=!((c->pm386.seg[B86_CS].flags&4u)!=0u);continue;}
         if(op==0x67u || op==0x26u || op==0x2eu || op==0x36u ||
            op==0x3eu || op==0x64u || op==0x65u)continue;
         break;
@@ -184,6 +185,6 @@ B86_PM23_FLASH int b86_pm23_step(B86Cpu *c)
     }else if(c->out8){
         for(i=0;i<n;i++)c->out8(c,(uint16_t)(port+i),(uint8_t)(oldax>>(8u*i)));
     }
-    c->ip=ip;++c->icount;
+    c->ip=(c->pm386.seg[B86_CS].flags&4u)?ip:(ip&0xFFFFu);++c->icount;
     return B86_OK;
 }
