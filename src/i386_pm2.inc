@@ -84,7 +84,7 @@ B86_PM2_FLASH int b86_pm2_plan_segment(const B86Cpu *cpu, unsigned seg,
     if (seg == B86_CS) {
         if (target_eip > d.limit)
             return b86_pm2_fault(fault, B86_PM2_GP, 0u);
-        if ((uint64_t)d.base + target_eip >= B86_MEM_BYTES)
+        if ((uint64_t)d.base + target_eip >= B86_RAM_BYTES)
             return B86_PM2_UNSUPPORTED;
     }
     p.cache.base = d.base;

@@ -37,7 +37,7 @@ B86_PM1_FLASH int b86_pm1_descriptor(const B86Cpu *cpu,
     index = selector & 0xFFF8u;
     if (index > limit || limit - index < 7u) return B86_PM1_TABLE_LIMIT;
     address = (uint64_t)base + (uint64_t)index;
-    if (address + 8u > B86_MEM_BYTES) return B86_PM1_MEMORY_LIMIT;
+    if (address + 8u > B86_RAM_BYTES) return B86_PM1_MEMORY_LIMIT;
     for (unsigned i=0; i<8u; ++i)
         bytes[i] = *b86_host(cpu, (uint32_t)address + i);
     rc = b86_pm0_decode(bytes, selector, out);
@@ -63,7 +63,7 @@ B86_PM1_FLASH int b86_pm1_prepare_ldtr(B86Cpu *cpu, uint16_t selector)
     if (d.code_data || (d.access & 0x0Fu) != 2u)
         return B86_PM1_TYPE;
     /* The LDT table itself must be representable in guest memory. */
-    if ((uint64_t)d.base + (uint64_t)d.limit >= B86_MEM_BYTES)
+    if ((uint64_t)d.base + (uint64_t)d.limit >= B86_RAM_BYTES)
         return B86_PM1_MEMORY_LIMIT;
     cpu->pm386.ldtr_base = d.base;
     cpu->pm386.ldtr_limit = d.limit;
@@ -151,7 +151,7 @@ B86_PM1_FLASH int b86_pm1_translate(const B86Cpu *cpu, unsigned seg,
             return B86_PM1_SEGMENT_LIMIT;
     } else if (end > c->limit) return B86_PM1_SEGMENT_LIMIT;
     phys = (uint64_t)c->base + (uint64_t)offset;
-    if (phys + width > B86_MEM_BYTES) return B86_PM1_MEMORY_LIMIT;
+    if (phys + width > B86_RAM_BYTES) return B86_PM1_MEMORY_LIMIT;
     *linear = (uint32_t)phys;
     return B86_PM1_OK;
 }

@@ -35,6 +35,18 @@ extern "C" {
    64 KiB window starting at mem + seg*16. */
 #define B86_MEM_BYTES   (0x110000u + 0x20u)
 #define B86_LINE_SHIFT  6u                         /* SMC line = 64 bytes */
+/* r63: total guest RAM. B86_MEM_BYTES above stays the *low window*: real
+   mode (1 MiB + HMA), everything the JIT translates, the SMC line table,
+   the page-delta map and the translation shadow. Extended memory above it
+   (B86_MEM_BYTES..B86_RAM_BYTES) is reached only by protected-mode code
+   through the interpreter; it is never translated, mapped or SMC-tracked.
+   The guest buffer passed to b86_init must hold B86_RAM_BYTES. */
+#ifndef B86_RAM_BYTES
+#define B86_RAM_BYTES   B86_MEM_BYTES
+#endif
+#if B86_RAM_BYTES < B86_MEM_BYTES
+#error "B86_RAM_BYTES must be >= B86_MEM_BYTES"
+#endif
 #define B86_LINES       ((B86_MEM_BYTES >> B86_LINE_SHIFT) + 1u)
 
 enum { B86_AX, B86_CX, B86_DX, B86_BX, B86_SP, B86_BP, B86_SI, B86_DI };
@@ -177,6 +189,9 @@ typedef struct B86Cpu {
 static inline __attribute__((always_inline)) uint8_t *b86_host(const B86Cpu *c, uint32_t lin)
 {
     uint8_t *p = c->mem + lin;
+#if B86_RAM_BYTES > B86_MEM_BYTES
+    if (lin >= B86_MEM_BYTES) return p;           /* r63: extended memory: never mapped */
+#endif
     return p + c->pt[((uintptr_t)p >> 12) & 511u];
 }
 #else

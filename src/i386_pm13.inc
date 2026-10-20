@@ -23,7 +23,7 @@ static B86_PM13_FLASH int b86_pm13_deliver(B86Cpu *c,unsigned vector,
     B86PM2Fault fault;
     if(c->flags&(0x20000u|0x4000u))return B86_UNSUPPORTED;
     if((uint32_t)vector*8u+7u>c->idt_limit ||
-       (uint64_t)c->idt_base+(uint64_t)vector*8u+8u>B86_MEM_BYTES)
+       (uint64_t)c->idt_base+(uint64_t)vector*8u+8u>B86_RAM_BYTES)
         return B86_UNSUPPORTED;
     idt=c->idt_base+(uint32_t)vector*8u;
     attr=*b86_host(c,idt+5u);gate=attr&15u;

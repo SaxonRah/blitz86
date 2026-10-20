@@ -49,7 +49,7 @@ B86_PM0_FLASH int b86_pm0_lookup_gdt(const B86Cpu *cpu,
     if (index > cpu->gdt_limit || cpu->gdt_limit - index < 7u)
         return B86_PM0_TABLE_LIMIT;
     address = (uint64_t)cpu->gdt_base + index;
-    if (address + 8u > B86_MEM_BYTES) return B86_PM0_MEM_LIMIT;
+    if (address + 8u > B86_RAM_BYTES) return B86_PM0_MEM_LIMIT;
     for (unsigned i = 0; i < 8u; ++i)
         bytes[i] = *b86_host(cpu, (uint32_t)address + i);
     return b86_pm0_decode(bytes, selector, out);

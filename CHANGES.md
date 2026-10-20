@@ -1,5 +1,21 @@
 # Changes
 
+## 2026-10-19 (r63) — extended memory (B86_RAM_BYTES)
+
+* New B86_RAM_BYTES (default = B86_MEM_BYTES): total guest RAM. B86_MEM_BYTES
+  remains the low window (real mode + HMA): JIT translation, SMC line table,
+  page-delta map and shadow are unchanged in size. Extended memory above it
+  is reached by protected-mode code through the interpreter only.
+* b86_host() skips the page-delta map above the low window (the 2 MiB-indexed
+  map would otherwise alias low SRAM-mapped pages); interpreter SMC checks
+  skip extended memory (never translated).
+* Protected-mode memory bounds (GDT/LDT/IDT lookups, segment access, PM
+  instruction fetch, far-jump targets) use B86_RAM_BYTES.
+* tests/bb_386_extmem.c: 4 MiB guest, PM store/load/RMW at 2 MiB and 4 MiB-16,
+  plain and -DB86_PAGED builds.
+* Thumb-2 compile with -DB86_RAM_BYTES=0x400000u clean; default build:
+  386 vectors 23038/23038.
+
 ## 2026-10-19 (r62) — 32-bit protected-mode integer core complete (fuzzer-verified)
 
 * New tests/pmfz: differential fuzzer for flat CPL0 protected mode against

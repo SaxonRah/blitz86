@@ -41,7 +41,7 @@ static B86_PM3_FLASH int b86_pm3_fetch(const B86Cpu *c, uint32_t off, uint8_t *o
     const B86PM1Cache *cs = &c->pm386.seg[B86_CS];
     if (off > cs->limit || !cs->valid || !(cs->access & 0x80u)) return 0;
     lin = (uint64_t)cs->base + off;
-    if (lin >= B86_MEM_BYTES) return 0;
+    if (lin >= B86_RAM_BYTES) return 0;
     *out = *b86_host(c, (uint32_t)lin);
     return 1;
 }

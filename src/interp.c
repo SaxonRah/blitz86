@@ -167,6 +167,9 @@ B86_HOT static inline __attribute__((always_inline)) uint32_t lin(const B86Cpu *
 
 B86_HOT static inline void smc(B86Cpu *c, uint32_t a, uint32_t n)
 {
+#if B86_RAM_BYTES > B86_MEM_BYTES
+    if (a >= B86_MEM_BYTES) return;               /* r63: never translated */
+#endif
     if (c->codemap && (c->codemap[a >> B86_LINE_SHIFT] |
                        c->codemap[(a + n - 1) >> B86_LINE_SHIFT]) && c->smc_hook)
         c->smc_hook(c, a, n);

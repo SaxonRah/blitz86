@@ -48,7 +48,7 @@ B86_PM12_FLASH int b86_pm12_step(B86Cpu *c)
     if(op!=0xCFu){
         /* Read IDT gate from linear, physically representable guest memory. */
         if((uint32_t)vec*8u+7u>c->idt_limit)return B86_UNSUPPORTED;
-        if((uint64_t)c->idt_base+(uint64_t)vec*8u+8u>B86_MEM_BYTES)
+        if((uint64_t)c->idt_base+(uint64_t)vec*8u+8u>B86_RAM_BYTES)
             return B86_UNSUPPORTED;
         idt=c->idt_base+(uint32_t)vec*8u;
         attr=*b86_host(c,idt+5u);
