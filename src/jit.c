@@ -617,6 +617,17 @@ B86_HOT static void classify(Insn *d)
             d->native = (be_has_t2 || d->mod == 3) && !(d->mod == 3 && d->rm == B86_SP); return;
         case 4: d->cls = C_IND; d->fuse = ALLF; d->native = 1; return;
         case 3: case 5:                                  /* r58: CALL/JMP FAR m16:16 native (Thumb-2) */
+            /* B86_386_FAR_TRANSFER_INTERP_V16: prefer the 386 interpreter for FF /3,/5. */
+            if (d->m386) {
+                /* The selector+offset pair must observe the current memory
+                 * and segment override after preceding guest writes.  Until
+                 * the native r58 transfer is independently validated, use
+                 * the existing 386-aware FF interpreter for this rare case.
+                 * The interpreter's result is the architectural result; do
+                 * NOT substitute a hard-coded destination or modify memory. */
+                d->cls = C_END; d->fuse = ALLF; d->native = 0;
+                return;
+            }
             if (be_rep_inline && d->mod != 3) { d->cls = C_IND; d->fuse = ALLF; d->native = 1; }
             else d->cls = C_END;
             return;
