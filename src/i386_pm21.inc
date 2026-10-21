@@ -25,7 +25,7 @@ B86_PM21_FLASH int b86_pm21_irq(B86Cpu *c,unsigned vector)
        !(c->flags&B86_IF)||
        c->pm386.seg[B86_SS].reserved||c->pm386.seg[B86_GS].reserved||
        c->lz_kind!=LZ_NONE||c->lz_ikind!=LZ_NONE||
-       (c->flags&(0x20000u|0x4000u)))return B86_UNSUPPORTED;
+       (c->flags&0x20000u))return B86_UNSUPPORTED;
     count=c->icount;
     rc=b86_pm13_deliver(c,vector,0u,0u);
     /* An external interrupt is not a retired guest instruction. PM13
@@ -44,7 +44,7 @@ B86_PM21_FLASH int b86_pm21_step(B86Cpu *c)
        !c->pm386.seg[B86_CS].valid||!(c->pm386.seg[B86_CS].access&8u)||
        (c->seg[B86_CS]&3u)||c->ip>UINT32_MAX-15u||
        (!(c->pm386.seg[B86_CS].flags&4u)&&c->ip>0xFFFFu)||c->lz_kind!=LZ_NONE||c->lz_ikind!=LZ_NONE||
-       (c->flags&(0x20000u|0x4000u)))return b86_pm20_step(c);
+       (c->flags&0x20000u))return b86_pm20_step(c);
     ip=start=c->ip;
     if(!b86_pm4_byte(c,&ip,start,&op))return B86_UNSUPPORTED;
     if(op==0xFAu||op==0xFBu){

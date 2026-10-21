@@ -182,11 +182,35 @@ typedef struct B86Cpu {
        live here; they are merged back before any interpreter step and when
        b86_jit_run returns, so outside b86_jit_run r[] is always exact. */
     uint32_t rhi[8];
+    /* r65 (B86_PG_V1): 80386 paging, appended only. pg mirrors CR0.PG and is
+       only ever set while CR0.PE=1. The 64-entry TLB caches linear page ->
+       physical page (tag = linear page | 1); it is flushed by CR3 writes and
+       CR0.PG changes, as on a 386 (no INVLPG, no global pages, no WP). A
+       translation miss sets pf_pending/pf_lin and returns a scratch page; the
+       protected-mode step rolls the instruction back and delivers #PF(14). */
+    uint32_t cr2, cr3;
+    uint8_t  pg, pf_pending, pf_err, pg_pad;
+    uint32_t pf_lin;
+    uint32_t tlb_tag[64], tlb_phys[64];
+    /* r65: task register (LTR/STR). No hardware task switching. */
+    uint32_t tr_base, tr_limit;
+    uint16_t tr_sel, tr_pad;
+    /* r66: protected-mode instruction-fetch window, valid only inside one
+       b86_step: up to 16 bytes at fb_cs:fb_ip, limit- and page-checked. */
+    uint32_t fb_ip;
+    uint16_t fb_cs;
+    uint8_t  fb_len, fb_pad;
+    uint8_t  fb[16];
+    /* r68: arithmetic flags the last PM40 instruction left undefined */
+    uint32_t pm40_undef;
 } B86Cpu;
+
+/* r65: translate through the guest page tables (interp.c). */
+uint8_t *b86_pg_host(B86Cpu *c, uint32_t lin);
 
 /* Host pointer for a guest linear address (honours mapped pages). */
 #ifdef B86_PAGED
-static inline __attribute__((always_inline)) uint8_t *b86_host(const B86Cpu *c, uint32_t lin)
+static inline __attribute__((always_inline)) uint8_t *b86_host_phys(const B86Cpu *c, uint32_t lin)
 {
     uint8_t *p = c->mem + lin;
 #if B86_RAM_BYTES > B86_MEM_BYTES
@@ -195,8 +219,16 @@ static inline __attribute__((always_inline)) uint8_t *b86_host(const B86Cpu *c, 
     return p + c->pt[((uintptr_t)p >> 12) & 511u];
 }
 #else
-static inline __attribute__((always_inline)) uint8_t *b86_host(const B86Cpu *c, uint32_t lin) { return c->mem + lin; }
+static inline __attribute__((always_inline)) uint8_t *b86_host_phys(const B86Cpu *c, uint32_t lin) { return c->mem + lin; }
 #endif
+/* Guest linear address -> host pointer. With CR0.PG clear (always in real
+   mode, and in the JIT) linear == physical; otherwise b86_pg_host walks the
+   guest page tables. */
+static inline __attribute__((always_inline)) uint8_t *b86_host(const B86Cpu *c, uint32_t lin)
+{
+    if (__builtin_expect(c->pg != 0, 0)) return b86_pg_host((B86Cpu *)c, lin);
+    return b86_host_phys(c, lin);
+}
 
 /* ---- core / interpreter --------------------------------------------------- */
 void     b86_init(B86Cpu *c, uint8_t *mem);           /* mem: B86_MEM_BYTES  */
@@ -207,6 +239,12 @@ void     b86_flags_materialize(B86Cpu *c);
 int      b86_step(B86Cpu *c);                         /* one instruction    */
 int      b86_run_interp(B86Cpu *c, uint64_t max_insns);
 void     b86_interrupt(B86Cpu *c, uint8_t vector);    /* real-mode INT n    */
+/* r67: deliver an external (hardware) interrupt between instructions, in
+   real or protected mode. Honours EFLAGS.IF and the MOV SS/POP SS shadow;
+   protected mode goes through the IDT (interrupt/trap gate or task gate).
+   Returns 1 when delivered, 0 when the CPU cannot take it now (retry later).
+   The caller owns the PIC (IRR/ISR) and the vector number. */
+int      b86_irq(B86Cpu *c, uint8_t vector);
 extern const uint8_t b86_parity[256];
 
 static inline uint16_t b86_r16(const B86Cpu *c, int r) { return (uint16_t)c->r[r]; }

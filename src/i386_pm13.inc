@@ -21,9 +21,9 @@ static B86_PM13_FLASH int b86_pm13_deliver(B86Cpu *c,unsigned vector,
     unsigned ss32,gate,width=error_valid?16u:12u;
     B86PM2Plan plan;
     B86PM2Fault fault;
-    if(c->flags&(0x20000u|0x4000u))return B86_UNSUPPORTED;
+    if(c->flags&0x20000u)return B86_UNSUPPORTED;
     if((uint32_t)vector*8u+7u>c->idt_limit ||
-       (uint64_t)c->idt_base+(uint64_t)vector*8u+8u>B86_RAM_BYTES)
+       (!c->pg&&(uint64_t)c->idt_base+(uint64_t)vector*8u+8u>B86_RAM_BYTES))
         return B86_UNSUPPORTED;
     idt=c->idt_base+(uint32_t)vector*8u;
     attr=*b86_host(c,idt+5u);gate=attr&15u;
@@ -79,7 +79,7 @@ B86_PM13_FLASH int b86_pm13_step(B86Cpu *c)
         if(!b86_pm4_byte(c,&ip,start,&second) || second!=0x0Bu)
             return b86_pm12_step(c);
         if(c->lz_kind!=LZ_NONE || c->lz_ikind!=LZ_NONE ||
-           (c->flags&(0x20000u|0x4000u)))return B86_UNSUPPORTED;
+           (c->flags&0x20000u))return B86_UNSUPPORTED;
         return b86_pm13_deliver(c,6u,0u,0u);
     }
     if(!b86_pm4_byte(c,&ip,start,&second))return B86_UNSUPPORTED;

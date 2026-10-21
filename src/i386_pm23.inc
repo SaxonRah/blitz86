@@ -105,6 +105,11 @@ B86_PM23_FLASH int b86_pm23_poll(B86Cpu *cpu,B86Pm23Hw *h,unsigned *vector)
  * Otherwise decode prefixes + ModRM (+SIB/displacement, 16/32-bit
  * addressing from CS.D xor 67h) and advance EIP: absent-FPU probes see no
  * coprocessor. Returns -1 when the instruction is not ESC/WAIT. */
+/* B86_PM31_V1: #NM delivery for CR0.EM=1 (no coprocessor, emulate) and
+ * WAIT with MP+TS. DOS/4GW sets EM when no 387 is present; the program's
+ * x87 emulator owns vector 7 through the IDT. Fault frame: EIP of the first
+ * prefix byte, no error code. Defined in PM26. */
+static int b86_pm26_interrupt(B86Cpu *c, unsigned vec, uint32_t return_ip);
 B86_PM23_FLASH int b86_pm23_esc(B86Cpu *c)
 {
     uint32_t ip, start;
@@ -122,11 +127,11 @@ B86_PM23_FLASH int b86_pm23_esc(B86Cpu *c)
         break;
     }
     if (op == 0x9Bu) {
-        if ((c->msw & 0xAu) == 0xAu) return B86_UNSUPPORTED;
+        if ((c->msw & 0xAu) == 0xAu) return b86_pm26_interrupt(c, 7u, start);
         c->ip = ip; ++c->icount; return B86_OK;
     }
     if (op < 0xD8u || op > 0xDFu) return -1;
-    if (c->msw & 4u) return B86_UNSUPPORTED;
+    if (c->msw & 4u) return b86_pm26_interrupt(c, 7u, start);
     if (!b86_pm4_byte(c, &ip, start, &m)) return B86_UNSUPPORTED;
     mod = m >> 6; rm = m & 7u;
     if (mod != 3u) {
@@ -162,7 +167,7 @@ B86_PM23_FLASH int b86_pm23_step(B86Cpu *c)
        (!(c->pm386.seg[B86_CS].flags&4u) && c->ip>0xFFFFu) ||
        c->pm386.seg[B86_CS].reserved==B86_PM3_TRANSITION_MARKER ||
        (c->seg[B86_CS]&3u) || c->lz_kind!=LZ_NONE || c->lz_ikind!=LZ_NONE ||
-       (c->flags&(0x20000u|0x4000u)) || c->ip>UINT32_MAX-15u)
+       (c->flags&0x20000u) || c->ip>UINT32_MAX-15u)
         return b86_pm21_step(c);
     ip=start=c->ip;op32=!!(c->pm386.seg[B86_CS].flags&4u);
     for(;;){

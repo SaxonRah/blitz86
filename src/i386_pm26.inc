@@ -57,7 +57,7 @@ static B86_PM26_FLASH int b86_pm26_interrupt(B86Cpu *c,unsigned vec,
     uint8_t attr;
     uint16_t selector;
     if(vec>255u || (uint32_t)vec*8u+7u>c->idt_limit ||
-       (uint64_t)c->idt_base+(uint64_t)vec*8u+8u>B86_RAM_BYTES)
+       (!c->pg&&(uint64_t)c->idt_base+(uint64_t)vec*8u+8u>B86_RAM_BYTES))
         return B86_UNSUPPORTED;
     gateat=c->idt_base+vec*8u;
     attr=*b86_host(c,gateat+5u);
@@ -106,8 +106,10 @@ static B86_PM26_FLASH int b86_pm26_iret(B86Cpu *c,unsigned w)
     flags=b86_pm26_read(c,slot+2u*w,w);
     if(w==2u)flags=(c->flags&0xFFFF0000u)|(flags&0xFFFFu);
     /* No task returns, VM86, RF, IOPL changes or debug-trap emulation. */
-    if(flags&(B86_TF|0x3000u|0x4000u|0x10000u|0x20000u))
+    /* CPL0 may restore IOPL; RF is cleared by any completed instruction. */
+    if(flags&(B86_TF|0x20000u))
         return B86_UNSUPPORTED;
+    flags&=~0x10000u;
     if(b86_pm2_plan_segment(c,B86_CS,selector,0u,target,&plan,&fault)!=B86_PM2_OK)
         return B86_UNSUPPORTED;
     if(!(plan.cache.flags&4u)&&target>0xFFFFu)return B86_UNSUPPORTED;
@@ -129,7 +131,7 @@ static B86_PM26_FLASH int b86_pm26_step(B86Cpu *c)
        !c->pm386.seg[B86_CS].valid||!(c->pm386.seg[B86_CS].access&8u)||
        (c->seg[B86_CS]&3u)||c->ip>UINT32_MAX-15u||
        c->lz_kind!=LZ_NONE||c->lz_ikind!=LZ_NONE||
-       (c->flags&(0x20000u|0x4000u)))return -1;
+       (c->flags&0x20000u))return -1;
     code32=!!(c->pm386.seg[B86_CS].flags&4u);
     if(!code32&&c->ip>0xFFFFu)return -1;
     ip=start=c->ip;
@@ -166,7 +168,10 @@ static B86_PM26_FLASH int b86_pm26_step(B86Cpu *c)
     if(op!=0xCDu && op!=0xCCu && op!=0xCEu && op!=0xCFu)return -1;
     /* Preserve the existing, tested PM12 32-bit INT/IRETD path. PM26
      * handles mixed-width overrides and the missing 16-bit gate path. */
-    if(code32 && !p66 && (op==0xCDu || op==0xCCu || op==0xCFu))return -1;
+    /* B86_PM31_V1: PM26 now owns every PM INT/INTO/INT3/IRET form. PM12
+     * required a 32-bit gate target and 32-bit stack; DOS/4GW's INT 31h
+     * enters a 16-bit kernel through a 386 gate from 32-bit code on a
+     * 16-bit (B=0) stack, which this path already frames correctly. */
     if(p67||segpref)return B86_UNSUPPORTED;
     if(op==0xCFu)return b86_pm26_iret(c,w);
     if(op==0xCDu){

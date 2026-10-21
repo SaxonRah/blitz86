@@ -88,7 +88,7 @@ static B86_PM25_FLASH int b86_pm25_step(B86Cpu *c)
             if(val&~0xFu)return B86_UNSUPPORTED;
             if(!(val&1u)){
                 if(c->pm386.seg[B86_CS].reserved ||
-                   (c->flags&(0x20000u|0x4000u)))return B86_UNSUPPORTED;
+                   (c->flags&0x20000u))return B86_UNSUPPORTED;
                 c->pm386.seg[B86_CS].reserved=B86_PM29_EXIT_MARKER;
             }
             c->msw=(uint16_t)val;
@@ -148,7 +148,7 @@ static B86_PM25_FLASH int b86_pm25_step(B86Cpu *c)
         for(unsigned i=0;i<4u;++i)
             base|=(uint32_t)*b86_host(c,lin+2u+i)<<(8u*i);
         if(!op32)base&=0xFFFFFFu; /* 16-bit operand size on a 386 */
-        if((uint64_t)base+(uint64_t)limit>=B86_RAM_BYTES)
+        if(!c->pg&&(uint64_t)base+(uint64_t)limit>=B86_RAM_BYTES)
             return B86_UNSUPPORTED;
         if(kind==7u){c->gdt_base=base;c->gdt_limit=(uint16_t)limit;}
         else{c->idt_base=base;c->idt_limit=(uint16_t)limit;}

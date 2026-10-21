@@ -814,6 +814,7 @@ static uint32_t b86_rm3_segvalue(B86Cpu *c, int which);
 /* BB_386_RM3_V1: FS/GS and 32-bit near flow, XIP flash. */
 #include "i386_rm3.inc"
 /* BB_386_PM0_V1: GDT descriptor helpers in flash, no PE switch. */
+#include "i386_pg.inc"    /* B86_PG_V1 (r65): 386 paging */
 #include "i386_pm0.inc"
 /* BB_386_STAGE5C5C_V1: shadow cache + checked address helpers, inert in RM. */
 #include "i386_pm1.inc"
@@ -859,6 +860,10 @@ static uint32_t b86_rm3_segvalue(B86Cpu *c, int which);
 #include "i386_pm27.inc"   /* B86_PM_UNIFIED_V7: LAR/LSL + 386 bit ops */
 #include "i386_pm28.inc"   /* B86_PM_UNIFIED_V8: data conversion + signed IMUL + far-pointer loads */
 #include "i386_pm29.inc" /* B86_PM_UNIFIED_V9 */
+#include "i386_pm30.inc"   /* B86_PM30_V1: FF /3 /5 far CALL/JMP m16:16/32 */
+#include "i386_pm31.inc"   /* B86_PM31_V1: DOS/4GW odds and ends */
+#include "i386_pm32.inc"   /* B86_PM32_V1 (r65): CR2/CR3/PG + #PF */
+#include "i386_pm40.inc"   /* B86_PM40_V1 (r68): flat 32-bit fast path */
 
 /* BB_386_STAGE5C3C_V1: model-386-only legacy word memory limit preflight. */
 /* The 8086/186/286 interpreter and JIT memory primitives are intentionally
@@ -1339,6 +1344,282 @@ static __attribute__((noinline, cold, section(".text.bb386_flash"))) int b86_386
     return rc;
 }
 
+/* r66: fill the protected-mode fetch window for this step. The first byte
+ * goes through the full descriptor/paging check (so a fault on it is
+ * recorded exactly as the stages would); following bytes stop at the CS
+ * limit, the end of RAM or the first non-present page, where the stages'
+ * own per-byte path takes over. */
+static B86_PG_FLASH void b86_pm_fill_fetch(B86Cpu *c)
+{
+    const B86PM1Cache *cs = &c->pm386.seg[B86_CS];
+    B86PM2Fault fault;
+    uint32_t lin, phys, avail, n = 0u;
+    c->fb_len = 0u;
+    if (cs->reserved == B86_PM3_TRANSITION_MARKER || !cs->valid) return;
+    /* r68b: present executable code segment, EIP inside the limit: copy up
+     * to 16 bytes page by page. Anything else (or a first page that is not
+     * present) takes the checked path, which records the fault exactly as
+     * the stages would. */
+    if ((cs->access & 0x98u) == 0x98u && c->ip <= cs->limit) {
+        avail = cs->limit - c->ip >= 15u ? 16u : cs->limit - c->ip + 1u;
+        lin = cs->base + c->ip;
+        while (n < avail) {
+            const uint32_t a = lin + n;
+            uint32_t chunk = 0x1000u - (a & 0xFFFu);
+            if (chunk > avail - n) chunk = avail - n;
+            if (c->pg) { if (!b86_pg_walk(c, a, &phys)) break; }
+            else phys = a;
+            if (phys >= B86_RAM_BYTES) break;
+            if (chunk > B86_RAM_BYTES - phys) chunk = B86_RAM_BYTES - phys;
+            memcpy(c->fb + n, b86_host_phys(c, phys), chunk);
+            n += chunk;
+        }
+    }
+    if (!n) {
+        if (b86_pm2_check_access(c, B86_CS, c->ip, 1u, B86_PM1_EXEC, &lin, &fault) != B86_PM2_OK) return;
+        c->fb[0] = *b86_host(c, lin);
+        n = 1u;
+    }
+    c->fb_ip = c->ip;
+    c->fb_cs = (uint16_t)c->seg[B86_CS];
+    c->fb_len = (uint8_t)n;
+}
+
+/* r65: register/descriptor state an instruction may change before a #PF is
+ * detected (memory writes are preflighted by the PM stages). */
+typedef struct B86PgSnap {
+    uint32_t r[8], flags, ip, seg[4], cr2, cr3, idt_base, gdt_base;
+    uint16_t seg386[2], msw, idt_limit, gdt_limit;
+    uint8_t pg;
+    uint64_t icount;
+    B86PM1State pm;
+} B86PgSnap;
+static B86_PG_FLASH void b86_pg_snap(const B86Cpu *c, B86PgSnap *s)
+{
+    memcpy(s->r, c->r, sizeof s->r); s->flags = c->flags; s->ip = c->ip;
+    memcpy(s->seg, c->seg, sizeof s->seg); memcpy(s->seg386, c->seg386, sizeof s->seg386);
+    s->cr2 = c->cr2; s->cr3 = c->cr3; s->idt_base = c->idt_base; s->gdt_base = c->gdt_base;
+    s->msw = c->msw; s->idt_limit = c->idt_limit; s->gdt_limit = c->gdt_limit;
+    s->pg = c->pg; s->icount = c->icount; s->pm = c->pm386;
+}
+static B86_PG_FLASH void b86_pg_restore(B86Cpu *c, const B86PgSnap *s)
+{
+    memcpy(c->r, s->r, sizeof s->r); c->flags = s->flags; c->ip = s->ip;
+    memcpy(c->seg, s->seg, sizeof s->seg); memcpy(c->seg386, s->seg386, sizeof s->seg386);
+    c->cr2 = s->cr2; c->cr3 = s->cr3; c->idt_base = s->idt_base; c->gdt_base = s->gdt_base;
+    c->msw = s->msw; c->idt_limit = s->idt_limit; c->gdt_limit = s->gdt_limit;
+    if (c->pg != s->pg || c->cr3 != s->cr3) b86_pg_flush(c);
+    c->pg = s->pg; c->icount = s->icount; c->pm386 = s->pm;
+    c->lz_kind = LZ_NONE; c->lz_ikind = LZ_NONE;
+}
+
+/* ---- r67: external interrupts (B86_IRQ_V1) ------------------------------ */
+unsigned long b86_irq_stat_rm, b86_irq_stat_pm, b86_irq_stat_task, b86_irq_stat_refused;
+int b86_irq(B86Cpu *c, uint8_t vec)
+{
+    if (!c || !c->mem || c->shutdown386) return 0;
+    if (c->lz_kind != LZ_NONE || c->lz_ikind != LZ_NONE) b86_flags_materialize(c);
+    if (!(c->flags & B86_IF)) return 0;
+    if (c->model < B86_CPU_386 || !(c->msw & 1u)) {
+        /* real mode (incl. 386): never in the middle of a PE exit far JMP */
+        if (c->model >= B86_CPU_386 && c->pm386.seg[B86_CS].reserved) return 0;
+        b86_interrupt(c, vec);
+        ++b86_irq_stat_rm;
+        return 1;
+    }
+    /* protected mode: not during PE entry/exit transitions or an SS shadow */
+    if (c->pm386.seg[B86_CS].reserved || !c->pm386.seg[B86_CS].valid ||
+        c->pm386.seg[B86_SS].reserved == B86_PM11_SHADOW_ARMED ||
+        (uint32_t)vec * 8u + 7u > c->idt_limit) { ++b86_irq_stat_refused; return 0; }
+    {
+        const uint32_t gate = c->idt_base + (uint32_t)vec * 8u;
+        B86PgSnap snap;
+        int rc;
+        c->pf_pending = 0u;
+        b86_pg_snap(c, &snap);
+        if ((*b86_host(c, gate + 5u) & 0x9Fu) == 0x85u) {           /* task gate */
+            uint16_t tss = (uint16_t)(*b86_host(c, gate + 2u) | (*b86_host(c, gate + 3u) << 8));
+            rc = c->pf_pending ? B86_UNSUPPORTED : b86_pm32_task_switch(c, tss, 0u, c->ip, 0, 0u);
+            if (rc == B86_OK) { --c->icount; ++b86_irq_stat_task; }
+        } else {
+            rc = b86_pm26_interrupt(c, vec, c->ip);
+            if (rc == B86_OK) { --c->icount; ++b86_irq_stat_pm; }  /* not an instruction */
+        }
+        if (rc != B86_OK || c->pf_pending) {
+            b86_pg_restore(c, &snap);
+            c->pf_pending = 0u;
+            ++b86_irq_stat_refused;
+            return 0;
+        }
+        return 1;
+    }
+}
+
+/* r66 (B86_PM_MEMO_V1): protected-mode stage dispatch.
+ * The stages are tried in a fixed order and each re-decodes the
+ * instruction, so a typical instruction paid for ~15 failed decodes. A small
+ * memo maps (code size, prefixes, opcode, next byte) to the top-level stage
+ * that last executed it; that stage is tried first. Any memo miss or memo
+ * failure (stage declines or reports UNSUPPORTED) runs the original chain in
+ * the original order, after rolling back a #PF the memo attempt recorded. */
+#define B86_PM_NSTAGE 11u
+static int b86_pm_stage(B86Cpu *c, unsigned i)
+{
+    switch (i) {
+    case 0:  return b86_pm32_step(c);
+    case 1:  return b86_pm23_esc(c);
+    case 2:  return b86_pm30_step(c);
+    case 3:  return b86_pm31_step(c);
+    case 4:  return b86_pm29_step(c);
+    case 5:  return b86_pm28_step(c);
+    case 6:  return b86_pm27_step(c);
+    case 7:  return b86_pm26_step(c);
+    case 8:  return b86_pm25_step(c);
+    case 9:  return b86_pm24_step(c);
+    default: return b86_pm23_step(c);
+    }
+}
+#ifndef B86_PM_MEMO_SLOTS
+#define B86_PM_MEMO_SLOTS 256u
+#endif
+static uint32_t b86_pm_memo_key[B86_PM_MEMO_SLOTS];
+static uint8_t  b86_pm_memo_stage[B86_PM_MEMO_SLOTS];
+unsigned long b86_pm_memo_hits, b86_pm_memo_misses, b86_pm_memo_fallbacks;
+static int b86_pm_has_modrm(uint8_t op)
+{
+    if (op < 0x40u) return (op & 7u) < 4u;
+    switch (op) {
+    case 0x62: case 0x63: case 0x69: case 0x6B:
+    case 0xC0: case 0xC1: case 0xC4: case 0xC5: case 0xC6: case 0xC7:
+    case 0xD0: case 0xD1: case 0xD2: case 0xD3: case 0xF6: case 0xF7: case 0xFE: case 0xFF:
+        return 1;
+    default:
+        return (op >= 0x80u && op <= 0x8Fu) || (op >= 0xD8u && op <= 0xDFu);
+    }
+}
+static uint32_t b86_pm_memo_make_key(const B86Cpu *c)
+{
+    uint32_t pf = 0u;
+    unsigned i = 0u;
+    if (c->fb_len < 2u) return 0u;
+    for (; i < 4u && i + 1u < c->fb_len; ++i) {
+        const uint8_t b = c->fb[i];
+        if (b == 0x66u) pf |= 1u; else if (b == 0x67u) pf |= 2u;
+        else if (b == 0xF2u) pf |= 4u; else if (b == 0xF3u) pf |= 8u;
+        else if (b == 0xF0u) pf |= 16u;
+        else if (b == 0x26u || b == 0x2Eu || b == 0x36u || b == 0x3Eu || b == 0x64u || b == 0x65u) pf |= 32u;
+        else break;
+    }
+    if (i + 1u >= c->fb_len) return 0u;
+    {
+        /* r66b: the second byte is part of the key only where it selects the
+         * operation (ModRM, 0F opcode byte, INT vector); immediates and
+         * displacements of other opcodes would just scatter the memo. */
+        const uint8_t op = c->fb[i];
+        const uint8_t b2 = (op == 0x0Fu || op == 0xCDu || b86_pm_has_modrm(op)) ? c->fb[i + 1u] : 0u;
+        return 0x80000000u | ((uint32_t)!!(c->pm386.seg[B86_CS].flags & 4u) << 30) |
+               (pf << 16) | ((uint32_t)op << 8) | b2;
+    }
+}
+static int b86_pm_dispatch(B86Cpu *c, B86PgSnap *snap);
+#ifdef B86_PM40_VERIFY
+#include <stdio.h>
+/* r68: run PM40, undo it, run the stage chain, compare. The chain's result
+ * is kept. Reports the first mismatches per instruction address. */
+static int b86_pm40_verifying;
+unsigned long b86_pm40_vfy_checked, b86_pm40_vfy_bad;
+static int b86_pm40_verify(B86Cpu *c, B86PgSnap *snap)
+{
+    B86PgSnap pre;
+    uint32_t r1[8], ip1, f1, undef;
+    uint64_t ic1;
+    unsigned n, i, bad = 0u;
+    int rc, rc2;
+    b86_pg_snap(c, &pre);
+    p40_nlog = 0u; p40_logging = 1u; p40_short = 0u;
+    rc = b86_pm40_step(c);
+    p40_logging = 0u;
+    if (rc < 0) { b86_pm40_verifying = 1; rc = b86_pm_dispatch(c, snap); b86_pm40_verifying = 0; return rc; }
+    memcpy(r1, c->r, sizeof r1); ip1 = c->ip; f1 = c->flags; ic1 = c->icount; undef = c->pm40_undef;
+    n = p40_nlog;
+    for (i = n; i-- > 0u;) memcpy(p40_log[i].p, p40_log[i].old, p40_log[i].w);
+    b86_pg_restore(c, &pre);
+    b86_pm40_verifying = 1;
+    rc2 = b86_pm_dispatch(c, snap);
+    b86_pm40_verifying = 0;
+    ++b86_pm40_vfy_checked;
+    if (rc2 != B86_OK || c->pf_pending) return rc2;          /* chain faulted: nothing to compare */
+    if (p40_short) return rc2;                               /* early REP stop: chunking differs */
+    for (i = 0; i < 8; ++i) if (c->r[i] != r1[i]) bad |= 1u;
+    if (c->ip != ip1) bad |= 2u;
+    if ((c->flags ^ f1) & ~undef & 0x3FFFFFu & ~0x10000u) bad |= 4u;
+    if (c->icount != ic1) bad |= 8u;
+    for (i = 0; i < n && i < 4096u; ++i) {
+        unsigned j, later = 0u;
+        for (j = i + 1u; j < n && j < i + 64u; ++j) if (p40_log[j].p == p40_log[i].p) later = 1u;
+        if (!later && memcmp(p40_log[i].p, p40_log[i].nw, p40_log[i].w)) bad |= 16u;
+    }
+    if (bad) {
+        ++b86_pm40_vfy_bad;
+        if (b86_pm40_vfy_bad <= 40u) {
+            fprintf(stderr, "[pm40-verify] MISMATCH%s%s%s%s%s at %04X:%08X bytes", (bad & 1u) ? " regs" : "",
+                    (bad & 2u) ? " eip" : "", (bad & 4u) ? " flags" : "", (bad & 8u) ? " icount" : "",
+                    (bad & 16u) ? " memory" : "", (unsigned)(uint16_t)pre.seg[B86_CS], pre.ip);
+            for (i = 0; i < c->fb_len && i < 10u; ++i) fprintf(stderr, " %02X", c->fb[i]);
+            fprintf(stderr, "\n   pm40 :");
+            for (i = 0; i < 8; ++i) fprintf(stderr, " %08X", r1[i]);
+            fprintf(stderr, " eip=%08X fl=%08X undef=%04X\n   chain:", ip1, f1, undef);
+            for (i = 0; i < 8; ++i) fprintf(stderr, " %08X", c->r[i]);
+            fprintf(stderr, " eip=%08X fl=%08X\n   pre  :", c->ip, c->flags);
+            for (i = 0; i < 8; ++i) fprintf(stderr, " %08X", pre.r[i]);
+            fprintf(stderr, " fl=%08X\n", pre.flags);
+        }
+    }
+    return rc2;
+}
+#endif
+static int b86_pm_dispatch(B86Cpu *c, B86PgSnap *snap)
+{
+    const int marker = c->pm386.seg[B86_CS].reserved == B86_PM3_TRANSITION_MARKER;
+    uint32_t key = 0u, slot = 0u;
+    unsigned i;
+    int rc = -1;
+    if (marker) return b86_pm23_step(c);
+#ifndef B86_PM40
+#define B86_PM40 1
+#endif
+#ifdef B86_PM40_VERIFY
+    if (B86_PM40 && !b86_pm40_verifying) return b86_pm40_verify(c, snap);
+#else
+    if (B86_PM40) { rc = b86_pm40_step(c); if (rc >= 0) return rc; }
+#endif
+#ifndef B86_PM_MEMO
+#define B86_PM_MEMO 1
+#endif
+    key = B86_PM_MEMO ? b86_pm_memo_make_key(c) : 0u;
+    if (key) {
+        slot = ((key * 2654435761u) >> 16) & (B86_PM_MEMO_SLOTS - 1u);
+        if (b86_pm_memo_key[slot] == key) {
+            rc = b86_pm_stage(c, b86_pm_memo_stage[slot]);
+            if (rc >= 0 && rc != B86_UNSUPPORTED) { ++b86_pm_memo_hits; return rc; }
+            ++b86_pm_memo_fallbacks;
+            if (c->pf_pending && snap) { b86_pg_restore(c, snap); c->pf_pending = 0u; }
+            rc = -1;
+        } else ++b86_pm_memo_misses;
+    }
+    for (i = 0u; i < B86_PM_NSTAGE; ++i) {
+        if (i + 1u < B86_PM_NSTAGE && c->pm386.seg[B86_CS].reserved == B86_PM3_TRANSITION_MARKER)
+            continue;                    /* original chain: only PM23 under the marker */
+        rc = b86_pm_stage(c, i);
+        if (rc >= 0) break;
+    }
+    if (key && rc >= 0 && rc != B86_UNSUPPORTED && i < B86_PM_NSTAGE) {
+        b86_pm_memo_key[slot] = key;
+        b86_pm_memo_stage[slot] = (uint8_t)i;
+    }
+    return rc;
+}
+
 B86_HOT int b86_step(B86Cpu *c)
 {
     /* BB_386_STAGE5C4A_V1: shutdown precedes fetch and all guest side effects. */
@@ -1348,23 +1629,24 @@ B86_HOT int b86_step(B86Cpu *c)
     if (c->model >= B86_CPU_386 && (c->msw & 1u)) {
         /* SS interrupt/debug shadow is retired by one completed *following*
          * protected instruction. The loader arms it with value 2. */
+        /* B86_PM31_V1: the PM stages read c->flags directly and most refuse
+         * lazy state; a lazy record left by real-mode code before PE=1 (or by
+         * a stage that records lazily) must not make them fall through. */
+        if (c->lz_kind != LZ_NONE || c->lz_ikind != LZ_NONE) b86_flags_materialize(c);
         uint8_t before = c->pm386.seg[B86_SS].reserved;
-        int rc = c->pm386.seg[B86_CS].reserved == B86_PM3_TRANSITION_MARKER
-                 ? -1 : b86_pm23_esc(c);                         /* r61 */
-
-        if (rc < 0 && c->pm386.seg[B86_CS].reserved != B86_PM3_TRANSITION_MARKER)
-            rc = b86_pm29_step(c); /* PM29 dispatch */
-        if (rc < 0 && c->pm386.seg[B86_CS].reserved != B86_PM3_TRANSITION_MARKER)
-            rc = b86_pm28_step(c); /* B86_PM_UNIFIED_V8 */
-        if (rc < 0 && c->pm386.seg[B86_CS].reserved != B86_PM3_TRANSITION_MARKER)
-            rc = b86_pm27_step(c); /* B86_PM_UNIFIED_V7 */
-        if (rc < 0 && c->pm386.seg[B86_CS].reserved != B86_PM3_TRANSITION_MARKER)
-            rc = b86_pm26_step(c); /* B86_PM_UNIFIED_V6 */
-        if (rc < 0 && c->pm386.seg[B86_CS].reserved != B86_PM3_TRANSITION_MARKER)
-            rc = b86_pm25_step(c); /* B86_PM_UNIFIED_V5 */
-        if (rc < 0 && c->pm386.seg[B86_CS].reserved != B86_PM3_TRANSITION_MARKER)
-            rc = b86_pm24_step(c);                                   /* r62 */
-        if (rc < 0) rc = b86_pm23_step(c); /* B86_PM_UNIFIED_V5: PM19 delegates PM16 to PM11 */
+        /* r65: with paging on, any translation miss during the instruction
+         * (preflight or not) records #PF; the instruction is rolled back and
+         * the fault delivered with EIP at its first byte. */
+        B86PgSnap snap;
+        const int paged = c->pg != 0u;
+        if (paged) { b86_pg_snap(c, &snap); c->pf_pending = 0u; }
+        b86_pm_fill_fetch(c);                                     /* r66 */
+        int rc = b86_pm_dispatch(c, paged ? &snap : (B86PgSnap *)0);   /* r66 */
+        c->fb_len = 0u;                                           /* r66 */
+        if (paged && c->pf_pending) {
+            b86_pg_restore(c, &snap);
+            return b86_pm32_page_fault(c);
+        }
         if (rc == B86_OK || rc == B86_HALT) {
             if (c->pm386.seg[B86_SS].reserved == B86_PM11_SHADOW_ARMED)
                 c->pm386.seg[B86_SS].reserved = B86_PM11_SHADOW_NEXT;

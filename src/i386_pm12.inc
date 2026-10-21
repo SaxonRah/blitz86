@@ -41,14 +41,14 @@ B86_PM12_FLASH int b86_pm12_step(B86Cpu *c)
      * Delegation lets the earlier interpreter handle its own opcodes. */
     if(op!=0xCDu && op!=0xCCu && op!=0xCFu)return b86_pm11_step(c);
     if(c->lz_kind!=LZ_NONE || c->lz_ikind!=LZ_NONE ||
-       (c->flags & (0x20000u | 0x4000u)))return B86_UNSUPPORTED;
+       (c->flags&0x20000u))return B86_UNSUPPORTED;
     if(op==0xCDu){if(!b86_pm4_byte(c,&ip,start,&b))return B86_UNSUPPORTED;vec=b;}
     else if(op==0xCCu)vec=3u;
     sp=c->r[B86_SP];ss32=!!(c->pm386.seg[B86_SS].flags&4u);
     if(op!=0xCFu){
         /* Read IDT gate from linear, physically representable guest memory. */
         if((uint32_t)vec*8u+7u>c->idt_limit)return B86_UNSUPPORTED;
-        if((uint64_t)c->idt_base+(uint64_t)vec*8u+8u>B86_RAM_BYTES)
+        if(!c->pg&&(uint64_t)c->idt_base+(uint64_t)vec*8u+8u>B86_RAM_BYTES)
             return B86_UNSUPPORTED;
         idt=c->idt_base+(uint32_t)vec*8u;
         attr=*b86_host(c,idt+5u);
@@ -83,7 +83,7 @@ B86_PM12_FLASH int b86_pm12_step(B86Cpu *c)
         target=b86_pm12_load(c,slot0,4u);
         selector=(uint16_t)b86_pm12_load(c,slot0+4u,4u);
         flags=b86_pm12_load(c,slot0+8u,4u);
-        if(flags & (B86_TF|0x3000u|0x4000u|0x10000u|0x20000u))
+        if(flags & (B86_TF|0x3000u|0x10000u|0x20000u))
             return B86_UNSUPPORTED;
         if(b86_pm2_plan_segment(c,B86_CS,selector,0u,target,&plan,&fault)!=B86_PM2_OK ||
            !(plan.cache.flags&4u))return B86_UNSUPPORTED;

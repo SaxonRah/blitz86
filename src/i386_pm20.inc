@@ -35,7 +35,7 @@ B86_PM20_FLASH int b86_pm20_step(B86Cpu*c)
     !(c->pm386.seg[B86_CS].access&8u)||(c->seg[B86_CS]&3u)||
     c->ip>UINT32_MAX-15u || (!(c->pm386.seg[B86_CS].flags&4u) && c->ip>0xFFFFu) ||
     c->lz_kind!=LZ_NONE||c->lz_ikind!=LZ_NONE||
-    (c->flags&(0x20000u|0x4000u)))return b86_pm19_step(c);
+    (c->flags&0x20000u))return b86_pm19_step(c);
  ip=start=c->ip;
  for(;;){
   if(!b86_pm4_byte(c,&ip,start,&op))return B86_UNSUPPORTED;
@@ -90,7 +90,7 @@ B86_PM20_FLASH int b86_pm20_step(B86Cpu*c)
   value=b86_pm12_load(c,at,w);
   flags=w==2u?(c->flags&0xffff0000u)|(value&0xffffu):value;
   /* Task and virtual mode control need TSS/VM86 handling. */
-  if(flags&(0x20000u|0x4000u))return B86_UNSUPPORTED;
+  if(flags&0x20000u)return B86_UNSUPPORTED;   /* r65: NT is plain state until IRET */
   c->flags=(flags&~(uint32_t)0x10000u)|(c->flags&0x10000u)|2u;
   c->r[B86_SP]=b86_pm20_add(c,sp,(int32_t)w);
  }else if(op==0x60u){

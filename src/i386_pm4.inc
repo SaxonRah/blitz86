@@ -13,6 +13,9 @@ static B86_PM4_FLASH int b86_pm4_fetch(const B86Cpu *c, uint32_t off, uint8_t *v
 {
     uint32_t linear;
     B86PM2Fault fault;
+    /* r66: served from the per-step fetch window when possible */
+    const uint32_t d = off - c->fb_ip;
+    if (d < c->fb_len && c->fb_cs == (uint16_t)c->seg[B86_CS]) { *v = c->fb[d]; return 1; }
     if (b86_pm2_check_access(c, B86_CS, off, 1u, B86_PM1_EXEC,
                              &linear, &fault) != B86_PM2_OK) return 0;
     *v = *b86_host(c, linear);

@@ -14,7 +14,7 @@ enum {
  B86_PM1_NOT_PRESENT=5, B86_PM1_TYPE=6,
  B86_PM1_PRIVILEGE=7, B86_PM1_ACCESS=8,
  B86_PM1_SEGMENT_LIMIT=9, B86_PM1_NO_LDT=10,
- B86_PM1_UNSUPPORTED=11
+ B86_PM1_UNSUPPORTED=11, B86_PM1_PAGE=12 /* r65: #PF recorded in pf_pending */
 };
 enum { B86_PM1_READ=1, B86_PM1_WRITE=2, B86_PM1_EXEC=4 };
 /* Loads the LDTR *shadow* from a system LDT descriptor in the GDT.
