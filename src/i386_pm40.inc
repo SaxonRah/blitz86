@@ -20,7 +20,7 @@
  *    on the instruction while ECX != 0 (restartable, as on the CPU).
  */
 #ifndef B86_PM40_FLASH
-#define B86_PM40_FLASH __attribute__((noinline,section(".text.bb386_flash")))
+#define B86_PM40_FLASH __attribute__((noinline)) B86_PM_HOT
 #endif
 #ifndef B86_PM40_REP
 #define B86_PM40_REP 4096u
@@ -55,7 +55,7 @@ static inline int p40_imm(P40 *d, unsigned w, uint32_t *v)
 { return w == 1u ? p40_u8(d, v) : w == 2u ? p40_u16(d, v) : p40_u32(d, v); }
 
 /* ModRM/SIB for 32-bit addressing, or 16-bit forms when d->a16. */
-static int p40_modrm(const B86Cpu *c, P40 *d)
+static B86_PM_HOT int p40_modrm(const B86Cpu *c, P40 *d)
 {
     uint32_t m, sib, disp = 0u;
     if (!p40_u8(d, &m)) return 0;
@@ -97,7 +97,7 @@ static int p40_modrm(const B86Cpu *c, P40 *d)
 }
 
 /* Host pointer for seg:off, size bytes, or NULL to decline (fault path). */
-static uint8_t *p40_ptr(B86Cpu *c, unsigned seg, uint32_t off, unsigned size, int write, uint32_t *lin_out)
+static B86_PM_HOT uint8_t *p40_ptr(B86Cpu *c, unsigned seg, uint32_t off, unsigned size, int write, uint32_t *lin_out)
 {
     const B86PM1Cache *s = &c->pm386.seg[seg];
     uint32_t lin, phys;
@@ -164,7 +164,7 @@ static inline uint32_t p40_szp(uint32_t r, unsigned w)
 static inline void p40_setflags(B86Cpu *c, uint32_t f) { c->flags = (c->flags & ~(uint32_t)B86_ARITH) | f; }
 
 /* ALU: 0 ADD 1 OR 2 ADC 3 SBB 4 AND 5 SUB 6 XOR 7 CMP. Returns result. */
-static uint32_t p40_alu(B86Cpu *c, unsigned op, uint32_t a, uint32_t b, unsigned w)
+static B86_PM_HOT uint32_t p40_alu(B86Cpu *c, unsigned op, uint32_t a, uint32_t b, unsigned w)
 {
     const uint32_t m = p40_mask(w), msb = p40_msb(w);
     uint32_t r, f;
@@ -191,7 +191,7 @@ static uint32_t p40_alu(B86Cpu *c, unsigned op, uint32_t a, uint32_t b, unsigned
     return r;
 }
 
-static int p40_cond(uint32_t f, unsigned cc)
+static B86_PM_HOT int p40_cond(uint32_t f, unsigned cc)
 {
     int r;
     switch (cc >> 1) {
@@ -208,7 +208,7 @@ static int p40_cond(uint32_t f, unsigned cc)
 }
 
 /* Shifts/rotates: 0 ROL 1 ROR 4/6 SHL 5 SHR 7 SAR (2/3 RCL/RCR decline). */
-static int p40_shift(B86Cpu *c, unsigned op, uint32_t a, unsigned n, unsigned w, uint32_t *res)
+static B86_PM_HOT int p40_shift(B86Cpu *c, unsigned op, uint32_t a, unsigned n, unsigned w, uint32_t *res)
 {
     const unsigned bits = w * 8u;
     const uint32_t m = p40_mask(w), msb = p40_msb(w);
@@ -260,7 +260,7 @@ static int p40_shift(B86Cpu *c, unsigned op, uint32_t a, unsigned n, unsigned w,
 
 /* r/m operand helpers (memory pointer fetched once, checked, before effects) */
 typedef struct { uint8_t *p; uint32_t lin; } P40M;
-static int p40_rm_ptr(B86Cpu *c, const P40 *d, unsigned w, int write, P40M *m)
+static B86_PM_HOT int p40_rm_ptr(B86Cpu *c, const P40 *d, unsigned w, int write, P40M *m)
 {
     if (d->mod == 3u) { m->p = NULL; return 1; }
     m->p = p40_ptr(c, d->easeg, d->ea, w, write, &m->lin);
@@ -273,13 +273,13 @@ static inline void p40_rm_put(B86Cpu *c, const P40 *d, const P40M *m, unsigned w
 
 /* stack (SS must be a 32-bit stack) */
 /* stack: 32-bit ESP when SS.B=1, else 16-bit SP (upper ESP preserved) */
-static uint8_t *p40_push_ptr(B86Cpu *c, unsigned w, uint32_t *nsp, uint32_t *lin)
+static B86_PM_HOT uint8_t *p40_push_ptr(B86Cpu *c, unsigned w, uint32_t *nsp, uint32_t *lin)
 {
     if (c->pm386.seg[B86_SS].flags & 4u) { *nsp = c->r[B86_SP] - w; return p40_ptr(c, B86_SS, *nsp, w, 1, lin); }
     *nsp = (c->r[B86_SP] & 0xFFFF0000u) | ((c->r[B86_SP] - w) & 0xFFFFu);
     return p40_ptr(c, B86_SS, *nsp & 0xFFFFu, w, 1, lin);
 }
-static uint8_t *p40_pop_ptr(B86Cpu *c, unsigned w, uint32_t *lin)
+static B86_PM_HOT uint8_t *p40_pop_ptr(B86Cpu *c, unsigned w, uint32_t *lin)
 {
     const int s32 = (c->pm386.seg[B86_SS].flags & 4u) != 0u;
     return p40_ptr(c, B86_SS, s32 ? c->r[B86_SP] : (c->r[B86_SP] & 0xFFFFu), w, 0, lin);

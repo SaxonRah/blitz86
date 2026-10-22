@@ -49,7 +49,7 @@ static unsigned long long g_tick_at;
    (--irq). Guest time advances with retired instructions at g_vmips. */
 static void logf_(const char *fmt, ...);
 static uint8_t g_pic_mask[2] = { 0xB8, 0xFF };
-static int g_irq_on;
+static int g_irq_on, g_pj;
 static double g_vmips = 25e6;
 static uint32_t g_pit_reload = 65536u;
 static int g_pit_lo_pending, g_pit_lo;
@@ -715,6 +715,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--jit")) use_jit = 1;
         else if (!strcmp(argv[i], "--pico-ivt")) g_pico_ivt = 1;
         else if (!strcmp(argv[i], "--irq")) g_irq_on = 1;
+        else if (!strcmp(argv[i], "--pj")) g_pj = 1;
         else if (!strcmp(argv[i], "--key") && i + 1 < argc && g_nkeys + 2 <= MAXKEYS) {
             unsigned long long at; unsigned sc;
             if (sscanf(argv[++i], "%llu:%x", &at, &sc) == 2) {
@@ -760,6 +761,15 @@ int main(int argc, char **argv)
     memcpy(M + lin(STUB_SEG, 0xFFF5), "01/01/94", 8);
     if (g_pico_ivt) for (unsigned v = 0x10; v <= 0x1A; ++v) { ww(v * 4u, 0); ww(v * 4u + 2u, 0); }
     if (!load_exe(exe, tail)) return 2;
+#if defined(B86_PJ) && B86_PJ
+    if (g_pj) {                                  /* r70: native PM translator */
+        size_t cb = 512u * 1024u;
+        void *code = mmap(NULL, cb, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        void *st = calloc(1, b86_pj_state_bytes());
+        if (code == MAP_FAILED || !st || !b86_pj_attach(&C, st, b86_pj_state_bytes(), code, cb)) { logf_("pj attach failed"); return 2; }
+        logf_("PJ on: %u KiB code, %u B state", (unsigned)(cb / 1024u), (unsigned)b86_pj_state_bytes());
+    }
+#endif
 
     int rc = B86_OK, pe = 0;
     unsigned long pe_in = 0, pe_out = 0;
@@ -835,6 +845,18 @@ int main(int argc, char **argv)
     else dump(rc == B86_OK ? "step limit" : rc == B86_HALT ? "HLT" : rc == B86_UNSUPPORTED ? "UNSUPPORTED" :
               rc == B86_SHUTDOWN ? "SHUTDOWN" : "rc", rc);
     fprintf(stderr, "[host] PE entries %lu exits %lu\n", pe_in, pe_out);
+#if defined(B86_PJ) && B86_PJ
+    if (g_pj) { unsigned long st[8], so[256]; b86_pj_stats(&C, st); b86_pj_stop_ops(&C, so);
+        fprintf(stderr, "[host] pj: blocks %lu flushes %lu runs %lu insns %lu (%.1f/run) mem-exits %lu declined %lu code %lu/%lu\n",
+                st[0], st[1], st[2], st[3], st[2] ? (double)st[3] / st[2] : 0.0, st[4], st[5], st[6], st[7]);
+        fprintf(stderr, "[host] pj blocks end at:");
+        for (int k = 0; k < 16; ++k) { int best = 0; for (int q = 1; q < 256; ++q) if (so[q] > so[best]) best = q; if (!so[best]) break; fprintf(stderr, " %02X:%lu", best, so[best]); so[best] = 0; }
+        fprintf(stderr, "\n"); }
+#endif
+#ifdef B86_PJ_VERIFY
+    { extern unsigned long b86_pj_vfy_checked, b86_pj_vfy_bad;
+      fprintf(stderr, "[host] pj-verify: blocks checked %lu mismatches %lu\n", b86_pj_vfy_checked, b86_pj_vfy_bad); }
+#endif
     { extern unsigned long b86_pm40_stat_ok, b86_pm40_stat_decline;
       fprintf(stderr, "[host] pm40: executed %lu declined %lu\n", b86_pm40_stat_ok, b86_pm40_stat_decline); }
 #ifdef B86_PM40_STATS

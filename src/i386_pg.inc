@@ -33,7 +33,7 @@ static B86_PG_FLASH void b86_pg_flush(B86Cpu *c)
     memset(c->tlb_tag, 0, sizeof c->tlb_tag);
 }
 /* 1 = translated (*phys), 0 = not present. Never records a fault. */
-static int b86_pg_walk(B86Cpu *c, uint32_t lin, uint32_t *phys)
+static B86_PM_HOT int b86_pg_walk(B86Cpu *c, uint32_t lin, uint32_t *phys)
 {
     const unsigned slot = (lin >> 12) & 63u;
     const uint32_t tag = (lin & 0xFFFFF000u) | 1u;
@@ -62,7 +62,7 @@ static void b86_pg_fault(B86Cpu *c, uint32_t lin, unsigned write)
     c->pf_lin = lin;
     c->pf_err = (uint8_t)((write ? 2u : 0u) | ((c->seg[B86_CS] & 3u) == 3u ? 4u : 0u));
 }
-uint8_t *b86_pg_host(B86Cpu *c, uint32_t lin)
+B86_PM_HOT uint8_t *b86_pg_host(B86Cpu *c, uint32_t lin)
 {
     uint32_t phys;
     const unsigned slot = (lin >> 12) & 63u;                 /* r66: TLB hit inline */

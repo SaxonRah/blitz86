@@ -58,3 +58,29 @@ r68b: PM40 also covers 16-bit protected-mode code and 16-bit addressing
 (DOS/4GW's own kernel), segment-register moves/push/pop, LES/LDS/LFS/LGS,
 PUSHA/POPA, PUSHF, ENTER (level 0), LOOP/JCXZ, BT/BTS/BTR/BTC, CLI/STI.
 -DB86_PM40_STATS prints which opcodes PM40 still declines.
+
+r70: PJ, native Thumb-2 translation of flat 32-bit protected-mode code
+---------------------------------------------------------------------
+src/i386_pj.inc, built with -DB86_PJ=1 on 32-bit ARM hosts (Pico, qemu-arm).
+The host attaches it with b86_pj_attach(cpu, state, b86_pj_state_bytes(),
+code, code_bytes). Blocks of supported instructions run natively with the
+guest registers in r4-r11, write the interpreter's lazy-flag records, call
+one helper per memory access (page walk, fault -> exit before the
+instruction), chain to each other (direct for static targets, a native
+hash lookup for RET/indirect), and stop at pending interrupts, written code
+pages or after B86_PJ_CHAIN instructions.
+
+    # Descent under qemu-arm with PJ
+    arm-linux-gnueabihf-gcc -static -mthumb -march=armv7-a+fp -O2 -DB86_PAGED \
+        -DB86_PJ=1 -DB86_RAM_BYTES=0x400000u -Iinclude src/interp.c \
+        tests/dos4gw_host.c -o build/pj_t2
+    qemu-arm build/pj_t2 DIR DESCENTR.EXE --pj --irq --env "DOS4GVM=..."
+
+    # verifier: every native run is undone and replayed in the interpreter
+    ... -DB86_PJ_VERIFY ...   (prints [pj-verify] MISMATCH lines)
+
+    # random differential fuzzer (single blocks vs the interpreter)
+    arm-linux-gnueabihf-gcc -static -mthumb -march=armv7-a+fp -O1 -DB86_PJ=1 \
+        -DB86_PJ_STR_MAX=64u -DB86_RAM_BYTES=0x400000u -Iinclude -Isrc \
+        tests/pj_fuzz.c -o build/pj_fuzz
+    qemu-arm build/pj_fuzz 6000 <seed>

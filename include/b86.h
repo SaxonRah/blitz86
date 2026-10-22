@@ -21,6 +21,14 @@ extern "C" {
 #else
 #define B86_HOT
 #endif
+/* r69: protected-mode hot path (PM40, fetch window, page walk, PM dispatch).
+   In SRAM with B86_PM_RAM=1 (about 12 KiB; on blitzBUS lower BB_CODE_KB to
+   make room). Otherwise it runs from flash like the rest of the PM stages. */
+#if defined(B86_RAM_FUNCS) && B86_RAM_FUNCS && defined(B86_PM_RAM) && B86_PM_RAM
+#define B86_PM_HOT __attribute__((section(".time_critical.blitz86pm")))
+#else
+#define B86_PM_HOT
+#endif
 /* Translator / emitter code: runs only while translating, so it stays in
    flash (B86_COLD_RAM=1 puts it back in RAM). */
 #if defined(B86_RAM_FUNCS) && B86_RAM_FUNCS && defined(B86_COLD_RAM) && B86_COLD_RAM
@@ -78,6 +86,8 @@ enum {
                              (a shift by 1 followed by RCL/RCR by 1) */
     LZ_ADD32, LZ_SUB32, LZ_LOG32, LZ_INC32, LZ_DEC32,   /* r56: 386 32-bit records */
     LZ_SHL8A, LZ_SHL16A, LZ_SHR8A, LZ_SHR16A, LZ_SAR8A, LZ_SAR16A, /* r59: 386 shift by 1, AF kept from flags */
+    LZ_SZPC32,            /* r70: 32-bit SF/ZF/PF from lz_res, CF/OF bits in lz_b, AF=0 */
+    LZ_ADC32, LZ_SBB32,   /* r70: 32-bit ADC/SBB, explicit lz_b */
     LZ_COUNT
 };
 
@@ -203,6 +213,10 @@ typedef struct B86Cpu {
     uint8_t  fb[16];
     /* r68: arithmetic flags the last PM40 instruction left undefined */
     uint32_t pm40_undef;
+    /* r70: protected-mode native translator state (b86_pj_attach), or NULL */
+    void *pj;
+    uintptr_t pj_exit;      /* r70: address after the static exit a block left by (0: none) */
+    uint32_t pj_stop;       /* r70: nonzero stops block chaining (code page written) */
 } B86Cpu;
 
 /* r65: translate through the guest page tables (interp.c). */
@@ -245,6 +259,12 @@ void     b86_interrupt(B86Cpu *c, uint8_t vector);    /* real-mode INT n    */
    Returns 1 when delivered, 0 when the CPU cannot take it now (retry later).
    The caller owns the PIC (IRR/ISR) and the vector number. */
 int      b86_irq(B86Cpu *c, uint8_t vector);
+/* r70: native translation of flat 32-bit protected-mode code (Thumb-2 hosts).
+   state: b86_pj_state_bytes() bytes; code: executable buffer (>= 16 KiB). */
+size_t   b86_pj_state_bytes(void);
+int      b86_pj_attach(B86Cpu *c, void *state, size_t state_bytes, void *code, size_t code_bytes);
+void     b86_pj_stats(const B86Cpu *c, unsigned long out[8]);
+void     b86_pj_stop_ops(const B86Cpu *c, unsigned long out[256]);
 extern const uint8_t b86_parity[256];
 
 static inline uint16_t b86_r16(const B86Cpu *c, int r) { return (uint16_t)c->r[r]; }

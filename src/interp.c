@@ -86,12 +86,14 @@ static const uint8_t lz_class[LZ_COUNT] = {
     [LZ_ADC8] = 8, [LZ_ADC16] = 8, [LZ_SBB8] = 9, [LZ_SBB16] = 9, [LZ_SZPC8] = 10, [LZ_SZPC16] = 10,
     [LZ_ADD32] = 0, [LZ_SUB32] = 1, [LZ_LOG32] = 2, [LZ_INC32] = 6, [LZ_DEC32] = 7,
     [LZ_SHL8A] = 11, [LZ_SHL16A] = 11, [LZ_SHR8A] = 12, [LZ_SHR16A] = 12, [LZ_SAR8A] = 13, [LZ_SAR16A] = 13,
+    [LZ_SZPC32] = 10, [LZ_ADC32] = 8, [LZ_SBB32] = 9,
 };
 static const uint8_t lz_w16[LZ_COUNT] = {
     [LZ_ADD16] = 1, [LZ_SUB16] = 1, [LZ_LOG16] = 1, [LZ_INC16] = 1, [LZ_DEC16] = 1,
     [LZ_SHL16] = 1, [LZ_SHR16] = 1, [LZ_SAR16] = 1, [LZ_ADC16] = 1, [LZ_SBB16] = 1, [LZ_SZPC16] = 1,
     [LZ_ADD32] = 2, [LZ_SUB32] = 2, [LZ_LOG32] = 2, [LZ_INC32] = 2, [LZ_DEC32] = 2,   /* 2: 32-bit */
     [LZ_SHL16A] = 1, [LZ_SHR16A] = 1, [LZ_SAR16A] = 1,
+    [LZ_SZPC32] = 2, [LZ_ADC32] = 2, [LZ_SBB32] = 2,
 };
 
 B86_HOT static uint32_t lazy_eval(uint32_t k, uint32_t a0, uint32_t r0, uint32_t b0, uint32_t f)
@@ -166,8 +168,12 @@ B86_HOT static inline __attribute__((always_inline)) uint32_t lin(const B86Cpu *
     return ((c->seg[s] << 4) + (off & 0xFFFFu)) & c->amask;
 }
 
+static inline void b86_pj_note_store(B86Cpu *c, uint32_t lin, uint32_t n);   /* r70 */
 B86_HOT static inline void smc(B86Cpu *c, uint32_t a, uint32_t n)
 {
+#if defined(B86_PJ) && B86_PJ
+    if (c->pj && (c->msw & 1u)) b86_pj_note_store(c, a, n);     /* r70: PM code-page filter */
+#endif
 #if B86_RAM_BYTES > B86_MEM_BYTES
     if (a >= B86_MEM_BYTES) return;               /* r63: never translated */
 #endif
@@ -864,6 +870,9 @@ static uint32_t b86_rm3_segvalue(B86Cpu *c, int which);
 #include "i386_pm31.inc"   /* B86_PM31_V1: DOS/4GW odds and ends */
 #include "i386_pm32.inc"   /* B86_PM32_V1 (r65): CR2/CR3/PG + #PF */
 #include "i386_pm40.inc"   /* B86_PM40_V1 (r68): flat 32-bit fast path */
+#if defined(B86_PJ) && B86_PJ
+#include "i386_pj.inc"     /* B86_PJ_V1 (r70): native Thumb-2 for flat 32-bit code */
+#endif
 
 /* BB_386_STAGE5C3C_V1: model-386-only legacy word memory limit preflight. */
 /* The 8086/186/286 interpreter and JIT memory primitives are intentionally
@@ -1349,7 +1358,7 @@ static __attribute__((noinline, cold, section(".text.bb386_flash"))) int b86_386
  * recorded exactly as the stages would); following bytes stop at the CS
  * limit, the end of RAM or the first non-present page, where the stages'
  * own per-byte path takes over. */
-static B86_PG_FLASH void b86_pm_fill_fetch(B86Cpu *c)
+static B86_PM_HOT void b86_pm_fill_fetch(B86Cpu *c)
 {
     const B86PM1Cache *cs = &c->pm386.seg[B86_CS];
     B86PM2Fault fault;
@@ -1394,7 +1403,7 @@ typedef struct B86PgSnap {
     uint64_t icount;
     B86PM1State pm;
 } B86PgSnap;
-static B86_PG_FLASH void b86_pg_snap(const B86Cpu *c, B86PgSnap *s)
+static B86_PM_HOT void b86_pg_snap(const B86Cpu *c, B86PgSnap *s)
 {
     memcpy(s->r, c->r, sizeof s->r); s->flags = c->flags; s->ip = c->ip;
     memcpy(s->seg, c->seg, sizeof s->seg); memcpy(s->seg386, c->seg386, sizeof s->seg386);
@@ -1521,7 +1530,7 @@ static uint32_t b86_pm_memo_make_key(const B86Cpu *c)
                (pf << 16) | ((uint32_t)op << 8) | b2;
     }
 }
-static int b86_pm_dispatch(B86Cpu *c, B86PgSnap *snap);
+static B86_PM_HOT int b86_pm_dispatch(B86Cpu *c, B86PgSnap *snap);
 #ifdef B86_PM40_VERIFY
 #include <stdio.h>
 /* r68: run PM40, undo it, run the stage chain, compare. The chain's result
@@ -1578,7 +1587,7 @@ static int b86_pm40_verify(B86Cpu *c, B86PgSnap *snap)
     return rc2;
 }
 #endif
-static int b86_pm_dispatch(B86Cpu *c, B86PgSnap *snap)
+static B86_PM_HOT int b86_pm_dispatch(B86Cpu *c, B86PgSnap *snap)
 {
     const int marker = c->pm386.seg[B86_CS].reserved == B86_PM3_TRANSITION_MARKER;
     uint32_t key = 0u, slot = 0u;
@@ -1634,6 +1643,12 @@ B86_HOT int b86_step(B86Cpu *c)
          * a stage that records lazily) must not make them fall through. */
         if (c->lz_kind != LZ_NONE || c->lz_ikind != LZ_NONE) b86_flags_materialize(c);
         uint8_t before = c->pm386.seg[B86_SS].reserved;
+#if defined(B86_PJ) && B86_PJ
+        if (!before && c->pj) {                                  /* r70: native block */
+            const unsigned n = b86_pj_try(c);
+            if (n) { c->icount += n; c->icnt += n - 1u; return B86_OK; }
+        }
+#endif
         /* r65: with paging on, any translation miss during the instruction
          * (preflight or not) records #PF; the instruction is rolled back and
          * the fault delivered with EIP at its first byte. */

@@ -4176,7 +4176,7 @@ B86_HOT static int MPF(cold_run)(J *j, B86Cpu *c, uint32_t key, int force)
    r55: only protected mode still runs here. */
 /* B86_PM_UNIFIED_V10: PE exit boundary; restore native JIT only after far JMP. */
 #define B86_PM29_EXIT_MARKER 0xA6u /* V9 PM25 exit marker; shared with this JIT dispatcher. */
-B86_COLD static int b86_386_rm0_run(B86Cpu *c, uint64_t budget)
+B86_PM_HOT static int b86_386_rm0_run(B86Cpu *c, uint64_t budget)   /* r69 */
 {
     /* BB_386_STAGE5C4A_V1: no IRQ, trap or budget result can bypass shutdown. */
     if (c->shutdown386) return B86_SHUTDOWN;
