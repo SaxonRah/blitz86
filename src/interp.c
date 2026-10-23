@@ -1629,6 +1629,12 @@ static B86_PM_HOT int b86_pm_dispatch(B86Cpu *c, B86PgSnap *snap)
     return rc;
 }
 
+/* BB_PJ_C1_E3_66_V1: actual protected-mode execution coverage.
+ * The C fallback includes PM40/PM stages; real-mode DOS work is excluded.
+ * Native count is incremented once per PJ block, not per guest instruction. */
+#if defined(B86_PJ) && B86_PJ
+uint64_t b86_pm_pj_guest_insns, b86_pm_c_guest_insns;
+#endif
 B86_HOT int b86_step(B86Cpu *c)
 {
     /* BB_386_STAGE5C4A_V1: shutdown precedes fetch and all guest side effects. */
@@ -1646,7 +1652,7 @@ B86_HOT int b86_step(B86Cpu *c)
 #if defined(B86_PJ) && B86_PJ
         if (!before && c->pj) {                                  /* r70: native block */
             const unsigned n = b86_pj_try(c);
-            if (n) { c->icount += n; c->icnt += n - 1u; return B86_OK; }
+            if (n) { b86_pm_pj_guest_insns += n; c->icount += n; c->icnt += n - 1u; return B86_OK; }
         }
 #endif
         /* r65: with paging on, any translation miss during the instruction
@@ -1663,6 +1669,9 @@ B86_HOT int b86_step(B86Cpu *c)
             return b86_pm32_page_fault(c);
         }
         if (rc == B86_OK || rc == B86_HALT) {
+#if defined(B86_PJ) && B86_PJ
+            ++b86_pm_c_guest_insns;
+#endif
             if (c->pm386.seg[B86_SS].reserved == B86_PM11_SHADOW_ARMED)
                 c->pm386.seg[B86_SS].reserved = B86_PM11_SHADOW_NEXT;
             else if (before == B86_PM11_SHADOW_NEXT &&

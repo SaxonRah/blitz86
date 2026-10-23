@@ -53,6 +53,9 @@ typedef struct B86Pj {
     unsigned long blocks, flushes, runs, insns, exits_mem, declines, fallback;
     unsigned long stop_op[256];         /* which opcode ended blocks           */
     int flush_pending;
+    /* BB_PJ_REPNE_EFFICIENCY_V1: separate yield vs mapped-memory refusal. */
+    unsigned long repne_calls, repne_completed, repne_budget_yields;
+    unsigned long repne_refusals, repne_comparisons, repne_spans;
 } B86Pj;
 
 unsigned long b86_pj_stat_runs, b86_pj_stat_insns;
@@ -356,34 +359,116 @@ static B86_PM_HOT uint32_t b86_pj_rotate1(B86Cpu *c, uint32_t a, uint32_t desc)
                (cf ? B86_CF : 0u) | (of ? B86_OF : 0u);
     return r;
 }
-/* F2 A6/A7/AE/AF (REPNE CMPS/SCAS): do up to 64 *complete* comparisons.
- * If a memory access cannot be handled, retain the updated SI/DI/CX/flags
- * and retry the remaining iterations through the interpreter at the same
- * EIP. This also yields back to C periodically for large string lengths. */
+/* BB_PJ_REPNE_EFFICIENCY_V1. 256 checked comparisons per native entry,
+ * and a single page walk per contiguous source/destination page span.
+ * Preserve the last CMP's full flags even when yielding or declining memory.
+ * Crucially this does NOT conflate a budget yield with a memory refusal. */
+#ifndef B86_PJ_REPNE_BUDGET
+#define B86_PJ_REPNE_BUDGET 256u
+#endif
 static B86_PM_HOT uint32_t b86_pj_repne_cmp(B86Cpu *c, uint32_t desc)
 {
+    B86Pj *j = b86_pj_state(c);
     const unsigned op = desc & 255u, w = (desc >> 8) & 7u;
-    const uint32_t step = (c->flags & B86_DF) ? 0u - w : w;
+    const int cmps = op == 0xA6u || op == 0xA7u;
+    const int backwards = (c->flags & B86_DF) != 0;
+    const uint32_t step = backwards ? (uint32_t)0u - w : w;
+    const uint32_t mask = w == 4u ? UINT32_MAX : (1u << (w * 8u)) - 1u;
+    uint32_t final_a = 0u, final_b = 0u;
+    unsigned performed = 0u;
+    int equal = 0, refused = 0;
+    if (j) ++j->repne_calls;
+    b86_flags_materialize(c);
+    while (c->r[B86_CX] && performed < B86_PJ_REPNE_BUDGET) {
+        const uint32_t si = c->r[B86_SI], di = c->r[B86_DI];
+        uint8_t *sp = NULL, *dp;
+        const unsigned soff = si & 0xFFFu, doff = di & 0xFFFu;
+        unsigned take = B86_PJ_REPNE_BUDGET - performed, i;
+        unsigned span;
+        if (take > c->r[B86_CX]) take = c->r[B86_CX];
+        if (cmps) {
+            sp = b86_pj_mem(c, si, w);
+            if (!sp) { refused = 1; break; }
+            span = backwards ? soff / w + 1u : (0x1000u - soff) / w;
+            if (take > span) take = span;
+        }
+        dp = b86_pj_mem(c, di, w);
+        if (!dp) { refused = 1; break; }
+        span = backwards ? doff / w + 1u : (0x1000u - doff) / w;
+        if (take > span) take = span;
+        /* Both complete operands remain in these mapped physical pages for
+         * the whole span. A crossing re-enters the checked mapper above. */
+        if (!take) { refused = 1; break; }
+        if (j) ++j->repne_spans;
+        for (i = 0u; i < take; ++i) {
+            const size_t offset = (size_t)i * w;
+            const uint8_t *pdi = backwards ? dp - offset : dp + offset;
+            final_a = cmps ? p40_ld(backwards ? sp - offset : sp + offset, w)
+                           : c->r[B86_AX] & mask;
+            final_b = p40_ld(pdi, w);
+            if (cmps) c->r[B86_SI] += step;
+            c->r[B86_DI] += step;
+            --c->r[B86_CX];
+            ++performed;
+            if (final_a == final_b) { equal = 1; break; }
+        }
+        if (equal) break;
+    }
+    /* No flags become externally visible between REPNE comparisons.  Only
+     * the last executed comparison matters; one ALU update suffices. */
+    if (performed) {
+        (void)p40_alu(c, 7u, final_a, final_b, w);
+        if (j) j->repne_comparisons += performed;
+    }
+    if (refused) { if (j) ++j->repne_refusals; return 0u; }
+    if (equal || !c->r[B86_CX]) {
+        if (j) ++j->repne_completed;
+        return 1u;
+    }
+    /* A partial native instruction is restarted at its original guest EIP.
+     * The C dispatcher may handle an interrupt before its next entry. */
+    if (j) ++j->repne_budget_yields;
+    return 0u;
+}
+
+/* BB_PJ_C1_E3_66_V1: bounded immediate-count C1 ROL/ROR/RCL/RCR.
+ * Called only for a nonzero masked count.  Full arithmetic flags are
+ * materialized before updating CF/OF; SF/ZF/PF/AF must remain unchanged.
+ * The 386 masks the count to five bits; a 16-bit rotate may wrap through
+ * 16 (ROL/ROR) or 17 (RCL/RCR) bits, which looping preserves exactly. */
+static B86_PM_HOT uint32_t b86_pj_c1_rotate(B86Cpu *c, uint32_t value, uint32_t desc)
+{
+    const unsigned w = desc & 7u, sub = (desc >> 8) & 3u, count = (desc >> 16) & 31u;
+    const unsigned bits = w * 8u;
+    const uint32_t mask = w == 4u ? UINT32_MAX : (1u << bits) - 1u;
+    const uint32_t msb = 1u << (bits - 1u);
+    uint32_t v = value & mask, carry, overflow;
     unsigned i;
     b86_flags_materialize(c);
-    for (i = 0u; i < 64u && c->r[B86_CX]; ++i) {
-        uint8_t *dp, *sp = NULL;
-        uint32_t a, b;
-        if (op == 0xA6u || op == 0xA7u) {
-            sp = b86_pj_mem(c, c->r[B86_SI], w);
-            if (!sp) return 0u;
+    carry = (c->flags & B86_CF) != 0u;
+    for (i = 0u; i < count; ++i) {
+        uint32_t oldcf = carry;
+        if (sub == 0u) { /* ROL */
+            carry = (v & msb) != 0u;
+            v = ((v << 1u) & mask) | carry;
+        } else if (sub == 1u) { /* ROR */
+            carry = v & 1u;
+            v = (v >> 1u) | (carry ? msb : 0u);
+        } else if (sub == 2u) { /* RCL through CF */
+            carry = (v & msb) != 0u;
+            v = ((v << 1u) & mask) | oldcf;
+        } else { /* RCR through CF */
+            carry = v & 1u;
+            v = (v >> 1u) | (oldcf ? msb : 0u);
         }
-        dp = b86_pj_mem(c, c->r[B86_DI], w);
-        if (!dp) return 0u;
-        a = sp ? p40_ld(sp, w) : (c->r[B86_AX] & (w == 4u ? 0xFFFFFFFFu : (1u << (w * 8u)) - 1u));
-        b = p40_ld(dp, w);
-        (void)p40_alu(c, 7u, a, b, w); /* CMP: a-b; CF/SF/ZF/OF/AF/PF. */
-        if (sp) c->r[B86_SI] += step;
-        c->r[B86_DI] += step;
-        --c->r[B86_CX];
-        if (c->flags & B86_ZF) return 1u; /* REPNE stops on equality. */
     }
-    return c->r[B86_CX] == 0u ? 1u : 0u;
+    overflow = sub == 0u || sub == 2u
+        ? (((v & msb) != 0u) ^ (carry != 0u))
+        : (((v & msb) != 0u) ^ ((v & (msb >> 1u)) != 0u));
+    c->flags = (c->flags & ~(uint32_t)(B86_CF | B86_OF)) |
+               (carry ? B86_CF : 0u) | (overflow ? B86_OF : 0u);
+    if (count != 1u) c->pm40_undef |= B86_OF; /* OF architecturally undefined */
+    return v;
 }
 
 /* ---- translator ----------------------------------------------------------- */
@@ -732,29 +817,31 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
         pjt_putr(t, op & 7u, w, R3);
         pjt_lazy(t, op < 0x48u ? pj_k_inc[w] : pj_k_dec[w], R2, R3);
         return 1;
+    /* BB_PJ_C1_E3_66_V1: 66 PUSH/POP/PUSH imm16 with 32-bit SS.B stack.
+     * Check the entire 16-bit guest access before updating ESP or registers.
+     * PUSH SP uses old SP; POP SP applies the popped value after ESP += 2. */
     case 0x50: case 0x51: case 0x52: case 0x53: case 0x54: case 0x55: case 0x56: case 0x57:
-        if (o16) PJ_FAIL();
-        pj_dpi(&t->e, 13u, 0, R1, GR(4), 4u);
-        pjt_mem(t, 4u, 1);
-        pj_ldst(&t->e, PJ_STR, GR(op & 7u), R0, 0u);
-        pj_dpi(&t->e, 13u, 0, GR(4), GR(4), 4u);
+        pj_dpi(&t->e, 13u, 0, R1, GR(4), w);
+        pjt_mem(t, w, 1);
+        if (w == 4u) pj_ldst(&t->e, PJ_STR, GR(op & 7u), R0, 0u);
+        else { pjt_getr(t, R1, op & 7u, 2u); pjt_st(t, R1, R0, 2u); }
+        pj_dpi(&t->e, 13u, 0, GR(4), GR(4), w);
         return 1;
     case 0x58: case 0x59: case 0x5A: case 0x5B: case 0x5C: case 0x5D: case 0x5E: case 0x5F:
-        if (o16) PJ_FAIL();
         pj_mov(&t->e, R1, GR(4));
-        pjt_mem(t, 4u, 0);
-        pj_dpi(&t->e, 8u, 0, GR(4), GR(4), 4u);
-        pj_ldst(&t->e, PJ_LDR, GR(op & 7u), R0, 0u);
+        pjt_mem(t, w, 0);
+        pj_dpi(&t->e, 8u, 0, GR(4), GR(4), w);
+        if (w == 4u) pj_ldst(&t->e, PJ_LDR, GR(op & 7u), R0, 0u);
+        else { pjt_ld(t, R1, R0, 2u); pjt_putr(t, op & 7u, 2u, R1); }
         return 1;
     case 0x68: case 0x6A:
-        if (o16) PJ_FAIL();
-        if (op == 0x68u) { if (!pjt_u32(t, &imm)) PJ_FAIL(); }
+        if (op == 0x68u) { if (!pjt_imm(t, w, &imm)) PJ_FAIL(); }
         else { if (!pjt_u8(t, &imm)) PJ_FAIL(); imm = (uint32_t)(int32_t)(int8_t)imm; }
-        pj_dpi(&t->e, 13u, 0, R1, GR(4), 4u);
-        pjt_mem(t, 4u, 1);
+        pj_dpi(&t->e, 13u, 0, R1, GR(4), w);
+        pjt_mem(t, w, 1);
         pj_imm32(&t->e, R1, imm);
-        pj_ldst(&t->e, PJ_STR, R1, R0, 0u);
-        pj_dpi(&t->e, 13u, 0, GR(4), GR(4), 4u);
+        pjt_st(t, R1, R0, w);
+        pj_dpi(&t->e, 13u, 0, GR(4), GR(4), w);
         return 1;
     case 0x69: case 0x6B: {                          /* IMUL r, r/m, imm */
         if (!pjt_modrm(t, &m)) PJ_FAIL();
@@ -965,19 +1052,21 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
         const unsigned ww = (op & 1u) ? w : 1u;
         unsigned n;
         if (!pjt_modrm(t, &m) || (m.reg > 3u && m.reg != 4u && m.reg != 5u && m.reg != 7u)) PJ_FAIL();
-        if (m.reg <= 3u && (op != 0xD1u || np != 1u)) PJ_FAIL();
+        if (m.reg <= 3u && (op != 0xD1u && op != 0xC1u ||
+            !(np == 1u || (np == 2u && o16)))) PJ_FAIL();
         if (op <= 0xC1u) { const unsigned save = t->pos; uint32_t c8;
             /* the count byte follows the ModRM displacement */
             if (!pjt_u8(t, &c8)) PJ_FAIL();
             n = c8 & 31u; (void)save;
         } else n = 1u;
-        if (n == 0u || n >= 8u * ww) PJ_FAIL();
+        if (n == 0u || (m.reg > 3u && n >= 8u * ww)) PJ_FAIL();
         pjt_rm_load(t, &m, ww, 1, R1, &o);
-        if (m.reg <= 3u) { /* ROL/ROR/RCL/RCR by 1, all valid D1 forms */
+        if (m.reg <= 3u) { /* D1 by 1; C1 by imm8 (16/32-bit operands) */
             pjt_c(t);
             pj_mov(&t->e, R0, CREG);
-            pj_movw(&t->e, R2, (m.reg << 8) | ww);
-            pjt_call(t, (const void *)b86_pj_rotate1);
+            pj_imm32(&t->e, R2, (m.reg << 8) | ww | (n << 16));
+            pjt_call(t, op == 0xD1u ? (const void *)b86_pj_rotate1
+                                       : (const void *)b86_pj_c1_rotate);
             pj_mov(&t->e, R1, R0);
             pjt_rm_store(t, &o, ww, R1);
             t->last_kind = -1; t->ikind_clear = 1;
@@ -1072,6 +1161,16 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
         pj_dpi(&t->e, 8u, 0, GR(4), GR(5), 4u);
         pj_ldst(&t->e, PJ_LDR, GR(5), R0, 0u);
         return 1;
+    /* BB_PJ_C1_E3_66_V1: E3 rel8 = JECXZ in 32-bit address mode.
+     * 67 JCXZ remains on the interpreter path (67 is not decoded here).
+     * The branch tests ECX without changing guest arithmetic flags. */
+    case 0xE3:
+        if (np != 1u || !pjt_u8(t, &imm)) PJ_FAIL();
+        imm = (uint32_t)(int32_t)(int8_t)imm;
+        pj_dpi(&t->e, 13u, 1, PC, GR(1), 0u); /* CMP ecx, #0 */
+        pjt_exit_cond(t, 0 /* EQ */, PJ_NEXT() + imm, t->ninsn);
+        pjt_exit(t, PJ_NEXT(), t->ninsn, 0);
+        return 2;
     case 0xE8: {
         if (o16 || !pjt_u32(t, &imm)) PJ_FAIL();
         pj_dpi(&t->e, 13u, 0, R1, GR(4), 4u);
@@ -1589,6 +1688,19 @@ void b86_pj_stats(const B86Cpu *c, unsigned long out[8])
     out[0] = j->blocks; out[1] = j->flushes; out[2] = j->runs; out[3] = j->insns;
     out[4] = j->exits_mem; out[5] = j->declines; out[6] = j->used; out[7] = j->cap;
     out[1] = j->flush_smc * 1000000ul + j->flush_full;     /* smc*1e6 + full */
+}
+/* BB_PJ_REPNE_EFFICIENCY_V1: read-only diagnostics for blitzBUS. */
+void b86_pj_repne_stats(const B86Cpu *c, unsigned long out[6])
+{
+    const B86Pj *j = c ? (const B86Pj *)c->pj : NULL;
+    memset(out, 0, 6u * sizeof out[0]);
+    if (!j) return;
+    out[0] = j->repne_calls;
+    out[1] = j->repne_completed;
+    out[2] = j->repne_budget_yields;
+    out[3] = j->repne_refusals;
+    out[4] = j->repne_comparisons;
+    out[5] = j->repne_spans;
 }
 void b86_pj_stop_ops(const B86Cpu *c, unsigned long out[256])
 {
