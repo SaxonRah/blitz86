@@ -297,6 +297,27 @@ static B86_PM_HOT uint32_t b86_pj_cond(B86Cpu *c, uint32_t cc)
     return (uint32_t)p40_cond(c->flags, cc);
 }
 
+/* BB_PJ_FASTIO_V1: execute common control/I-O instructions inside native PJ.
+ * Privilege refusal is side-effect-free: the exit-stay path delegates to the
+ * existing protected-mode interpreter for its architectural exception.
+ * OUT callbacks in blitzBUS inspect c->ip; the emitter stores guest IP and
+ * live registers immediately before entering this helper. */
+static B86_PM_HOT uint32_t b86_pj_fast_cli(B86Cpu *c)
+{
+    if ((c->seg[B86_CS] & 3u) > ((c->flags >> 12) & 3u)) return 0u;
+    c->flags &= ~(uint32_t)B86_IF;
+    return 1u;
+}
+static B86_PM_HOT uint32_t b86_pj_fast_outimm8(B86Cpu *c, uint32_t port, uint32_t al)
+{
+    if (!c->out8 || (c->seg[B86_CS] & 3u) > ((c->flags >> 12) & 3u)) return 0u;
+    /* Interpreter normally has materialized arithmetic flags by this point.
+     * This also makes the flag state visible if the device hook inspects it. */
+    b86_flags_materialize(c);
+    c->out8(c, (uint16_t)port, (uint8_t)al);
+    return 1u;
+}
+
 /* ---- translator ----------------------------------------------------------- */
 typedef struct { uint8_t *at; uint32_t ip, n; int dyn; } PjExit;   /* dyn: 0 static/chainable, 1 EIP in r1, 2 static, never chained */
 typedef struct {
@@ -714,6 +735,37 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
         pjt_putr(t, m.reg, w, R1);
         return 1;
     case 0x90: return 1;
+    /* BB_PJ_FASTIO_V1: CLI changes IF, but must preserve pending lazy ALU
+     * flags; an IOPL violation is retried through the interpreter. */
+    case 0xFA:
+        pjt_c(t);
+        pj_mov(&t->e, R0, CREG);
+        pjt_call(t, (const void *)b86_pj_fast_cli);
+        pj_dpi(&t->e, 13u, 1, PC, R0, 0u);      /* CMP result, #0 */
+        pjt_exit_stay(t, 0 /* EQ */, t->ip0, t->ninsn - 1u);
+        return 1;
+    /* OUT imm8,AL: synchronize guest register file and current EIP before
+     * host I/O callback. Reload the registers in case the hook modified them.
+     * The callback is executed exactly once; a refused port leaves no effects. */
+    case 0xE6:
+        if (!pjt_u8(t, &imm)) PJ_FAIL();
+        pjt_c(t);
+        pje32(&t->e, 0xE880u | CREG, 0x0FF0u); /* STMIA r12,{r4-r11} */
+        pj_imm32(&t->e, R3, t->ip0);
+        pj_ldst(&t->e, PJ_STR, R3, CREG, (unsigned)offsetof(B86Cpu, ip));
+        pj_mov(&t->e, R0, CREG);
+        pj_movw(&t->e, R1, imm);                /* 8-bit port */
+        pj_mov(&t->e, R2, GR(0));              /* EAX, helper uses AL */
+        pjt_call(t, (const void *)b86_pj_fast_outimm8);
+        pj_ldst(&t->e, PJ_LDR, CREG, SP, 0u);
+        pje32(&t->e, 0xE890u | CREG, 0x0FF0u); /* LDMIA r12,{r4-r11} */
+        t->creg_ok = 1;
+        /* Helper materialized the previously lazy arithmetic flags. */
+        t->last_kind = -1;
+        t->ikind_clear = 1;
+        pj_dpi(&t->e, 13u, 1, PC, R0, 0u);     /* CMP result, #0 */
+        pjt_exit_stay(t, 0 /* EQ */, t->ip0, t->ninsn - 1u);
+        return 1;
     case 0xF5: case 0xF8: case 0xF9: case 0xFC: case 0xFD:
         pjt_c(t);
         pj_mov(&t->e, R0, CREG);
