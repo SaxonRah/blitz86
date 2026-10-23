@@ -1634,6 +1634,10 @@ static B86_PM_HOT int b86_pm_dispatch(B86Cpu *c, B86PgSnap *snap)
  * Native count is incremented once per PJ block, not per guest instruction. */
 #if defined(B86_PJ) && B86_PJ
 uint64_t b86_pm_pj_guest_insns, b86_pm_c_guest_insns;
+/* BB_PJ_TLB_0F_V1: actual protected-mode C *executions*, not JIT stops. */
+unsigned long b86_pm_c_0f_exec[256];
+/* BB_PJ_SHIFTD_GS_X87_V1: x87 C-fallback executed instructions by primary opcode D8..DF. */
+unsigned long b86_pm_c_x87_exec[8];
 #endif
 B86_HOT int b86_step(B86Cpu *c)
 {
@@ -1663,6 +1667,27 @@ B86_HOT int b86_step(B86Cpu *c)
         if (paged) { b86_pg_snap(c, &snap); c->pf_pending = 0u; }
         b86_pm_fill_fetch(c);                                     /* r66 */
         int rc = b86_pm_dispatch(c, paged ? &snap : (B86PgSnap *)0);   /* r66 */
+#if defined(B86_PJ) && B86_PJ /* BB_PJ_TLB_0F_V1 */
+        unsigned pj_0f_op2 = 256u;
+        unsigned pj_x87_major = 8u;
+        /* Save the executed 0F subopcode before clearing the fetch window;
+         * update its count only after page-fault rollback is ruled out.
+         * The already populated fetch window needs no additional guest
+         * memory access or page-fault side effect. */
+        if (c->pj && (rc == B86_OK || rc == B86_HALT)) {
+            unsigned p = 0u;
+            while (p + 1u < c->fb_len && p < 5u) {
+                const uint8_t b = c->fb[p];
+                if (b == 0x0Fu) { pj_0f_op2 = c->fb[p + 1u]; break; }
+                if (b >= 0xD8u && b <= 0xDFu) { pj_x87_major = b - 0xD8u; break; }
+                if (b == 0x66u || b == 0x67u || b == 0xF0u ||
+                    b == 0xF2u || b == 0xF3u || b == 0x26u ||
+                    b == 0x2Eu || b == 0x36u || b == 0x3Eu ||
+                    b == 0x64u || b == 0x65u) { ++p; continue; }
+                break;
+            }
+        }
+#endif
         c->fb_len = 0u;                                           /* r66 */
         if (paged && c->pf_pending) {
             b86_pg_restore(c, &snap);
@@ -1671,6 +1696,9 @@ B86_HOT int b86_step(B86Cpu *c)
         if (rc == B86_OK || rc == B86_HALT) {
 #if defined(B86_PJ) && B86_PJ
             ++b86_pm_c_guest_insns;
+            /* BB_PJ_TLB_0F_V1: retired C-fallback 0F, not aborted by #PF. */
+            if (pj_0f_op2 < 256u) ++b86_pm_c_0f_exec[pj_0f_op2];
+            if (pj_x87_major < 8u) ++b86_pm_c_x87_exec[pj_x87_major];
 #endif
             if (c->pm386.seg[B86_SS].reserved == B86_PM11_SHADOW_ARMED)
                 c->pm386.seg[B86_SS].reserved = B86_PM11_SHADOW_NEXT;
