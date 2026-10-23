@@ -1094,7 +1094,13 @@ static void pjt_stub(PjT *t, const PjExit *x, const B86Pj *j)
  * enters the target's chain entry with r3 = r0; a miss returns to C. */
 static B86_PJ_COLD void pj_emit_shared(B86Pj *j)
 {
-    PjT tt;
+#if defined(PICO_ON_DEVICE) && PICO_ON_DEVICE
+    /* PJ emits on core 0 only. Keep the 96-exit workspace out of the 4 KiB
+     * hardware scratch stack; this is not on the execution hot path. */
+    static PjT tt;
+#else
+    PjT tt;  /* host tests retain a reentrant automatic workspace */
+#endif
     PjT *t = &tt;
     uint8_t *miss1, *miss2;
     unsigned hb = 0u;
@@ -1222,8 +1228,16 @@ static B86_PJ_COLD unsigned pj_fetch(B86Cpu *c, uint32_t eip, uint8_t *buf, unsi
 static B86_PJ_COLD uint32_t b86_pj_translate(B86Cpu *c, uint32_t eip)
 {
     B86Pj *j = b86_pj_state(c);
+#if defined(PICO_ON_DEVICE) && PICO_ON_DEVICE
+    /* Single CPU owns PJ translation on the Pico. Cache-building can invoke
+     * pj_emit_shared while this function is active; keeping both workspaces
+     * off the 4 KiB scratch stack avoids that nested stack pressure. */
+    static uint8_t bytes[192];
+    static PjT t;
+#else
     uint8_t bytes[192];
     PjT t;
+#endif
     int r = 1;
     unsigned i;
     uint32_t start_off;
