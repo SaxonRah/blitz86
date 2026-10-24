@@ -8,11 +8,11 @@
 enum { B86_X87_UNMASKED_EXCEPTION=-40 };
 static inline void b86_x87_st_le(uint8_t *p,uint64_t n,unsigned bytes){unsigned k;for(k=0;k<bytes;k++)p[k]=(uint8_t)(n>>(8u*k));}
 static inline int b86_x87_to_int_bits(const uint8_t v[10],unsigned width,unsigned rounding,
-                                       uint64_t *bits,unsigned *invalid,unsigned *inexact){
+                                       uint64_t *bits,unsigned *invalid,unsigned *inexact,unsigned *rounded_up){
     unsigned c=b86_x87_class(v),negative=b86_x87_sign(v),e=b86_x87_exp(v),r=0;
     uint64_t m=b86_x87_significand(v),mag=0,remain=0,half=0,lim;
     int shift=(int)(e?e:1u)-16383-63;
-    *invalid=0;*inexact=0;
+    *invalid=0;*inexact=0;*rounded_up=0;
     if(c==B86_X87_ZERO){*bits=0;return 0;}
     if(c!=B86_X87_FINITE){*invalid=1;return 0;}
     if(shift>=0){
@@ -30,6 +30,7 @@ static inline int b86_x87_to_int_bits(const uint8_t v[10],unsigned width,unsigne
             else if(rounding==1u){increment=negative;}
             else if(rounding==2u){increment=!negative;}
             if(increment)mag++;
+            *rounded_up=increment;
         }
     }
     lim=UINT64_C(1)<<(width-1u);
@@ -43,7 +44,7 @@ static inline int b86_x87_to_int_bits(const uint8_t v[10],unsigned width,unsigne
    DF /1 FISTTP m16, DB /1 FISTTP m32, DD /1 FISTTP m64. */
 static inline int b86_x87_exec_mem3d(B86X87 *f,unsigned op,unsigned modrm,
                                       uint32_t ea,const B86X87Memory *mem){
-    unsigned sub=(modrm>>3)&7u,width=0,pop=0,trunc=0,invalid=0,inexact=0,mode;
+    unsigned sub=(modrm>>3)&7u,width=0,pop=0,trunc=0,invalid=0,inexact=0,rounded_up=0,mode;
     uint8_t value[10],data[8];uint64_t bits=0;
     B86X87 next;
     int rc;
@@ -57,7 +58,7 @@ static inline int b86_x87_exec_mem3d(B86X87 *f,unsigned op,unsigned modrm,
     next=*f;
     if(b86_x87_peek_raw(&next,0,value))return B86_X87_DEC_STACK;
     mode=trunc?3u:((next.control>>10)&3u);
-    b86_x87_to_int_bits(value,width,mode,&bits,&invalid,&inexact);
+    b86_x87_to_int_bits(value,width,mode,&bits,&invalid,&inexact,&rounded_up);
     if(invalid){
         if(!(next.control&1u))return B86_X87_UNMASKED_EXCEPTION;
         bits=UINT64_C(1)<<(width-1u);next.status|=1u;inexact=0;
@@ -65,6 +66,7 @@ static inline int b86_x87_exec_mem3d(B86X87 *f,unsigned op,unsigned modrm,
         if(!(next.control&(1u<<5)))return B86_X87_UNMASKED_EXCEPTION;
         next.status|=(1u<<5);
     }
+    next.status=(uint16_t)((next.status&~0x0200u)|(rounded_up?0x0200u:0u));
     b86_x87_st_le(data,bits,width/8u);
     if(pop && b86_x87_pop(&next))return B86_X87_DEC_STACK;
     rc=mem->write(mem->opaque,ea,data,width/8u);

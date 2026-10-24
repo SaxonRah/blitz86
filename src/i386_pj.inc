@@ -37,6 +37,12 @@
 #ifndef B86_PJ_CPS
 #define B86_PJ_CPS 1024u                         /* exact code-page set size (power of 2) */
 #endif
+/* BB_STAGE4W2_PROFILE: actual production layout, verified from Pico -D flags.
+ * Refuse all others; never resize PJ state silently. */
+#if defined(PICO_ON_DEVICE) && PICO_ON_DEVICE && \
+    ((B86_PJ_HASH != 512u) || (B86_PJ_CPS != 256u))
+#error "Stage4W2 expected B86_PJ_HASH=512 and B86_PJ_CPS=256"
+#endif
 #ifndef B86_PJ_COLD
 #define B86_PJ_COLD __attribute__((noinline,cold))
 #endif
@@ -57,6 +63,9 @@ typedef struct B86Pj {
     uint32_t ent[B86_PJ_HASH];          /* code offset + 1, or 0 = interpret   */
     uint32_t cpg[128];                  /* linear code page filter (4096 bits) */
     uint32_t cps[B86_PJ_CPS];           /* exact set of code pages (page+1), open addressing */
+    /* BB_STAGE4W2_PROFILE: measurements only; no changes to dispatch decisions. */
+    unsigned long profile_lookup_misses, profile_slot_replacements;
+    unsigned long profile_cps_refusals, profile_last_report;
     unsigned long flush_smc, flush_full, links;
     uint8_t *tail_z, *tail, *dyn, *chk, *entry, *memtramp;   /* shared code at the start of the buffer */
     unsigned long blocks, flushes, runs, insns, exits_mem, declines, fallback;
@@ -192,17 +201,15 @@ static void pj_patch_b(uint8_t *at, uint8_t *to)
 /* ---- runtime helpers called from native code --------------------------- */
 #define PJ_PGH(pg) ((((uint32_t)(pg)) * 0x9E3779B1u) >> 20)   /* 4096-bit hashed page filter */
 static B86Pj *b86_pj_state(const B86Cpu *c) { return (B86Pj *)c->pj; }
-/* Stage4I trial-only: arbitrary paged stores may alias translated code.
- * Force conservative PJ cache invalidation on the next native entry.
- * This function is reached only from the C interpreter after a completed
- * x87 store. Never allow a pending flush to leak into normal builds. */
+/* Stage4U: keep native translations when x87 writes ordinary guest data.
+ * Each cached translated code page is indexed both by its guest linear page
+ * and by its physical page, with distinct keys in the existing exact cps
+ * table. This preserves detection of aliases without enlarging the 8 KiB
+ * PJ state arena. A false-positive bloom hit is resolved by cps. */
 #if defined(B86_X87_EXPERIMENTAL) && B86_X87_EXPERIMENTAL && \
-    defined(B86_X87_PG_WRITES_TRIAL) && B86_X87_PG_WRITES_TRIAL
-static void b86_x87_pg_force_pj_flush(B86Cpu *c)
-{
-    B86Pj *j=b86_pj_state(c);
-    if(j){j->flush_pending=1;c->pj_stop=1u;}
-}
+    ((defined(B86_X87_PG_WRITES_TRIAL) && B86_X87_PG_WRITES_TRIAL) || \
+     (defined(B86_X87_PG_CW_STORE) && B86_X87_PG_CW_STORE))
+static void b86_x87_pg_note_pj_store(B86Cpu *c,uint32_t physical,unsigned size);
 #endif
 
 static int pj_cps_has(const B86Pj *j, uint32_t pg)
@@ -214,6 +221,29 @@ static int pj_cps_has(const B86Pj *j, uint32_t pg)
     }
     return 0;
 }
+/* Physical aliases are stored under tagged page keys. Ordinary guest
+ * linear page numbers are at most 20 bits, so 0x40000000 is disjoint.
+ * A hit is an exact translated physical code page: self-modifying writes
+ * still schedule a full flush, while data-only writes leave PJ intact. */
+#if defined(B86_X87_EXPERIMENTAL) && B86_X87_EXPERIMENTAL && \
+    ((defined(B86_X87_PG_WRITES_TRIAL) && B86_X87_PG_WRITES_TRIAL) || \
+     (defined(B86_X87_PG_CW_STORE) && B86_X87_PG_CW_STORE))
+static void b86_x87_pg_note_pj_store(B86Cpu *c,uint32_t physical,unsigned size)
+{
+    B86Pj *j=b86_pj_state(c);
+    uint32_t pg,last;
+    if(!j || !size || physical>UINT32_MAX-(size-1u))return;
+    pg=physical>>12;last=(physical+size-1u)>>12;
+    for(;;++pg){
+        const uint32_t key=0x40000000u | pg;
+        const uint32_t h=PJ_PGH(key);
+        if((j->cpg[h>>5]&(1u<<(h&31u))) && pj_cps_has(j,key)){
+            j->flush_pending=1;c->pj_stop=1u;return;
+        }
+        if(pg==last)break;
+    }
+}
+#endif
 static int pj_cps_add(B86Pj *j, uint32_t pg)
 {
     uint32_t i = (pg * 0x9E3779B1u) & (B86_PJ_CPS - 1u), k;
@@ -1744,7 +1774,7 @@ static B86_PJ_COLD void pj_emit_shared(B86Pj *j)
      * Fail closed for unusual widths, paging off, crossings, TLB misses,
      * and out-of-RAM addresses. No new B86Cpu/B86Pj fields. */
 #ifndef BB_PJ_SHARED_MEMTRAMP_FAST
-#define BB_PJ_SHARED_MEMTRAMP_FAST 0
+#define BB_PJ_SHARED_MEMTRAMP_FAST 1
 #endif
     j->memtramp = t->e.p;
     {
@@ -2447,7 +2477,28 @@ static B86_PJ_COLD uint32_t b86_pj_translate(B86Cpu *c, uint32_t eip)
         if (i && pg == ((eip + i - 1u) >> 12)) continue;
 #endif
         j->cpg[h >> 5] |= 1u << (h & 31u);
-        if (!pj_cps_add(j, pg)) { b86_pj_flush(c); return 0u; }
+        if (!pj_cps_add(j, pg)) { ++j->profile_cps_refusals; b86_pj_flush(c); return 0u; }
+        /* Stage4U: mark the same source bytes by physical code page, too.
+         * If the mapping disappeared, refuse this block rather than cache
+         * native code without alias tracking. */
+        {
+            uint32_t phys, pkey, ph;
+#if BB_PJ_PM16_REG_TIER
+            const uint32_t source_linear=lin;
+#else
+            const uint32_t source_linear=eip+i;
+#endif
+            if(c->pg){
+                if(!b86_pg_walk(c,source_linear,&phys)){
+                    b86_pj_flush(c);return 0u;
+                }
+            }else phys=source_linear;
+            if(phys>=B86_RAM_BYTES){b86_pj_flush(c);return 0u;}
+            pkey=0x40000000u | (phys>>12);
+            ph=PJ_PGH(pkey);
+            j->cpg[ph>>5]|=1u<<(ph&31u);
+            if(!pj_cps_add(j,pkey)){++j->profile_cps_refusals;b86_pj_flush(c);return 0u;}
+        }
     }
     j->used = (uint32_t)(t.e.p - j->code);
 #if defined(__linux__)
@@ -2633,6 +2684,8 @@ static B86_PM_HOT unsigned b86_pj_try(B86Cpu *c)
     }
     h = ((c->ip * 2654435761u) >> 16) & (B86_PJ_HASH - 1u);
     if (j->tag[h] != (c->ip | 1u)) {
+        ++j->profile_lookup_misses;
+        if (j->tag[h]) ++j->profile_slot_replacements;
 /* BB_PJ_PM16_NEGCACHE_V1: check persistent negative key only on a
      * miss in the ordinary EIP cache. Linear keys eliminate most CS-base
      * aliasing. A false/stale hit only runs the checked interpreter. */
@@ -2778,7 +2831,34 @@ void b86_pj_stats(const B86Cpu *c, unsigned long out[8])
     if (!j) return;
     out[0] = j->blocks; out[1] = j->flushes; out[2] = j->runs; out[3] = j->insns;
     out[4] = j->exits_mem; out[5] = j->declines; out[6] = j->used; out[7] = j->cap;
-    out[1] = j->flush_smc * 1000000ul + j->flush_full;     /* smc*1e6 + full */
+#if defined(PICO_ON_DEVICE) && PICO_ON_DEVICE && \
+    defined(B86_X87_TRACE_FIRST_REJECT) && B86_X87_TRACE_FIRST_REJECT
+    /* Print at most once per 20,000 newly generated translations.
+     * Updates from b86_pj_stats(), not from hot native code. */
+    if(j->blocks >= j->profile_last_report + 20000u){
+        B86Pj *mutable_j = (B86Pj *)(void *)j;
+        mutable_j->profile_last_report = j->blocks;
+        printf("[bb386-pj-cache] hash=%u cps=%u miss=%lu replace=%lu cps-refuse=%lu smc=%lu full=%lu blocks=%lu\n",
+               (unsigned)B86_PJ_HASH,(unsigned)B86_PJ_CPS,
+               j->profile_lookup_misses,j->profile_slot_replacements,
+               j->profile_cps_refusals,j->flush_smc,j->flush_full,j->blocks);
+    }
+#endif
+    /* Legacy packed ABI overflows 32-bit unsigned long at 4,295 SMC
+     * flushes. Preserve it for blitzBUS's existing decoder, but report the
+     * true individual counts in trace builds when approaching wraparound. */
+    out[1] = j->flush_smc * 1000000ul + j->flush_full;
+#if defined(B86_X87_TRACE_FIRST_REJECT) && B86_X87_TRACE_FIRST_REJECT
+    {
+        static unsigned long last_exact=0;
+        if(j->flush_smc>=4000u &&
+           (last_exact==0u || j->flush_smc-last_exact>=512u)){
+            printf("[bb386-pj-exact] smc=%lu full=%lu blocks=%lu used=%lu\n",
+                   j->flush_smc,j->flush_full,j->blocks,(unsigned long)j->used);
+            last_exact=j->flush_smc;
+        }
+    }
+#endif
 }
 /* BB_PJ_REPNE_EFFICIENCY_V1: read-only diagnostics for blitzBUS. */
 void b86_pj_repne_stats(const B86Cpu *c, unsigned long out[6])

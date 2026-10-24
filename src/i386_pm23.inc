@@ -8,6 +8,9 @@
 #include "x87_decode3a.h"
 #include "x87_store3d.h"
 #include "x87_pm_mem_plan.h"
+#if defined(B86_X87_TRACE_FIRST_REJECT) && B86_X87_TRACE_FIRST_REJECT
+#include <stdio.h>
+#endif
 #endif
 #ifndef B86_PM23_FLASH
 #define B86_PM23_FLASH __attribute__((noinline,cold,section(".text.bb386_flash")))
@@ -116,17 +119,48 @@ B86_PM23_FLASH int b86_pm23_poll(B86Cpu *cpu,B86Pm23Hw *h,unsigned *vector)
  * prefix byte, no error code. Defined in PM26. */
 static int b86_pm26_interrupt(B86Cpu *c, unsigned vec, uint32_t return_ip);
 #if defined(B86_X87_EXPERIMENTAL) && B86_X87_EXPERIMENTAL
+/* Stage4L: opt-in first-occurrence execution trace.  No data or CPU
+ * mutation outside a 32-bit host-side "already printed" mask.  One line per
+ * reason class, never a log per instruction.  Disabled in ordinary builds. */
+#if defined(B86_X87_TRACE_FIRST_REJECT) && B86_X87_TRACE_FIRST_REJECT
+static uint32_t b86_x87_diag_seen;
+static void b86_x87_diag_event(const B86Cpu *c,uint32_t start,
+                               unsigned op,unsigned m,unsigned kind,
+                               const char *reason)
+{
+    uint32_t bit;
+    if(!c || kind>=32u) return;
+    bit=1u<<kind;
+    if(b86_x87_diag_seen&bit) return;
+    b86_x87_diag_seen|=bit;
+    printf("[bb386-x87-first] kind=%u reason=%s cs=%04lX ip=%08lX csbase=%08lX "
+           "op=%02X modrm=%02X pg=%u cr3=%08lX pf=%u pf_lin=%08lX pf_err=%02X\n",
+           kind,reason,(unsigned long)c->seg[B86_CS],(unsigned long)start,
+           (unsigned long)c->pm386.seg[B86_CS].base,op,m,(unsigned)c->pg,
+           (unsigned long)c->cr3,(unsigned)c->pf_pending,
+           (unsigned long)c->pf_lin,(unsigned)c->pf_err);
+}
+#define B86_X87_DIAG(c,ip,op,m,k,reason) b86_x87_diag_event(c,ip,op,m,k,reason)
+#else
+#define B86_X87_DIAG(c,ip,op,m,k,reason) ((void)0)
+#endif
+/* Reasons are printed once per classification, not once per x87 opcode.
+ * 0 attempt; 1 reg-ok; 2 reg-unsupported; 3 mem-ok;
+ * 4 plan; 5 paged-store-refused; 6 opcode-rescan; 7 EA-decode;
+ * 8 segment; 9 wrap; 10 permissions; 11 page-backing;
+ * 12 execution; 13 ModRM-fetch; 14 SIB-fetch; 15 displacement-fetch. */
 /* Strict Stage4B: paging and unhandled memory forms stay unsupported. */
 /* Stage4H opt-in paging rights check: full operand preflight before x87
  * register state or guest data changes.  Does not mutate the global TLB. */
 #include "x87_pg_rights.h"
+#include "x87_pg_cw_gate.h"
 #ifndef B86_X87_PG_WRITES_TRIAL
 #define B86_X87_PG_WRITES_TRIAL 0
 #endif
-#if B86_X87_PG_WRITES_TRIAL
+#if B86_X87_PG_WRITES_TRIAL || B86_X87_PG_CW_STORE
 #include "x87_pg_tx.h"
 #if defined(B86_PJ) && B86_PJ
-static void b86_x87_pg_force_pj_flush(B86Cpu *c);
+static void b86_x87_pg_note_pj_store(B86Cpu *c,uint32_t physical,unsigned size);
 #endif
 #endif
 static int b86_x87_pm_read_pte(void *opaque,uint32_t physical,uint32_t *value)
@@ -147,15 +181,13 @@ static int b86_x87_pm_rights(B86Cpu *c,uint32_t linear,
     memset(&r,0,sizeof r);
     r.cr3=c->cr3;r.ram_bytes=B86_RAM_BYTES;
     r.cpl=(unsigned)(c->seg[B86_CS]&3u);
-    /* The current 386 CPU model mirrors CR0 lower bits in msw.
-       WP is CR0 bit 16; do NOT guess it from the 16-bit MSW.
-       Refuse writes under paging until CR0.WP representation is verified. */
-    r.wp=
-#if B86_X87_PG_WRITES_TRIAL
-        write ? 1u : 0u; /* conservative: reject supervisor RO stores */
-#else
-        0u;
-#endif
+    /* The existing PM/paging backend emulates an 80386 (B86_CPU_386).
+     * Supervisor stores ignore the PTE/PDE R/W bit on that CPU, including
+     * writes into present read-only pages. The 386 has no CR0.WP bit.
+     * This matches i386_pg.inc; CPL3 writes remain permission-checked.
+     * Any future CPU model must retain conservative WP=1 here until the
+     * complete CR0.WP state is implemented rather than inferred from msw. */
+    r.wp=(c->model==B86_CPU_386)?0u:1u;
     r.read32=b86_x87_pm_read_pte;r.opaque=c;
     last=linear+size-1u;
     at=linear;
@@ -210,7 +242,7 @@ static uint8_t *b86_x87_pm_ptr(B86Cpu *c,uint32_t linear)
 }
 
 typedef struct B86X87PmMem { B86Cpu *cpu; uint32_t address; unsigned width; } B86X87PmMem;
-#if B86_X87_PG_WRITES_TRIAL
+#if B86_X87_PG_WRITES_TRIAL || B86_X87_PG_CW_STORE
 /* Trial-only: revalidate the complete store against live PDE/PTE before
  * touching backing RAM. One instruction is serialized within b86_step().
  * WP=1 is deliberately conservative because CR0.WP is not represented
@@ -226,7 +258,10 @@ static int b86_x87_pm_tx_resolve(void *opaque,uint32_t linear,
     memset(&r,0,sizeof r);
     r.cr3=c->cr3; r.ram_bytes=B86_RAM_BYTES;
     r.cpl=(unsigned)(c->seg[B86_CS]&3u);
-    r.wp=1u; /* safe conservative behavior */
+    /* Same 80386 supervisor policy as the operand-range preflight above.
+     * This is a SECOND, independent permission check immediately before
+     * the all-or-nothing write transaction, not a permissions bypass. */
+    r.wp=(c->model==B86_CPU_386)?0u:1u;
     r.read32=b86_x87_pm_read_pte; r.opaque=c;
     if (!b86_x87_pg_rights(&r,linear,write,physical)) {
         if (!c->pf_pending) {
@@ -250,15 +285,15 @@ static void b86_x87_pm_tx_invalidate(void *opaque,uint32_t linear,
 {
     B86X87PmMem *ctx=(B86X87PmMem *)opaque;
     B86Cpu *c=ctx->cpu;
-    /* The existing 8086 codemap is bounded by B86_MEM_BYTES.  Invalidate
-     * both address spaces when representable, and conservatively purge PJ
-     * even if a physical alias is mapped at a different linear address. */
+    /* Keep existing 8086 codemap invalidation and linear PJ SMC checks.
+     * Stage4U additionally checks the exact physical translated-code set,
+     * so a non-code x87 data store does not throw out the native cache. */
     if(linear < B86_MEM_BYTES && size <= B86_MEM_BYTES-linear)
         smc(c,linear,size);
     if(physical != linear && physical < B86_MEM_BYTES &&
        size <= B86_MEM_BYTES-physical)smc(c,physical,size);
 #if defined(B86_PJ) && B86_PJ
-    b86_x87_pg_force_pj_flush(c);
+    b86_x87_pg_note_pj_store(c,physical,size);
 #endif
 }
 #endif
@@ -275,7 +310,7 @@ static int b86_x87_pm_wr(void *opaque,uint32_t addr,const uint8_t *src,unsigned 
     B86X87PmMem *ctx=(B86X87PmMem *)opaque;
     unsigned i;
     if(!ctx || !ctx->cpu || !src || addr!=ctx->address || size!=ctx->width)return -1;
-#if B86_X87_PG_WRITES_TRIAL
+#if B86_X87_PG_WRITES_TRIAL || B86_X87_PG_CW_STORE
     if(ctx->cpu->pg){
         B86X87Tx tx;
         if(b86_x87_tx_prepare(&tx,ctx,addr,size,
@@ -294,9 +329,21 @@ static int b86_x87_pm_wr(void *opaque,uint32_t addr,const uint8_t *src,unsigned 
     smc(ctx->cpu,addr,size);
     return 0;
 }
+/* Stage4T: approved scalar stores use the prevalidated 2-span atomic
+ * paged transaction (not unrestricted trial writes).  Only operand forms
+ * implemented by x87_memory3b/x87_store3d may be admitted here. */
+static int b86_x87_pg_scalar_store_ok(unsigned op,unsigned m,unsigned n){
+    unsigned sub=(m>>3)&7u;
+    if(m>=0xC0u)return 0;
+    if(op==0xD9u)return ((sub==2u||sub==3u)&&n==4u)||(sub==7u&&n==2u);
+    if(op==0xDBu)return ((sub==1u||sub==2u||sub==3u)&&n==4u)||(sub==7u&&n==10u);
+    if(op==0xDDu)return ((sub==1u||sub==2u||sub==3u)&&n==8u)||(sub==7u&&n==2u);
+    if(op==0xDFu)return ((sub==1u||sub==2u||sub==3u)&&n==2u)||(sub==7u&&n==8u);
+    return 0;
+}
 /* ip points at ModR/M. Caller has already fetched the x87 opcode. */
 static int b86_x87_pm_mem(B86Cpu *c,uint32_t start,unsigned op,unsigned m,
-                           unsigned ad32,uint32_t *ip)
+                           unsigned ad32,uint32_t *ip,unsigned *why)
 {
     B86PM6EA ea;
     B86X87MemPlan plan;
@@ -307,14 +354,17 @@ static int b86_x87_pm_mem(B86Cpu *c,uint32_t start,unsigned op,unsigned m,
     uint8_t b;
     unsigned seg=B86_DS;
     int override=0;
-    if(!b86_x87_mem_plan(op,m,&plan))return B86_X87_DEC_UNSUPPORTED;
+    if(!b86_x87_mem_plan(op,m,&plan)){*why=4u;return B86_X87_DEC_UNSUPPORTED;}
 #if !B86_X87_PG_WRITES_TRIAL
-    if(c->pg && plan.write)return B86_X87_DEC_UNSUPPORTED;
+    /* Narrow compatibility step: FNSTCW m16 is the first Descent store.
+     * It uses the Stage4I all-pages-before-write transaction below. */
+    if(c->pg && plan.write && !b86_x87_pg_scalar_store_ok(op,m,plan.size)){
+        *why=5u;return B86_X87_DEC_UNSUPPORTED;}
 #endif
     /* Address decoding already does instruction-fetch preflight for ModR/M,
        SIB and displacement. Input ip is after ModR/M, rewind one byte. */
     for(;;){
-        if(!b86_pm4_byte(c,&scan,start,&b))return B86_X87_DEC_UNSUPPORTED;
+        if(!b86_pm4_byte(c,&scan,start,&b)){*why=6u;return B86_X87_DEC_UNSUPPORTED;}
         switch(b){
         case 0x26u:seg=B86_ES;override=1;break;
         case 0x2eu:seg=B86_CS;override=1;break;
@@ -323,27 +373,27 @@ static int b86_x87_pm_mem(B86Cpu *c,uint32_t start,unsigned op,unsigned m,
         case 0x64u:seg=B86_FS;override=1;break;
         case 0x65u:seg=B86_GS;override=1;break;
         case 0x66u:case 0x67u:break;
-        default:if(b==op)goto x87_opcode_found;return B86_X87_DEC_UNSUPPORTED;
+        default:if(b==op)goto x87_opcode_found;*why=6u;return B86_X87_DEC_UNSUPPORTED;
         }
     }
 x87_opcode_found:
     /* scan is immediately after the opcode; ModR/M starts here. */
     operand = scan;
-    if(!b86_pm6_ea(c,&operand,start,(int)ad32,&ea) || ea.is_reg)
-        return B86_X87_DEC_UNSUPPORTED;
+    if(!b86_pm6_ea(c,&operand,start,(int)ad32,&ea) || ea.is_reg){
+        *why=7u;return B86_X87_DEC_UNSUPPORTED;}
     if(override)ea.seg=seg;
     if(b86_pm2_check_access(c,ea.seg,ea.off,plan.size,
-         plan.write?B86_PM1_WRITE:B86_PM1_READ,&linear,&fault)!=B86_PM2_OK)
-        return B86_X87_DEC_UNSUPPORTED;
-    if(linear>UINT32_MAX-(plan.size-1u))return B86_X87_DEC_UNSUPPORTED;
-    if(!b86_x87_pm_rights(c,linear,plan.size,plan.write))
-        return B86_X87_DEC_UNSUPPORTED;
-    if(!b86_x87_pm_page_preflight(c,linear,plan.size,plan.write))
-        return B86_X87_DEC_UNSUPPORTED;
+         plan.write?B86_PM1_WRITE:B86_PM1_READ,&linear,&fault)!=B86_PM2_OK){
+        *why=8u;return B86_X87_DEC_UNSUPPORTED;}
+    if(linear>UINT32_MAX-(plan.size-1u)){*why=9u;return B86_X87_DEC_UNSUPPORTED;}
+    if(!b86_x87_pm_rights(c,linear,plan.size,plan.write)){
+        *why=10u;return B86_X87_DEC_UNSUPPORTED;}
+    if(!b86_x87_pm_page_preflight(c,linear,plan.size,plan.write)){
+        *why=11u;return B86_X87_DEC_UNSUPPORTED;}
     ctx.cpu=c;ctx.address=linear;ctx.width=plan.size;
     memory.opaque=&ctx;memory.read=b86_x87_pm_rd;memory.write=b86_x87_pm_wr;
-    if(b86_x87_exec_mem3d(&c->x87,op,m,linear,&memory)!=B86_X87_OK)
-        return B86_X87_DEC_UNSUPPORTED;
+    if(b86_x87_exec_mem3d(&c->x87,op,m,linear,&memory)!=B86_X87_OK){
+        *why=12u;return B86_X87_DEC_UNSUPPORTED;}
     *ip=operand;
     return B86_X87_OK;
 }
@@ -370,12 +420,25 @@ B86_PM23_FLASH int b86_pm23_esc(B86Cpu *c)
     }
     if (op < 0xD8u || op > 0xDFu) return -1;
     if (c->msw & 4u) return b86_pm26_interrupt(c, 7u, start);
-    if (!b86_pm4_byte(c, &ip, start, &m)) return B86_UNSUPPORTED;
+    if (!b86_pm4_byte(c, &ip, start, &m)) {
+#if defined(B86_X87_EXPERIMENTAL) && B86_X87_EXPERIMENTAL
+        B86_X87_DIAG(c,start,op,0xffu,13u,"modrm-fetch");
+#endif
+        return B86_UNSUPPORTED;
+    }
+#if defined(B86_X87_EXPERIMENTAL) && B86_X87_EXPERIMENTAL
+    B86_X87_DIAG(c,start,op,m,0u,"first-x87-attempt");
+#endif
     mod = m >> 6; rm = m & 7u;
     if (mod != 3u) {
         if (ad32) {
             if (rm == 4u) {
-                if (!b86_pm4_byte(c, &ip, start, &sib)) return B86_UNSUPPORTED;
+                if (!b86_pm4_byte(c, &ip, start, &sib)) {
+#if defined(B86_X87_EXPERIMENTAL) && B86_X87_EXPERIMENTAL
+                    B86_X87_DIAG(c,start,op,m,14u,"sib-fetch");
+#endif
+                    return B86_UNSUPPORTED;
+                }
                 if (mod == 0u && (sib & 7u) == 5u) disp = 4u;
             } else if (mod == 0u && rm == 5u) disp = 4u;
             if (mod == 1u) disp = 1u; else if (mod == 2u) disp = 4u;
@@ -384,17 +447,47 @@ B86_PM23_FLASH int b86_pm23_esc(B86Cpu *c)
             else if (mod == 1u) disp = 1u; else if (mod == 2u) disp = 2u;
         }
         for (i = 0; i < disp; ++i)
-            if (!b86_pm4_byte(c, &ip, start, &b)) return B86_UNSUPPORTED;
+            if (!b86_pm4_byte(c, &ip, start, &b)) {
+#if defined(B86_X87_EXPERIMENTAL) && B86_X87_EXPERIMENTAL
+                B86_X87_DIAG(c,start,op,m,15u,"displacement-fetch");
+#endif
+                return B86_UNSUPPORTED;
+            }
     }
 #if defined(B86_X87_EXPERIMENTAL) && B86_X87_EXPERIMENTAL
     /* Stage4B: strict opt-in. Decoder must commit FPU state before EIP moves.
        Unsupported memory ops/special arithmetic never silently skip. */
     if (mod == 3u) {
-        if (b86_x87_exec_reg(&c->x87, op, m) != B86_X87_OK)
+        /* FNSTSW AX (DF E0): the x87 status word is copied to guest AX.
+         * Preserve EAX[31:16] in 32-bit PM and leave FPU state untouched.
+         * This non-waiting opcode does not access guest memory. */
+        if(op==0xDFu && m==0xE0u) {
+            uint16_t sw;
+            if(b86_x87_fnstsw_ax(&c->x87,op,m,&sw)!=B86_X87_OK)
+                return B86_UNSUPPORTED;
+            c->r[B86_AX]=(c->r[B86_AX]&0xFFFF0000u)|(uint32_t)sw;
+        } else if (b86_x87_exec_reg(&c->x87, op, m) != B86_X87_OK) {
+            B86_X87_DIAG(c,start,op,m,2u,"register-unsupported");
             return B86_UNSUPPORTED;
+        }
+        B86_X87_DIAG(c,start,op,m,1u,"register-ok");
     } else {
-        if (b86_x87_pm_mem(c, start, op, m, ad32, &ip) != B86_X87_OK)
+        unsigned why=12u;
+        if (b86_x87_pm_mem(c, start, op, m, ad32, &ip, &why) != B86_X87_OK) {
+#if defined(B86_X87_TRACE_FIRST_REJECT) && B86_X87_TRACE_FIRST_REJECT
+            static const char *const reasons[]={
+                "none","reg-ok","reg-unsupported","mem-ok","mem-plan",
+                "paged-store-disabled","opcode-rescan","effective-address",
+                "segment-access","linear-wrap","paging-rights",
+                "page-backing","mem-exec"
+            };
+            B86_X87_DIAG(c,start,op,m,why,why<13u?reasons[why]:"unknown");
+#else
+            (void)why;
+#endif
             return B86_UNSUPPORTED;
+        }
+        B86_X87_DIAG(c,start,op,m,3u,"memory-ok");
     }
 #endif
     c->ip = ip; ++c->icount;
