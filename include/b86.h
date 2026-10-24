@@ -9,6 +9,9 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#if defined(B86_X87_EXPERIMENTAL) && B86_X87_EXPERIMENTAL
+#include "x87_state.h"
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -217,6 +220,9 @@ typedef struct B86Cpu {
     void *pj;
     uintptr_t pj_exit;      /* r70: address after the static exit a block left by (0: none) */
     uint32_t pj_stop;       /* r70: nonzero stops block chaining (code page written) */
+#if defined(B86_X87_EXPERIMENTAL) && B86_X87_EXPERIMENTAL
+    B86X87 x87; /* Stage4B: experimental register-only PM x87 state */
+#endif
 } B86Cpu;
 
 /* r65: translate through the guest page tables (interp.c). */

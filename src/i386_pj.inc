@@ -192,6 +192,19 @@ static void pj_patch_b(uint8_t *at, uint8_t *to)
 /* ---- runtime helpers called from native code --------------------------- */
 #define PJ_PGH(pg) ((((uint32_t)(pg)) * 0x9E3779B1u) >> 20)   /* 4096-bit hashed page filter */
 static B86Pj *b86_pj_state(const B86Cpu *c) { return (B86Pj *)c->pj; }
+/* Stage4I trial-only: arbitrary paged stores may alias translated code.
+ * Force conservative PJ cache invalidation on the next native entry.
+ * This function is reached only from the C interpreter after a completed
+ * x87 store. Never allow a pending flush to leak into normal builds. */
+#if defined(B86_X87_EXPERIMENTAL) && B86_X87_EXPERIMENTAL && \
+    defined(B86_X87_PG_WRITES_TRIAL) && B86_X87_PG_WRITES_TRIAL
+static void b86_x87_pg_force_pj_flush(B86Cpu *c)
+{
+    B86Pj *j=b86_pj_state(c);
+    if(j){j->flush_pending=1;c->pj_stop=1u;}
+}
+#endif
+
 static int pj_cps_has(const B86Pj *j, uint32_t pg)
 {
     uint32_t i = (pg * 0x9E3779B1u) & (B86_PJ_CPS - 1u), k;

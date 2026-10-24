@@ -4,6 +4,11 @@
  * read-back/latch PIT, channel 1/2, wall-clock scheduling or VM86.
  */
 #include "b86_pm23.h"
+#if defined(B86_X87_EXPERIMENTAL) && B86_X87_EXPERIMENTAL
+#include "x87_decode3a.h"
+#include "x87_store3d.h"
+#include "x87_pm_mem_plan.h"
+#endif
 #ifndef B86_PM23_FLASH
 #define B86_PM23_FLASH __attribute__((noinline,cold,section(".text.bb386_flash")))
 #endif
@@ -110,6 +115,239 @@ B86_PM23_FLASH int b86_pm23_poll(B86Cpu *cpu,B86Pm23Hw *h,unsigned *vector)
  * x87 emulator owns vector 7 through the IDT. Fault frame: EIP of the first
  * prefix byte, no error code. Defined in PM26. */
 static int b86_pm26_interrupt(B86Cpu *c, unsigned vec, uint32_t return_ip);
+#if defined(B86_X87_EXPERIMENTAL) && B86_X87_EXPERIMENTAL
+/* Strict Stage4B: paging and unhandled memory forms stay unsupported. */
+/* Stage4H opt-in paging rights check: full operand preflight before x87
+ * register state or guest data changes.  Does not mutate the global TLB. */
+#include "x87_pg_rights.h"
+#ifndef B86_X87_PG_WRITES_TRIAL
+#define B86_X87_PG_WRITES_TRIAL 0
+#endif
+#if B86_X87_PG_WRITES_TRIAL
+#include "x87_pg_tx.h"
+#if defined(B86_PJ) && B86_PJ
+static void b86_x87_pg_force_pj_flush(B86Cpu *c);
+#endif
+#endif
+static int b86_x87_pm_read_pte(void *opaque,uint32_t physical,uint32_t *value)
+{
+    B86Cpu *c=(B86Cpu *)opaque;
+    if (!c || !value || physical > B86_RAM_BYTES ||
+        B86_RAM_BYTES - physical < 4u) return 0;
+    *value=b86_pg_rd32(c,physical);
+    return 1;
+}
+static int b86_x87_pm_rights(B86Cpu *c,uint32_t linear,
+                             unsigned size,unsigned write)
+{
+    B86X87PgRights r;
+    uint32_t last,at,physical;
+    if (!c || !size || linear > UINT32_MAX-(size-1u)) return 0;
+    if (!c->pg) return 1;
+    memset(&r,0,sizeof r);
+    r.cr3=c->cr3;r.ram_bytes=B86_RAM_BYTES;
+    r.cpl=(unsigned)(c->seg[B86_CS]&3u);
+    /* The current 386 CPU model mirrors CR0 lower bits in msw.
+       WP is CR0 bit 16; do NOT guess it from the 16-bit MSW.
+       Refuse writes under paging until CR0.WP representation is verified. */
+    r.wp=
+#if B86_X87_PG_WRITES_TRIAL
+        write ? 1u : 0u; /* conservative: reject supervisor RO stores */
+#else
+        0u;
+#endif
+    r.read32=b86_x87_pm_read_pte;r.opaque=c;
+    last=linear+size-1u;
+    at=linear;
+    for (;;) {
+        uint32_t end=(at&0xfffff000u)|0xfffu;
+        if(!b86_x87_pg_rights(&r,at,write,&physical)) {
+            if(!c->pf_pending) {
+                c->pf_pending=1u;
+                c->pf_lin=r.fault_linear;
+                c->pf_err=r.fault_error;
+            }
+            return 0;
+        }
+        if(last<=end) break;
+        at=end+1u;
+    }
+    return 1;
+}
+/* x87 Stage4D: guest-paging range preflight.  Does NOT repair the core
+ * paging engine's missing permission enforcement or A/D-bit semantics. */
+static int b86_x87_pm_page_preflight(B86Cpu *c, uint32_t linear,
+                                     unsigned size, unsigned write)
+{
+    uint32_t last, at, phys;
+    if (!c->pg) return 1;
+    if (!size || linear > UINT32_MAX - (size - 1u)) return 0;
+    last = linear + size - 1u;
+    /* b86_pg_probe records the FIRST #PF and b86_step delivers it. */
+    if (!b86_pg_probe(c, linear, size, write)) return 0;
+    at = linear;
+    for (;;) {
+        uint32_t end = (at & 0xfffff000u) + 0xfffu;
+        uint32_t chunk = (last < end ? last : end) - at;
+        if (!b86_pg_walk(c, at, &phys)) {
+            b86_pg_fault(c, at, write);
+            return 0;
+        }
+        if (phys >= B86_RAM_BYTES || chunk >= B86_RAM_BYTES - phys)
+            return 0; /* Out-of-RAM frames: refuse, never write sink. */
+        if (last <= end) break;
+        at = end + 1u;
+    }
+    return 1;
+}
+static uint8_t *b86_x87_pm_ptr(B86Cpu *c,uint32_t linear)
+{
+    uint32_t phys;
+    if (!c->pg) return b86_host(c, linear);
+    if (!b86_pg_walk(c, linear, &phys) || phys >= B86_RAM_BYTES)
+        return (uint8_t *)0;
+    return b86_host_phys(c, phys);
+}
+
+typedef struct B86X87PmMem { B86Cpu *cpu; uint32_t address; unsigned width; } B86X87PmMem;
+#if B86_X87_PG_WRITES_TRIAL
+/* Trial-only: revalidate the complete store against live PDE/PTE before
+ * touching backing RAM. One instruction is serialized within b86_step().
+ * WP=1 is deliberately conservative because CR0.WP is not represented
+ * in the 16-bit MSW here: supervisor writes to read-only pages decline.
+ */
+static int b86_x87_pm_tx_resolve(void *opaque,uint32_t linear,
+                                 unsigned write,uint32_t *physical)
+{
+    B86X87PmMem *ctx=(B86X87PmMem *)opaque;
+    B86X87PgRights r;
+    B86Cpu *c;
+    if (!ctx || !physical || !(c=ctx->cpu) || !c->pg) return 0;
+    memset(&r,0,sizeof r);
+    r.cr3=c->cr3; r.ram_bytes=B86_RAM_BYTES;
+    r.cpl=(unsigned)(c->seg[B86_CS]&3u);
+    r.wp=1u; /* safe conservative behavior */
+    r.read32=b86_x87_pm_read_pte; r.opaque=c;
+    if (!b86_x87_pg_rights(&r,linear,write,physical)) {
+        if (!c->pf_pending) {
+            c->pf_pending=1u;
+            c->pf_lin=r.fault_linear;
+            c->pf_err=r.fault_error;
+        }
+        return 0;
+    }
+    return 1;
+}
+static uint8_t *b86_x87_pm_tx_map(void *opaque,uint32_t physical,unsigned size)
+{
+    B86X87PmMem *ctx=(B86X87PmMem *)opaque;
+    if(!ctx || !ctx->cpu || !size || physical >= B86_RAM_BYTES ||
+       size > B86_RAM_BYTES-physical)return (uint8_t *)0;
+    return b86_host_phys(ctx->cpu,physical);
+}
+static void b86_x87_pm_tx_invalidate(void *opaque,uint32_t linear,
+                                      uint32_t physical,unsigned size)
+{
+    B86X87PmMem *ctx=(B86X87PmMem *)opaque;
+    B86Cpu *c=ctx->cpu;
+    /* The existing 8086 codemap is bounded by B86_MEM_BYTES.  Invalidate
+     * both address spaces when representable, and conservatively purge PJ
+     * even if a physical alias is mapped at a different linear address. */
+    if(linear < B86_MEM_BYTES && size <= B86_MEM_BYTES-linear)
+        smc(c,linear,size);
+    if(physical != linear && physical < B86_MEM_BYTES &&
+       size <= B86_MEM_BYTES-physical)smc(c,physical,size);
+#if defined(B86_PJ) && B86_PJ
+    b86_x87_pg_force_pj_flush(c);
+#endif
+}
+#endif
+static int b86_x87_pm_rd(void *opaque,uint32_t addr,uint8_t *dst,unsigned size)
+{
+    B86X87PmMem *ctx=(B86X87PmMem *)opaque;
+    unsigned i;
+    if(!ctx || addr!=ctx->address || size!=ctx->width)return -1;
+    for(i=0;i<size;i++){uint8_t *p=b86_x87_pm_ptr(ctx->cpu,addr+i);if(!p)return -1;dst[i]=*p;}
+    return 0;
+}
+static int b86_x87_pm_wr(void *opaque,uint32_t addr,const uint8_t *src,unsigned size)
+{
+    B86X87PmMem *ctx=(B86X87PmMem *)opaque;
+    unsigned i;
+    if(!ctx || !ctx->cpu || !src || addr!=ctx->address || size!=ctx->width)return -1;
+#if B86_X87_PG_WRITES_TRIAL
+    if(ctx->cpu->pg){
+        B86X87Tx tx;
+        if(b86_x87_tx_prepare(&tx,ctx,addr,size,
+                             b86_x87_pm_tx_resolve,b86_x87_pm_tx_map))return -1;
+        return b86_x87_tx_write(&tx,ctx,src,b86_x87_pm_tx_map,
+                                b86_x87_pm_tx_invalidate);
+    }
+#else
+    if(ctx->cpu->pg)return -1;
+#endif
+    for(i=0;i<size;i++){
+        uint8_t *p=b86_x87_pm_ptr(ctx->cpu,addr+i);
+        if(!p)return -1; /* caller preflights complete range */
+        *p=src[i];
+    }
+    smc(ctx->cpu,addr,size);
+    return 0;
+}
+/* ip points at ModR/M. Caller has already fetched the x87 opcode. */
+static int b86_x87_pm_mem(B86Cpu *c,uint32_t start,unsigned op,unsigned m,
+                           unsigned ad32,uint32_t *ip)
+{
+    B86PM6EA ea;
+    B86X87MemPlan plan;
+    B86PM2Fault fault;
+    B86X87PmMem ctx;
+    B86X87Memory memory;
+    uint32_t operand=start, linear, scan=start;
+    uint8_t b;
+    unsigned seg=B86_DS;
+    int override=0;
+    if(!b86_x87_mem_plan(op,m,&plan))return B86_X87_DEC_UNSUPPORTED;
+#if !B86_X87_PG_WRITES_TRIAL
+    if(c->pg && plan.write)return B86_X87_DEC_UNSUPPORTED;
+#endif
+    /* Address decoding already does instruction-fetch preflight for ModR/M,
+       SIB and displacement. Input ip is after ModR/M, rewind one byte. */
+    for(;;){
+        if(!b86_pm4_byte(c,&scan,start,&b))return B86_X87_DEC_UNSUPPORTED;
+        switch(b){
+        case 0x26u:seg=B86_ES;override=1;break;
+        case 0x2eu:seg=B86_CS;override=1;break;
+        case 0x36u:seg=B86_SS;override=1;break;
+        case 0x3eu:seg=B86_DS;override=1;break;
+        case 0x64u:seg=B86_FS;override=1;break;
+        case 0x65u:seg=B86_GS;override=1;break;
+        case 0x66u:case 0x67u:break;
+        default:if(b==op)goto x87_opcode_found;return B86_X87_DEC_UNSUPPORTED;
+        }
+    }
+x87_opcode_found:
+    /* scan is immediately after the opcode; ModR/M starts here. */
+    operand = scan;
+    if(!b86_pm6_ea(c,&operand,start,(int)ad32,&ea) || ea.is_reg)
+        return B86_X87_DEC_UNSUPPORTED;
+    if(override)ea.seg=seg;
+    if(b86_pm2_check_access(c,ea.seg,ea.off,plan.size,
+         plan.write?B86_PM1_WRITE:B86_PM1_READ,&linear,&fault)!=B86_PM2_OK)
+        return B86_X87_DEC_UNSUPPORTED;
+    if(linear>UINT32_MAX-(plan.size-1u))return B86_X87_DEC_UNSUPPORTED;
+    if(!b86_x87_pm_rights(c,linear,plan.size,plan.write))
+        return B86_X87_DEC_UNSUPPORTED;
+    if(!b86_x87_pm_page_preflight(c,linear,plan.size,plan.write))
+        return B86_X87_DEC_UNSUPPORTED;
+    ctx.cpu=c;ctx.address=linear;ctx.width=plan.size;
+    memory.opaque=&ctx;memory.read=b86_x87_pm_rd;memory.write=b86_x87_pm_wr;
+    if(b86_x87_exec_mem3d(&c->x87,op,m,linear,&memory)!=B86_X87_OK)
+        return B86_X87_DEC_UNSUPPORTED;
+    *ip=operand;
+    return B86_X87_OK;
+}
+#endif
 B86_PM23_FLASH int b86_pm23_esc(B86Cpu *c)
 {
     uint32_t ip, start;
@@ -148,6 +386,17 @@ B86_PM23_FLASH int b86_pm23_esc(B86Cpu *c)
         for (i = 0; i < disp; ++i)
             if (!b86_pm4_byte(c, &ip, start, &b)) return B86_UNSUPPORTED;
     }
+#if defined(B86_X87_EXPERIMENTAL) && B86_X87_EXPERIMENTAL
+    /* Stage4B: strict opt-in. Decoder must commit FPU state before EIP moves.
+       Unsupported memory ops/special arithmetic never silently skip. */
+    if (mod == 3u) {
+        if (b86_x87_exec_reg(&c->x87, op, m) != B86_X87_OK)
+            return B86_UNSUPPORTED;
+    } else {
+        if (b86_x87_pm_mem(c, start, op, m, ad32, &ip) != B86_X87_OK)
+            return B86_UNSUPPORTED;
+    }
+#endif
     c->ip = ip; ++c->icount;
     return B86_OK;
 }

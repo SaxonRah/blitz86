@@ -66,6 +66,9 @@ B86_HOT void b86_set_seg(B86Cpu *c, int s, uint16_t v)
 B86_HOT void b86_init(B86Cpu *c, uint8_t *mem)
 {
     memset(c, 0, sizeof *c);
+#if defined(B86_X87_EXPERIMENTAL) && B86_X87_EXPERIMENTAL
+    b86_x87_init(&c->x87);
+#endif
     c->mem = mem;
     c->amask = 0x1FFFFFu;
     c->flags = 0xF002u;
