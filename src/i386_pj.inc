@@ -41,6 +41,15 @@
 #define B86_PJ_COLD __attribute__((noinline,cold))
 #endif
 
+/* BB_PJ_PM16_REG_TIER_V1: deliberately conservative nonflat 16-bit CS tier.
+ * No native guest data/stack references or in-mode chain links. */
+#ifndef BB_PJ_PM16_REG_TIER
+#define BB_PJ_PM16_REG_TIER 1
+/* BB_PJ_PM16_ADAPTIVE_V1: guarded PM16 admission; disabled = no behavior change. */
+#ifndef BB_PJ_PM16_ADAPTIVE
+#define BB_PJ_PM16_ADAPTIVE 1
+#endif
+#endif
 typedef struct B86Pj {
     uint8_t *code;
     uint32_t cap, used;
@@ -52,14 +61,29 @@ typedef struct B86Pj {
     uint8_t *tail_z, *tail, *dyn, *chk, *entry, *memtramp;   /* shared code at the start of the buffer */
     unsigned long blocks, flushes, runs, insns, exits_mem, declines, fallback;
     unsigned long stop_op[256];         /* which opcode ended blocks           */
-    /* BB_PJ_ES_INDEPENDENT_V1: 0=uninitialized, 1=flat ES, 2=nonflat ES.
-     * Tiny counters replace the previous full fallback-site profiler. */
+    /* BB_PJ_ES_STABLE_CACHE_V1: cache is safe in either ES state;
+     * ES-dependent instructions are checked in emitted code at runtime. */
     unsigned es_mode;
-    unsigned long es_mode_flushes, es_relaxed_entries, es_guarded_ops;
+    unsigned long es_mode_switches, es_relaxed_entries, es_guarded_ops;
+    /* Refused guest EIPs, stored as EIP+1. Rejection is only consulted
+     * while ES is non-flat; a stale entry can only force safe C fallback.
+     * 64x4-byte direct mapped sites fit the existing 8 KiB PJ state arena. */
+    uint32_t es_skip_eip[64];
+    unsigned long es_skip_checks, es_skip_hits, es_skip_marks;
     /* BB_PJ_TLB_0F_V1: sampled only at genuine translation failures. */
     unsigned long stop_0f[256];
     unsigned long prof_mem_calls, prof_mem_paged, prof_tlb_hits, prof_walks;
     unsigned long prof_mem_refused, prof_mem_cross, prof_mem_bounds, prof_mem_writes;
+#if BB_PJ_PM16_REG_TIER
+    uint32_t pm16_active, pm16_base, pm16_limit, pm16_kind;
+#endif
+/* BB_PJ_PM16_NEGCACHE_V1: not reset by b86_pj_flush().
+     * Inexact/stale negative hits only deopt to C; no native execution. */
+    unsigned long pm16_neg_hits, pm16_neg_inserts;
+#if BB_PJ_PM16_ADAPTIVE
+    uint32_t pm16_adapt_calls, pm16_adapt_insns, pm16_adapt_cooldown;
+    uint32_t pm16_adapt_skips, pm16_adapt_triggers;
+#endif
     int flush_pending;
     /* BB_PJ_REPNE_EFFICIENCY_V1: separate yield vs mapped-memory refusal. */
     unsigned long repne_calls, repne_completed, repne_budget_yields;
@@ -67,6 +91,15 @@ typedef struct B86Pj {
 } B86Pj;
 
 unsigned long b86_pj_stat_runs, b86_pj_stat_insns;
+
+/* BB_PJ_ES_SKIP_ASSOC_V1: A/B mode controls only the ES refusal-site
+ * lookup policy; both policies occupy the same 64-word state array. */
+#ifndef B86_PJ_ES_SKIP_WAYS
+#define B86_PJ_ES_SKIP_WAYS 2
+#endif
+#if B86_PJ_ES_SKIP_WAYS != 1 && B86_PJ_ES_SKIP_WAYS != 2
+#error B86_PJ_ES_SKIP_WAYS must be either 1 or 2
+#endif
 
 /* ---- Thumb-2 emitter ----------------------------------------------------- */
 typedef struct { uint8_t *p, *end; int bad; } PjE;
@@ -201,21 +234,50 @@ unsigned long b86_pj_vfy_checked, b86_pj_vfy_bad;
  * original pg_walk on TLB misses, with the same page/fault/store ordering.
  * Mode 0 profiles the existing page walker for a controlled A/B test. */
 #define BB_PJ_TLB_MODE 1
+/* B86_PJ_MEMSTATS_LEAN_V1: hot memory statistics are diagnostic only.
+ * Mode 0 keeps all physical/virtual memory, paging, SMC and write behavior;
+ * only profiling-counter increments disappear at compile time.
+ * Mode 1 retains byte-for-byte original helper statements. */
+#ifndef BB_PJ_MEMSTATS
+#define BB_PJ_MEMSTATS 0
+#endif
+/* B86_PJ_READ_TLB_LEAN_V1: optional single-pass read TLB fast path.
+ * The only shortcut is a read (no write/other flags), size 1/2/4, fully
+ * contained within an already translated page, with a valid existing TLB
+ * entry. The original checked helper remains the fallback for everything
+ * else. The TLB hit uses exactly the same cached phys calculation and RAM
+ * bounds rule as the original b86_pj_mem() path. */
+#ifndef BB_PJ_READ_TLB_LEAN
+#define BB_PJ_READ_TLB_LEAN 1
+#endif
 static B86_PM_HOT uint8_t *b86_pj_mem(B86Cpu *c, uint32_t lin, uint32_t sw)
 {
     const uint32_t size = sw & 0xFFu;
     B86Pj *j = b86_pj_state(c);
+#if BB_PJ_READ_TLB_LEAN
+    if ((sw & ~0xFFu) == 0u && c->pg &&
+        (size == 1u || size == 2u || size == 4u) &&
+        (lin & 0xFFFu) + size <= 0x1000u) {
+        const unsigned slot = (lin >> 12) & 63u;
+        const uint32_t tag = (lin & 0xFFFFF000u) | 1u;
+        if (c->tlb_tag[slot] == tag) {
+            const uint32_t phys = c->tlb_phys[slot] | (lin & 0xFFFu);
+            if (phys > B86_RAM_BYTES - size) return NULL;
+            return b86_host_phys(c, phys);
+        }
+    }
+#endif
     uint32_t phys;
-    if (j) ++j->prof_mem_calls;
+    if (BB_PJ_MEMSTATS && j) ++j->prof_mem_calls;
     if ((lin & 0xFFFu) + size > 0x1000u) {
-        if (j) ++j->prof_mem_cross;
+        if (BB_PJ_MEMSTATS && j) ++j->prof_mem_cross;
         return NULL;
     }
     if (c->pg) {
         const unsigned slot = (lin >> 12) & 63u;
         const uint32_t tag = (lin & 0xFFFFF000u) | 1u;
         const int hit = c->tlb_tag[slot] == tag;
-        if (j) {
+        if (BB_PJ_MEMSTATS && j) {
             ++j->prof_mem_paged;
             if (hit) ++j->prof_tlb_hits;
             else ++j->prof_walks;
@@ -223,22 +285,22 @@ static B86_PM_HOT uint8_t *b86_pj_mem(B86Cpu *c, uint32_t lin, uint32_t sw)
 #if BB_PJ_TLB_MODE
         if (hit) phys = c->tlb_phys[slot] | (lin & 0xFFFu);
         else if (!b86_pg_walk(c, lin, &phys)) {
-            if (j) ++j->prof_mem_refused;
+            if (BB_PJ_MEMSTATS && j) ++j->prof_mem_refused;
             return NULL;
         }
 #else
         if (!b86_pg_walk(c, lin, &phys)) {
-            if (j) ++j->prof_mem_refused;
+            if (BB_PJ_MEMSTATS && j) ++j->prof_mem_refused;
             return NULL;
         }
 #endif
     } else phys = lin;
     if (phys > B86_RAM_BYTES - size) {
-        if (j) { ++j->prof_mem_refused; ++j->prof_mem_bounds; }
+        if (BB_PJ_MEMSTATS && j) { ++j->prof_mem_refused; ++j->prof_mem_bounds; }
         return NULL;
     }
     if (sw & 0x100u) {
-        if (j) ++j->prof_mem_writes;
+        if (BB_PJ_MEMSTATS && j) ++j->prof_mem_writes;
         b86_pj_note_store(c, lin, size);
         smc(c, lin, size);
     }
@@ -247,6 +309,39 @@ static B86_PM_HOT uint8_t *b86_pj_mem(B86Cpu *c, uint32_t lin, uint32_t sw)
 #endif
     return b86_host_phys(c, phys);
 }
+/* B86_PJ_ES8_TLB_FAST_V1: the 26 8A native helper may reuse a
+ * read-mapped page already validated by the 386 paging TLB. This avoids
+ * b86_pm2_check_access -> b86_pg_probe -> b86_pg_walk on a TLB hit;
+ * b86_pj_mem remains responsible for actual physical-bounds validation.
+ * Only readable, present, expand-UP data segments with in-range offsets
+ * use the shortcut. Every other descriptor and every TLB miss retains the
+ * original checked path (including fault/exception behavior). */
+#ifndef BB_PJ_ES8_TLB_FAST
+#define BB_PJ_ES8_TLB_FAST 1
+#endif
+static B86_PM_HOT uint8_t *b86_pj_es_mov8_ptr(B86Cpu *c, uint32_t off)
+{
+#if BB_PJ_ES8_TLB_FAST
+    const B86PM1Cache *s = &c->pm386.seg[B86_ES];
+    if (c->model == B86_CPU_386 && c->pg && s->valid &&
+        (s->access & 0x90u) == 0x90u &&
+        (s->access & 0x0Cu) == 0u &&
+        off <= s->limit && off <= UINT32_MAX - s->base) {
+        const uint32_t at = s->base + off;
+        const unsigned slot = (at >> 12) & 63u;
+        if (c->tlb_tag[slot] == ((at & 0xFFFFF000u) | 1u))
+            return b86_pj_mem(c, at, 1u);
+    }
+#endif
+    {
+        B86PM2Fault fault;
+        uint32_t linear = 0u;
+        if (b86_pm2_check_access(c, B86_ES, off, 1u, B86_PM1_READ,
+                                &linear, &fault) != B86_PM2_OK) return NULL;
+        return b86_pj_mem(c, linear, 1u);
+    }
+}
+
 /* DIV/IDIV: dividend hi:lo, divisor d (width w, signed sgn); quotient and
  * remainder in b86_pj_divres. 0 = #DE (the interpreter raises it). */
 uint32_t b86_pj_divres[2];
@@ -530,6 +625,11 @@ static B86_PM_HOT uint32_t b86_pj_shiftd_imm(B86Cpu *c, uint32_t dst,
     const uint32_t mask = w == 2u ? 0xFFFFu : UINT32_MAX;
     const uint32_t sign = 1u << (bits - 1u);
     uint32_t result, cf, oldflags;
+    /* 0F A5/AD with CL masked to zero retires without changing flags.
+     * Only register operands use this dynamic-count native form; no memory
+     * access or side effects occur when the count is zero. The old immediate
+     * translation never calls this helper with a zero count. */
+    if (!count) return dst;
     /* Materialize flags left by any preceding translated instruction before
      * changing the subset defined by this instruction. */
     b86_flags_materialize(c);
@@ -569,6 +669,9 @@ typedef struct {
 } PjT;
 
 #define CREG R12                                  /* B86Cpu pointer, reloaded after calls */
+/* Runtime guard lives after the segment classifier; translator sees this
+ * declaration even though the helper is defined lower in the source. */
+static uint32_t b86_pj_es_runtime_check(B86Cpu *c, uint32_t eip);
 static void pjt_c(PjT *t) { if (!t->creg_ok) { pj_ldst(&t->e, PJ_LDR, CREG, SP, 0u); t->creg_ok = 1; } }
 static void pjt_call(PjT *t, const void *fn) { pj_call(&t->e, fn); t->creg_ok = 0; }
 static void pjt_exit(PjT *t, uint32_t ip, unsigned n, int dyn)
@@ -844,7 +947,7 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
     PjM m;
     PjOp o;
     uint32_t op, imm, op2;
-    unsigned o16 = 0u, w, np = 0u, repz = 0u, repne = 0u, segpref = 0u;
+    unsigned o16 = 0u, w, np = 0u, repz = 0u, repne = 0u, segpref = 0u, es_override = 0u;
     const unsigned start = t->pos, nex0 = t->nex;
     uint8_t *const e0 = t->e.p;
     const int lk0 = t->last_kind, ik0 = t->ikind_clear, cr0 = t->creg_ok;
@@ -856,11 +959,9 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
         if (!pjt_u8(t, &op) || ++np > 4u) PJ_FAIL();
         if (op == 0x66u) { o16 = 1u; continue; }
         if (op == 0x3Eu || op == 0x36u || op == 0x2Eu || op == 0x26u) {
-            /* Flat CS/SS/DS overrides remain valid. ES overrides do not. */
-            if (op == 0x26u && ((B86Pj *)t->c->pj)->es_mode == 2u) {
-                ++((B86Pj *)t->c->pj)->es_guarded_ops;
-                PJ_FAIL();
-            }
+            /* 26h uses ES. Its validity is checked in generated Thumb-2
+             * when the instruction executes, not when it is translated. */
+            if (op == 0x26u) es_override = 1u;
             segpref = 1u; continue;
         }
         if (op == 0xF3u) { repz = 1u; continue; }
@@ -868,16 +969,40 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
         break;
     }
     w = o16 ? 2u : 4u;
-    /* ES is implicit in MOVS, STOS, CMPS and SCAS. Even without a 26h
-     * prefix, native helpers assume ES.base=0. LODS is DS-only and safe.
-     * Native MOV Sreg,reg may change segment state: keep it on the checked
-     * interpreter path in the relaxed mode, including DS and ES forms. */
-    if (((B86Pj *)t->c->pj)->es_mode == 2u &&
-        (op == 0xA4u || op == 0xA5u || op == 0xAAu || op == 0xABu ||
-         op == 0xA6u || op == 0xA7u || op == 0xAEu || op == 0xAFu ||
-         op == 0x8Eu)) {
-        ++((B86Pj *)t->c->pj)->es_guarded_ops;
-        PJ_FAIL();
+    /* BB_PJ_ES_MOV8_V1: exactly one 26h prefix and MOV r8,ES:[r/m].
+     * Offset R1 is already calculated by the standard 32-bit ModRM decoder.
+     * A checked C helper returns the mapped byte pointer; on failure, exit
+     * BEFORE updating the destination and retry through the interpreter.
+     * No ES-mode-dependent code or cache invalidation is required. */
+    if (es_override && op == 0x8Au && np == 2u && !repz) {
+        if (!pjt_modrm(t, &m)) PJ_FAIL();
+        if (m.mod == 3u) { /* the override is ignored for register sources */
+            pjt_get8(t, R1, m.rm);
+            pjt_put8(t, m.reg, R1);
+            return 1;
+        }
+        pjt_c(t);
+        pj_mov(&t->e, R0, CREG); /* R1 still holds the effective offset */
+        pjt_call(t, (const void *)b86_pj_es_mov8_ptr);
+        pj_dpi(&t->e, 13u, 1, PC, R0, 0u); /* CMP pointer, #0 */
+        pjt_exit_stay(t, 0 /* EQ */, t->ip0, t->ninsn - 1u);
+        pj_ldst(&t->e, PJ_LDRB, R1, R0, 0u);
+        pjt_put8(t, m.reg, R1);  /* AL/CL/DL/BL and AH/CH/DH/BH */
+        return 1;
+    }
+    /* Same cached Thumb-2 is correct in both ES modes. The guest ES
+     * descriptor is rechecked BEFORE any ES-dependent side effects.
+     * 8E segment loads use their existing checked helper and force a C
+     * boundary; linked blocks cannot silently change DS/SS semantics. */
+    if (es_override || op == 0xA4u || op == 0xA5u ||
+        op == 0xAAu || op == 0xABu || op == 0xA6u || op == 0xA7u ||
+        op == 0xAEu || op == 0xAFu) {
+        pjt_c(t);
+        pj_mov(&t->e, R0, CREG);
+        pj_imm32(&t->e, R1, t->ip0); /* exact denied guest instruction */
+        pjt_call(t, (const void *)b86_pj_es_runtime_check);
+        pj_dpi(&t->e, 13u, 1, PC, R0, 0u); /* CHECK result, preserve x86 flags */
+        pjt_exit_stay(t, 0 /* EQ */, t->ip0, t->ninsn - 1u);
     }
     if (repz && op != 0xA4u && op != 0xA5u && op != 0xAAu && op != 0xABu &&
         !(repne && (op == 0xA6u || op == 0xA7u || op == 0xAEu || op == 0xAFu))) PJ_FAIL();
@@ -1415,6 +1540,57 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
             pj_dpi(&t->e, 13u, 0, GR(4), GR(4), 4u);
             return 1;
         }
+        /* BB_PJ_CL_SHIFTD_REG_V1: SHLD/SHRD r32,r32,CL (0F A5/AD).
+         * No ES access, no guest memory, no 16-bit undefined-count range.
+         * Preserve the interpreter for 16-bit and memory operands. CL is
+         * sampled from live ECX BEFORE the destination register is written.
+         * The existing PM27-equivalent helper handles counts 1..31 and flags;
+         * a masked zero count is a no-op. */
+        if (op2 == 0xA5u || op2 == 0xADu) {
+            PjOp sh;
+            if (repz || o16 || !pjt_modrm(t, &m) || m.mod != 3u) PJ_FAIL();
+            pjt_rm_load(t, &m, 4u, 1, R1, &sh);
+            pjt_getr(t, R2, m.reg, 4u);
+            pjt_c(t);
+            pj_imm32(&t->e, R3, (4u << 8) |
+                     ((op2 == 0xA5u) ? (1u << 16) : 0u));
+            pj_ubfx(&t->e, R0, GR(1), 0u, 5u); /* ECX[4:0] */
+            pj_dpr(&t->e, 2u, 0, R3, R3, R0, 0u, 0u); /* ORR desc,CL */
+            pj_mov(&t->e, R0, CREG);
+            pjt_call(t, (const void *)b86_pj_shiftd_imm);
+            pj_mov(&t->e, R1, R0);
+            pjt_rm_store(t, &sh, 4u, R1);
+            t->last_kind = -1; t->ikind_clear = 1;
+            return 1;
+        }
+        /* BB_PJ_NATIVE_POP_FSGS_V1: validated 32-bit stack POP FS/GS.
+         * 0F A1 / 0F A9: the existing pointer trampoline checks paging and
+         * boundaries, and b86_pj_loadseg validates/commits the selector.
+         * The guest ESP changes only after BOTH checks succeed. A refused
+         * selector or memory access replays the untouched instruction in C.
+         * Unlike POP DS/ES, FS/GS do not affect the native flat ES contract,
+         * so a successful POP continues in this block (no dispatcher exit).
+         * 66h, segment override and REP forms stay with the interpreter. */
+#ifndef BB_PJ_NATIVE_POP_FSGS
+#define BB_PJ_NATIVE_POP_FSGS 1
+#endif
+#if BB_PJ_NATIVE_POP_FSGS
+        if (op2 == 0xA1u || op2 == 0xA9u) {
+            const unsigned sr = op2 == 0xA1u ? B86_FS : B86_GS;
+            if (np != 1u || o16 || segpref || repz) PJ_FAIL();
+            pj_mov(&t->e, R1, GR(4));           /* linear SS:ESP, no ESP update */
+            pjt_mem(t, 4u, 0);                   /* checked read, retry on fault */
+            pj_ldst(&t->e, PJ_LDRH, R2, R0, 0u); /* selector = low 16 bits */
+            pjt_c(t);
+            pj_mov(&t->e, R0, CREG);
+            pj_movw(&t->e, R1, sr);
+            pjt_call(t, (const void *)b86_pj_loadseg);
+            pj_dpi(&t->e, 13u, 1, PC, R0, 0u);
+            pjt_exit_stay(t, 0 /* EQ */, t->ip0, t->ninsn - 1u);
+            pj_dpi(&t->e, 8u, 0, GR(4), GR(4), 4u);
+            return 1;
+        }
+#endif
         if (op2 >= 0x80u && op2 <= 0x8Fu) {
             if (o16 || !pjt_u32(t, &imm)) PJ_FAIL();
             pjt_jcc(t, op2 & 15u, PJ_NEXT() + imm, PJ_NEXT());
@@ -1546,11 +1722,90 @@ static B86_PJ_COLD void pj_emit_shared(B86Pj *j)
         pje16(&t->e, 0x4700u | (LR << 3));                  /* BX lr */
         pj_patch_b(f1, j->tail_z); pj_patch_b(f2, j->tail_z);
     }
-    /* memtramp: r1 = linear, r2 = size|write<<8, lr -> {eip, retired} literal */
+    /* BB_PJ_SHARED_MEMTRAMP_FAST: one native read-TLB fast path per JIT,
+     * NOT one per translated instruction. R1=linear, R2=size|write<<8,
+     * LR addresses the two caller literal words (EIP and retired).
+     * Preserve R1 and R2 for the exact original C slow path. No writes
+     * take the fast path; all guest writes retain SMC protection.
+     * [sp+4] and [sp+16] belong to callers; never use them as scratch.
+     * Fail closed for unusual widths, paging off, crossings, TLB misses,
+     * and out-of-RAM addresses. No new B86Cpu/B86Pj fields. */
+#ifndef BB_PJ_SHARED_MEMTRAMP_FAST
+#define BB_PJ_SHARED_MEMTRAMP_FAST 0
+#endif
     j->memtramp = t->e.p;
     {
         uint8_t *fail;
         pj_ldst(&t->e, PJ_STR, LR, SP, 12u);
+#if BB_PJ_SHARED_MEMTRAMP_FAST
+        {
+            uint8_t *miss[10];
+            unsigned nm = 0u, i;
+#if defined(B86_PAGED) && B86_RAM_BYTES > B86_MEM_BYTES
+            uint8_t *skip_delta;
+#endif
+            /* Scratch: R0,R3,R12,LR only. R1 and R2 must survive a miss;
+             * LR is saved at [sp+12]. R4-R11 are guest registers. */
+            pj_ldst(&t->e, PJ_LDR, CREG, SP, 0u);
+            pj_ldst(&t->e, PJ_LDRB, R0, CREG, (unsigned)offsetof(B86Cpu, pg));
+            pj_dpi(&t->e, 13u, 1, PC, R0, 0u);
+            miss[nm++] = pj_b(&t->e, 0 /* EQ: paging disabled */);
+            pj_dpi(&t->e, 13u, 1, PC, R2, 1u);
+            miss[nm++] = pj_b(&t->e, 3 /* LO: invalid size */);
+            pj_dpi(&t->e, 13u, 1, PC, R2, 4u);
+            miss[nm++] = pj_b(&t->e, 8 /* HI: write/invalid size */);
+            pj_dpi(&t->e, 13u, 1, PC, R2, 3u);
+            miss[nm++] = pj_b(&t->e, 0 /* EQ: invalid size */);
+            pj_ubfx(&t->e, R0, R1, 0u, 12u);
+            pj_dpr(&t->e, 8u, 0, R0, R0, R2, 0u, 0u);
+            pj_dpi(&t->e, 13u, 1, PC, R0, 4096u);
+            miss[nm++] = pj_b(&t->e, 8 /* HI: page crossing */);
+            pj_ubfx(&t->e, R3, R1, 12u, 6u);
+            pj_shift(&t->e, LR, R1, 1u, 12u);
+            pj_shift(&t->e, LR, LR, 0u, 12u);
+            pj_dpi(&t->e, 2u, 0, LR, LR, 1u);
+            pjt_addimm(t, R0, CREG, (uint32_t)offsetof(B86Cpu, tlb_tag));
+            pje32(&t->e, 0xF850u | R0, (R0 << 12) | (2u << 4) | R3);
+            pj_dpr(&t->e, 13u, 1, PC, R0, LR, 0u, 0u);
+            miss[nm++] = pj_b(&t->e, 1 /* NE: TLB miss */);
+            pjt_addimm(t, R0, CREG, (uint32_t)offsetof(B86Cpu, tlb_phys));
+            pje32(&t->e, 0xF850u | R0, (R0 << 12) | (2u << 4) | R3);
+            pj_ubfx(&t->e, R3, R1, 0u, 12u);
+            pj_dpr(&t->e, 2u, 0, R0, R0, R3, 0u, 0u);
+            /* phys <= B86_RAM_BYTES - size avoids arithmetic wraparound. */
+            pj_imm32(&t->e, LR, B86_RAM_BYTES);
+            pj_dpr(&t->e, 13u, 0, LR, LR, R2, 0u, 0u);
+            pj_dpr(&t->e, 13u, 1, PC, R0, LR, 0u, 0u);
+            miss[nm++] = pj_b(&t->e, 8 /* HI: beyond guest RAM */);
+#if defined(B86_PAGED) && B86_RAM_BYTES > B86_MEM_BYTES
+            pj_mov(&t->e, R3, R0); /* preserve phys for low-window test */
+#endif
+            pj_ldst(&t->e, PJ_LDR, LR, CREG, (unsigned)offsetof(B86Cpu, mem));
+            pj_dpr(&t->e, 8u, 0, R0, R0, LR, 0u, 0u);
+#ifdef B86_PAGED
+#if B86_RAM_BYTES > B86_MEM_BYTES
+            pj_imm32(&t->e, LR, B86_MEM_BYTES);
+            pj_dpr(&t->e, 13u, 1, PC, R3, LR, 0u, 0u);
+            skip_delta = pj_b(&t->e, 2 /* HS: extended RAM is unmapped */);
+#endif
+            pj_ubfx(&t->e, R3, R0, 12u, 9u);
+            pj_ldst(&t->e, PJ_LDR, LR, CREG, (unsigned)offsetof(B86Cpu, pt));
+            pj_dpr(&t->e, 8u, 0, LR, LR, R3, 0u, 2u);
+            pj_ldst(&t->e, PJ_LDR, LR, LR, 0u);
+            pj_dpr(&t->e, 8u, 0, R0, R0, LR, 0u, 0u);
+#if B86_RAM_BYTES > B86_MEM_BYTES
+            pj_patch_b(skip_delta, t->e.p);
+#endif
+#endif
+            /* Return directly after the two literal words at the callsite. */
+            pj_ldst(&t->e, PJ_LDR, LR, SP, 12u);
+            pj_dpi(&t->e, 8u, 0, LR, LR, 8u);
+            pje16(&t->e, 0x4700u | (LR << 3));
+            pje16(&t->e, 0xBF00u);
+            /* Every rejected access resumes the unmodified C slow path. */
+            for (i = 0u; i < nm; ++i) pj_patch_b(miss[i], t->e.p);
+        }
+#endif
         pj_ldst(&t->e, PJ_LDR, R0, SP, 0u);
         pj_call(&t->e, (const void *)b86_pj_mem);
         pj_ldst(&t->e, PJ_LDR, LR, SP, 12u);
@@ -1623,6 +1878,7 @@ static B86_PJ_COLD void b86_pj_flush(B86Cpu *c)
     memset(j->ent, 0, sizeof j->ent);
     memset(j->cpg, 0, sizeof j->cpg);
     memset(j->cps, 0, sizeof j->cps);
+    memset(j->es_skip_eip, 0, sizeof j->es_skip_eip);
     j->used = 0u;
     j->flush_pending = 0;
     c->pj_stop = 0u;
@@ -1646,6 +1902,462 @@ static B86_PJ_COLD unsigned pj_fetch(B86Cpu *c, uint32_t eip, uint8_t *buf, unsi
     return n;
 }
 
+/* BB_PJ_PM16_MOVREAD_V1: only checked MOV r8/r16, [16-bit EA]. */
+#ifndef BB_PJ_PM16_MOV_READ
+#define BB_PJ_PM16_MOV_READ 1
+#endif
+/* BB_PJ_PM16_PERF_GATE_V1: identical firmware except PM16 admission gate. */
+#define BB_PJ_PM16_PERF_GATE 0
+/* BB_PJ_PM16_TRUTHDIAG_V1: read-only counters; DEBUG BUILD ONLY. */
+#ifndef BB_PJ_PM16_TRUTHDIAG
+#define BB_PJ_PM16_TRUTHDIAG 1
+#endif
+#if BB_PJ_PM16_TRUTHDIAG
+#include <stdio.h>
+static struct {
+    uint32_t emit_attempt, emit_ok, emit_fail;
+    uint32_t pref66, pref66_mov, pref66_stack, pref66_0f, pref66_other;
+    uint32_t read_attempt, read_success, write_attempt, write_success;
+} bb_pm16_diag;
+#define BB_PM16_DIAG_INC(field) (++bb_pm16_diag.field)
+#else
+#define BB_PM16_DIAG_INC(field) ((void)0)
+#endif
+/* BB_PJ_PM16_OP66REG_V1: operand-override register-only PM16 tier.
+ * No memory, stack, segment, control transfer or further prefixes. */
+#ifndef BB_PJ_PM16_OP66REG
+#define BB_PJ_PM16_OP66REG 1
+#endif
+/* BB_PJ_PM16_MOVSTORE_V1: checked PM16 MOV memory stores only. */
+#ifndef BB_PJ_PM16_MOV_WRITE
+#define BB_PJ_PM16_MOV_WRITE 1
+#endif
+#if BB_PJ_PM16_REG_TIER
+#if BB_PJ_PM16_MOV_WRITE
+/* Checked store: segment checks and physical translation BEFORE any write.
+ * No expand-down, byte/word crossing, unaligned word, code segment, or
+ * address wrapping. Unsupported but legal cases deopt to the interpreter.
+ * Always exit the native block after a successful store to honor SMC stop. */
+static B86_PM_HOT uint32_t b86_pj_pm16_write(B86Cpu *c, uint32_t off,
+                                               uint32_t desc, uint32_t value)
+{
+    const unsigned seg = (desc >> 8) & 7u, width = desc & 0xFFu;
+    const B86PM1Cache *s;
+    uint64_t linear;
+    uint8_t *p;
+    BB_PM16_DIAG_INC(write_attempt);
+    if ((width != 1u && width != 2u) || (seg != B86_DS && seg != B86_SS) ||
+        off > 0xFFFFu) return 0u;
+    s = &c->pm386.seg[seg];
+    /* S=1, data=1, writable=1, expand-up=1. Avoid descriptor subtleties
+     * not covered by the existing conservative MOV-read tier. */
+    if (!s->valid || s->reserved || (s->access & 0x1Au) != 0x12u ||
+        (s->access & 0x04u) || off > s->limit ||
+        (uint32_t)(width - 1u) > s->limit - off) return 0u;
+    linear = (uint64_t)s->base + (uint64_t)off;
+    if (linear + width - 1u > UINT32_MAX) return 0u;
+    if (width == 2u && (linear & 1u)) return 0u;
+    p = b86_pj_mem(c, (uint32_t)linear, width | 0x100u);
+    if (!p) return 0u;
+    p[0] = (uint8_t)value;
+    if (width == 2u) p[1] = (uint8_t)(value >> 8);
+    BB_PM16_DIAG_INC(write_success);
+    return 1u;
+}
+#endif /* BB_PJ_PM16_MOV_WRITE */
+
+#if BB_PJ_PM16_MOV_READ
+/* Checked segment-aware read pointer. All failures deopt BEFORE changing
+ * the destination GPR; the interpreter owns descriptor exceptions/page faults.
+ * This tier only handles expand-up readable DATA, not code or expand-down. */
+static B86_PM_HOT uint8_t *b86_pj_pm16_read_ptr(B86Cpu *c,
+                                                   uint32_t off, uint32_t desc)
+{
+    const unsigned seg = (desc >> 8) & 7u, width = desc & 0xFFu;
+    const B86PM1Cache *s;
+    uint64_t linear;
+    BB_PM16_DIAG_INC(read_attempt);
+    if ((width != 1u && width != 2u) || (seg != B86_DS && seg != B86_SS) ||
+        off > 0xFFFFu) return NULL;
+    s = &c->pm386.seg[seg];
+    if (!s->valid || s->reserved || (s->access & 0x1Au) != 0x12u ||
+        (s->access & 0x04u) || off > s->limit ||
+        (uint32_t)(width - 1u) > s->limit - off) return NULL;
+    linear = (uint64_t)s->base + (uint64_t)off;
+    if (linear + width - 1u > UINT32_MAX) return NULL;
+    /* Never require unaligned halfword semantics of the Cortex-M33: the
+     * interpreter handles these valid but less common x86 reads. */
+    if (width == 2u && (linear & 1u)) return NULL;
+    uint8_t *p = b86_pj_mem(c, (uint32_t)linear, width);
+    if (p) BB_PM16_DIAG_INC(read_success);
+    return p;
+}
+#endif /* BB_PJ_PM16_MOV_READ */
+
+/* 16-bit protected-mode fetch with CS.base and CS.limit enforced BEFORE
+ * translating. Refuse near wrap/limit boundaries rather than guess at a
+ * partially fetched 16-bit instruction. All accesses use the checked fetch. */
+static B86_PJ_COLD unsigned pj_fetch_pm16(B86Cpu *c, uint32_t eip,
+                                            uint8_t *bytes, unsigned max)
+{
+    const B86PM1Cache *cs = &c->pm386.seg[B86_CS];
+    const uint64_t lin = (uint64_t)cs->base + eip;
+    uint32_t n = max;
+    if (eip > 0xFFFFu || eip > cs->limit || lin > UINT32_MAX) return 0u;
+    if (n > 0x10000u - eip) n = 0x10000u - eip;
+    if (cs->limit - eip < n - 1u) n = cs->limit - eip + 1u;
+    if ((uint64_t)n > (uint64_t)UINT32_MAX - lin + 1u)
+        n = (unsigned)((uint64_t)UINT32_MAX - lin + 1u);
+    return pj_fetch(c, (uint32_t)lin, bytes, n);
+}
+
+/* Only simple 16-bit register operations and relative control transfers.
+ * No 66/67, segment override, LOCK/REP, stack or memory form is accepted.
+ * The checked interpreter handles everything else. */
+static B86_PJ_COLD int pjt_insn_pm16(PjT *t)
+{
+    uint32_t op, modrm, imm;
+    const unsigned start = t->pos, ex0 = t->nex;
+    uint8_t *const p0 = t->e.p;
+    const int lk0 = t->last_kind, ik0 = t->ikind_clear, cr0 = t->creg_ok;
+    const unsigned base_ip = t->ip0;
+    unsigned w, alu, form, a, b;
+#define PJ16_FAIL() do { BB_PM16_DIAG_INC(emit_fail); t->pos=start; --t->ninsn; t->nex=ex0; \
+    t->e.p=p0; t->last_kind=lk0; t->ikind_clear=ik0; t->creg_ok=cr0; return 0; } while(0)
+#define PJ16_NEXT() ((base_ip + (t->pos - start)) & 0xFFFFu)
+    BB_PM16_DIAG_INC(emit_attempt);
+    ++t->ninsn;
+    if (!pjt_u8(t, &op)) PJ16_FAIL();
+    /* Count the opcode AFTER 66; these are decoder translation attempts,
+     * NOT executed-instruction counts. Keep separate from runtime helpers. */
+    if (op == 0x66u) {
+        const unsigned x = t->pos < t->n ? t->b[t->pos] : 0xFFu;
+        BB_PM16_DIAG_INC(pref66);
+        if (x >= 0x88u && x <= 0x8Bu) BB_PM16_DIAG_INC(pref66_mov);
+        else if (x >= 0x50u && x <= 0x5Fu) BB_PM16_DIAG_INC(pref66_stack);
+        else if (x == 0x0Fu) BB_PM16_DIAG_INC(pref66_0f);
+        else BB_PM16_DIAG_INC(pref66_other);
+    }
+
+#if BB_PJ_PM16_OP66REG
+    /* In 16-bit code, 66 changes operand size to 32. This opt-in path
+     * accepts only forms with ModRM.mod=3 (registers), or imm32 to GPR.
+     * On any decoding failure PJ16_FAIL completely discards emitted code. */
+    if (op == 0x66u) {
+        uint32_t op66, mr, imm66;
+        unsigned a66, b66, alu66, form66;
+        if (!pjt_u8(t, &op66)) PJ16_FAIL();
+        if (op66 == 0x90u) do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0); /* XCHG EAX,EAX */
+        if (op66 >= 0xB8u && op66 <= 0xBFu) {
+            if (!pjt_imm(t, 4u, &imm66)) PJ16_FAIL();
+            pj_imm32(&t->e, R1, imm66);
+            pjt_putr(t, op66 & 7u, 4u, R1);
+            do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0);
+        }
+        if (op66 >= 0x40u && op66 <= 0x4Fu) {
+            pjt_getr(t, R2, op66 & 7u, 4u);
+            if (op66 < 0x48u) pj_dpi(&t->e, 8u, 0, R3, R2, 1u);
+            else pj_dpi(&t->e, 13u, 0, R3, R2, 1u);
+            pjt_putr(t, op66 & 7u, 4u, R3);
+            pjt_lazy(t, op66 < 0x48u ? pj_k_inc[4] : pj_k_dec[4], R2, R3);
+            do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0);
+        }
+        if (op66 >= 0x91u && op66 <= 0x97u) {
+            pjt_getr(t, R1, 0u, 4u);
+            pjt_getr(t, R2, op66 & 7u, 4u);
+            pjt_putr(t, 0u, 4u, R2);
+            pjt_putr(t, op66 & 7u, 4u, R1);
+            do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0);
+        }
+        if (op66 == 0x89u || op66 == 0x8Bu) {
+            if (!pjt_u8(t, &mr) || (mr >> 6) != 3u) PJ16_FAIL();
+            a66 = (mr >> 3) & 7u; b66 = mr & 7u;
+            if (op66 == 0x8Bu) {
+                pjt_getr(t, R1, b66, 4u); pjt_putr(t, a66, 4u, R1);
+            } else {
+                pjt_getr(t, R1, a66, 4u); pjt_putr(t, b66, 4u, R1);
+            }
+            do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0);
+        }
+        if (op66 < 0x40u && ((op66 & 7u) == 1u || (op66 & 7u) == 3u)) {
+            alu66 = op66 >> 3; form66 = op66 & 7u;
+            if (alu66 != 0u && alu66 != 1u && alu66 != 4u &&
+                alu66 != 5u && alu66 != 6u && alu66 != 7u) PJ16_FAIL();
+            if (!pjt_u8(t, &mr) || (mr >> 6) != 3u) PJ16_FAIL();
+            a66 = (mr >> 3) & 7u; b66 = mr & 7u;
+            if (form66 == 3u) {
+                pjt_getr(t, R0, a66, 4u); pjt_getr(t, R1, b66, 4u);
+                if (!pjt_alu(t, alu66, 4u, alu66 == 7u ? R3 : R0, R0, R1)) PJ16_FAIL();
+                if (alu66 != 7u) pjt_putr(t, a66, 4u, R0);
+            } else {
+                pjt_getr(t, R1, b66, 4u); pjt_getr(t, R0, a66, 4u);
+                if (!pjt_alu(t, alu66, 4u, alu66 == 7u ? R3 : R1, R1, R0)) PJ16_FAIL();
+                if (alu66 != 7u) pjt_putr(t, b66, 4u, R1);
+            }
+            do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0);
+        }
+        if (op66 == 0x81u || op66 == 0x83u) {
+            if (!pjt_u8(t, &mr) || (mr >> 6) != 3u) PJ16_FAIL();
+            alu66 = (mr >> 3) & 7u; b66 = mr & 7u;
+            if (alu66 != 0u && alu66 != 1u && alu66 != 4u &&
+                alu66 != 5u && alu66 != 6u && alu66 != 7u) PJ16_FAIL();
+            if (op66 == 0x83u) {
+                if (!pjt_u8(t, &imm66)) PJ16_FAIL();
+                imm66 = (uint32_t)(int32_t)(int8_t)imm66;
+            } else if (!pjt_imm(t, 4u, &imm66)) PJ16_FAIL();
+            pjt_getr(t, R1, b66, 4u);
+            pj_imm32(&t->e, R0, imm66);
+            if (!pjt_alu(t, alu66, 4u, alu66 == 7u ? R3 : R1, R1, R0)) PJ16_FAIL();
+            if (alu66 != 7u) pjt_putr(t, b66, 4u, R1);
+            do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0);
+        }
+        if (op66 == 0x85u || op66 == 0xA9u) {
+            if (op66 == 0x85u) {
+                if (!pjt_u8(t, &mr) || (mr >> 6) != 3u) PJ16_FAIL();
+                pjt_getr(t, R1, mr & 7u, 4u);
+                pjt_getr(t, R0, (mr >> 3) & 7u, 4u);
+            } else {
+                if (!pjt_imm(t, 4u, &imm66)) PJ16_FAIL();
+                pjt_getr(t, R1, 0u, 4u);
+                pj_imm32(&t->e, R0, imm66);
+            }
+            if (!pjt_alu(t, 4u, 4u, R3, R1, R0)) PJ16_FAIL();
+            do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0);
+        }
+        if ((op66 & 7u) == 5u && op66 <= 0x3Du) {
+            alu66 = op66 >> 3;
+            if (alu66 != 0u && alu66 != 1u && alu66 != 4u &&
+                alu66 != 5u && alu66 != 6u && alu66 != 7u) PJ16_FAIL();
+            if (!pjt_imm(t, 4u, &imm66)) PJ16_FAIL();
+            pjt_getr(t, R1, 0u, 4u);
+            pj_imm32(&t->e, R0, imm66);
+            if (!pjt_alu(t, alu66, 4u, alu66 == 7u ? R3 : R1, R1, R0)) PJ16_FAIL();
+            if (alu66 != 7u) pjt_putr(t, 0u, 4u, R1);
+            do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0);
+        }
+        if (op66 == 0xC7u) { /* MOV r/m32, imm32: /0, register form only */
+            if (!pjt_u8(t, &mr) || (mr >> 6) != 3u || ((mr >> 3) & 7u)) PJ16_FAIL();
+            if (!pjt_imm(t, 4u, &imm66)) PJ16_FAIL();
+            pj_imm32(&t->e, R1, imm66); pjt_putr(t, mr & 7u, 4u, R1);
+            do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0);
+        }
+        PJ16_FAIL();
+    }
+#endif /* BB_PJ_PM16_OP66REG */
+    /* Other prefixes and unsupported 66 forms decline naturally. */
+    if (op == 0x90u) do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0); /* NOP */
+    if (op >= 0xB8u && op <= 0xBFu) {
+        if (!pjt_imm(t, 2u, &imm)) PJ16_FAIL();
+        pj_movw(&t->e, R1, imm);
+        pjt_putr(t, op & 7u, 2u, R1);
+        do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0);
+    }
+    if (op >= 0x40u && op <= 0x4Fu) {
+        pjt_getr(t, R2, op & 7u, 2u);
+        if (op < 0x48u) pj_dpi(&t->e, 8u, 0, R3, R2, 1u);
+        else pj_dpi(&t->e, 13u, 0, R3, R2, 1u);
+        pjt_putr(t, op & 7u, 2u, R3);
+        pjt_lazy(t, op < 0x48u ? pj_k_inc[2] : pj_k_dec[2], R2, R3);
+        do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0);
+    }
+    if (op >= 0x91u && op <= 0x97u) {
+        pjt_getr(t, R1, 0u, 2u);
+        pjt_getr(t, R2, op & 7u, 2u);
+        pjt_putr(t, 0u, 2u, R2);
+        pjt_putr(t, op & 7u, 2u, R1);
+        do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0);
+    }
+#if BB_PJ_PM16_MOV_WRITE
+    /* MOV [EA16],reg8/reg16 (88/89) ONLY. No prefixes, no guest stack,
+     * no DS/ES override. A refusal executes the exact old C instruction. */
+    if ((op == 0x88u || op == 0x89u) && t->pos < t->n &&
+        (t->b[t->pos] >> 6) != 3u) {
+        uint32_t bmod, disp = 0u, width = op == 0x89u ? 2u : 1u;
+        unsigned mod, rm, reg, seg, base = 255u, index = 255u;
+        if (!pjt_u8(t, &bmod)) PJ16_FAIL();
+        mod = bmod >> 6; rm = bmod & 7u; reg = (bmod >> 3) & 7u;
+        seg = ((rm == 2u || rm == 3u) || (rm == 6u && mod != 0u)) ? B86_SS : B86_DS;
+        if (mod == 0u && rm == 6u) {
+            if (!pjt_imm(t, 2u, &disp)) PJ16_FAIL();
+            pj_movw(&t->e, R1, disp);
+        } else {
+            switch (rm) {
+            case 0u: base=B86_BX; index=B86_SI; break;
+            case 1u: base=B86_BX; index=B86_DI; break;
+            case 2u: base=B86_BP; index=B86_SI; break;
+            case 3u: base=B86_BP; index=B86_DI; break;
+            case 4u: base=B86_SI; break;
+            case 5u: base=B86_DI; break;
+            case 6u: base=B86_BP; break;
+            default: base=B86_BX; break;
+            }
+            pjt_getr(t, R1, base, 2u);
+            if (index != 255u) {
+                pjt_getr(t, R2, index, 2u);
+                pj_dpr(&t->e, 8u, 0, R1, R1, R2, 0u, 0u);
+            }
+            if (mod == 1u) {
+                if (!pjt_u8(t, &disp)) PJ16_FAIL();
+                disp = (uint32_t)(int32_t)(int8_t)disp;
+            } else if (mod == 2u) {
+                if (!pjt_imm(t, 2u, &disp)) PJ16_FAIL();
+            }
+            pjt_addimm(t, R1, R1, disp);
+            pj_ubfx(&t->e, R1, R1, 0u, 16u);
+        }
+        pjt_c(t);
+        pj_mov(&t->e, R0, CREG);
+        pj_movw(&t->e, R2, width | (seg << 8));
+        pjt_getr(t, R3, reg, width);
+        pjt_call(t, (const void *)b86_pj_pm16_write);
+        pj_dpi(&t->e, 13u, 1, PC, R0, 0u); /* CMP success, #0 */
+        pjt_exit_stay(t, 0 /* EQ */, t->ip0, t->ninsn - 1u);
+        /* End the block after ANY successful write: SMC and page validity. */
+        pjt_exit(t, PJ16_NEXT(), t->ninsn, 2);
+        do { BB_PM16_DIAG_INC(emit_ok); return 2; } while (0);
+    }
+#endif /* BB_PJ_PM16_MOV_WRITE */
+#if BB_PJ_PM16_MOV_READ
+    /* MOV reg8/reg16, [EA16] ONLY (8A/8B, ModRM.mod != 3).
+     * Operand segment is resolved at execution time, not baked into code.
+     * No segment prefix, memory write, stack op, or 32-bit operand here. */
+    if ((op == 0x8Au || op == 0x8Bu) && t->pos < t->n &&
+        (t->b[t->pos] >> 6) != 3u) {
+        uint32_t bmod, disp = 0u, width = op == 0x8Bu ? 2u : 1u;
+        unsigned mod, rm, reg, seg, base = 255u, index = 255u;
+        if (!pjt_u8(t, &bmod)) PJ16_FAIL();
+        mod = bmod >> 6; rm = bmod & 7u; reg = (bmod >> 3) & 7u;
+        seg = ((rm == 2u || rm == 3u) || (rm == 6u && mod != 0u)) ? B86_SS : B86_DS;
+        if (mod == 0u && rm == 6u) {
+            if (!pjt_imm(t, 2u, &disp)) PJ16_FAIL();
+            pj_movw(&t->e, R1, disp);
+        } else {
+            switch (rm) {
+            case 0u: base=B86_BX; index=B86_SI; break;
+            case 1u: base=B86_BX; index=B86_DI; break;
+            case 2u: base=B86_BP; index=B86_SI; break;
+            case 3u: base=B86_BP; index=B86_DI; break;
+            case 4u: base=B86_SI; break;
+            case 5u: base=B86_DI; break;
+            case 6u: base=B86_BP; break;
+            default: base=B86_BX; break;
+            }
+            pjt_getr(t, R1, base, 2u);
+            if (index != 255u) {
+                pjt_getr(t, R2, index, 2u);
+                pj_dpr(&t->e, 8u, 0, R1, R1, R2, 0u, 0u);
+            }
+            if (mod == 1u) {
+                if (!pjt_u8(t, &disp)) PJ16_FAIL();
+                disp = (uint32_t)(int32_t)(int8_t)disp;
+            } else if (mod == 2u) {
+                if (!pjt_imm(t, 2u, &disp)) PJ16_FAIL();
+            }
+            pjt_addimm(t, R1, R1, disp);
+            pj_ubfx(&t->e, R1, R1, 0u, 16u);
+        }
+        pjt_c(t);
+        pj_mov(&t->e, R0, CREG);
+        pj_movw(&t->e, R2, width | (seg << 8));
+        pjt_call(t, (const void *)b86_pj_pm16_read_ptr);
+        pj_dpi(&t->e, 13u, 1, PC, R0, 0u);  /* CMP pointer, #0 */
+        pjt_exit_stay(t, 0 /* EQ */, t->ip0, t->ninsn - 1u);
+        pjt_ld(t, R1, R0, width);
+        pjt_putr(t, reg, width, R1);
+        do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0);
+    }
+#endif /* BB_PJ_PM16_MOV_READ */
+    /* Exact register-only MOV (including 8-bit AH/BH etc). */
+    if (op >= 0x88u && op <= 0x8Bu) {
+        if (!pjt_u8(t, &modrm) || (modrm >> 6) != 3u) PJ16_FAIL();
+        w = (op & 1u) ? 2u : 1u;
+        a = (modrm >> 3) & 7u; b = modrm & 7u;
+        if (op & 2u) { pjt_getr(t, R1, b, w); pjt_putr(t, a, w, R1); }
+        else { pjt_getr(t, R1, a, w); pjt_putr(t, b, w, R1); }
+        do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0);
+    }
+    /* ADD/OR/AND/SUB/XOR/CMP r8/r16, r8/r16: ModRM.mod=3 only. */
+    if (op < 0x40u && (op & 7u) < 4u) {
+        alu = op >> 3; form = op & 7u;
+        if (alu != 0u && alu != 1u && alu != 4u &&
+            alu != 5u && alu != 6u && alu != 7u) PJ16_FAIL();
+        if (!pjt_u8(t, &modrm) || (modrm >> 6) != 3u) PJ16_FAIL();
+        w = (form & 1u) ? 2u : 1u;
+        a = (modrm >> 3) & 7u; b = modrm & 7u;
+        if (form & 2u) { /* reg <- reg op r/m */
+            pjt_getr(t, R0, a, w); pjt_getr(t, R1, b, w);
+            if (!pjt_alu(t, alu, w, alu == 7u ? R3 : R0, R0, R1)) PJ16_FAIL();
+            if (alu != 7u) pjt_putr(t, a, w, R0);
+        } else { /* r/m <- r/m op reg */
+            pjt_getr(t, R1, b, w); pjt_getr(t, R0, a, w);
+            if (!pjt_alu(t, alu, w, alu == 7u ? R3 : R1, R1, R0)) PJ16_FAIL();
+            if (alu != 7u) pjt_putr(t, b, w, R1);
+        }
+        do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0);
+    }
+    if (op == 0x80u || op == 0x81u || op == 0x83u) {
+        if (!pjt_u8(t, &modrm) || (modrm >> 6) != 3u) PJ16_FAIL();
+        alu = (modrm >> 3) & 7u; b = modrm & 7u;
+        if (alu != 0u && alu != 1u && alu != 4u &&
+            alu != 5u && alu != 6u && alu != 7u) PJ16_FAIL();
+        w = op == 0x80u ? 1u : 2u;
+        if (op == 0x83u) {
+            if (!pjt_u8(t, &imm)) PJ16_FAIL();
+            imm = (uint32_t)(int32_t)(int8_t)imm;
+        } else if (!pjt_imm(t, w, &imm)) PJ16_FAIL();
+        pjt_getr(t, R1, b, w);
+        pj_imm32(&t->e, R0, imm);
+        if (!pjt_alu(t, alu, w, alu == 7u ? R3 : R1, R1, R0)) PJ16_FAIL();
+        if (alu != 7u) pjt_putr(t, b, w, R1);
+        do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0);
+    }
+    if (op == 0x84u || op == 0x85u) {
+        if (!pjt_u8(t, &modrm) || (modrm >> 6) != 3u) PJ16_FAIL();
+        w = (op & 1u) ? 2u : 1u;
+        pjt_getr(t, R1, modrm & 7u, w);
+        pjt_getr(t, R0, (modrm >> 3) & 7u, w);
+        if (!pjt_alu(t, 4u, w, R3, R1, R0)) PJ16_FAIL();
+        do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0);
+    }
+    /* All control transfers return through the unlinked C dispatcher. */
+    if (op == 0xEBu || op == 0xE9u) {
+        if (op == 0xEBu) {
+            if (!pjt_u8(t, &imm)) PJ16_FAIL();
+            imm = (uint32_t)(int32_t)(int8_t)imm;
+        } else {
+            if (!pjt_imm(t, 2u, &imm)) PJ16_FAIL();
+            imm = (uint32_t)(int32_t)(int16_t)imm;
+        }
+        pjt_exit(t, (PJ16_NEXT() + imm) & 0xFFFFu, t->ninsn, 2);
+        do { BB_PM16_DIAG_INC(emit_ok); return 2; } while (0);
+    }
+    if (op >= 0x70u && op <= 0x7Fu) {
+        int arm;
+        if (!pjt_u8(t, &imm)) PJ16_FAIL();
+        imm = (uint32_t)(int32_t)(int8_t)imm;
+        arm = pjt_flags_for(t, op & 15u);
+        pjt_exit_cond(t, arm, (PJ16_NEXT() + imm) & 0xFFFFu, t->ninsn);
+        /* dyn=2 returns unlinked and uses the specified fallthrough EIP. */
+        pjt_exit(t, PJ16_NEXT(), t->ninsn, 2);
+        do { BB_PM16_DIAG_INC(emit_ok); return 2; } while (0);
+    }
+    PJ16_FAIL();
+#undef PJ16_FAIL
+#undef PJ16_NEXT
+}
+
+/* A nonflat 16-bit code segment is eligible for the register tier even if
+ * DS, ES, SS are nonflat. No generated code accesses those segments. */
+static inline int pj_pm16_reg_ok(const B86Cpu *c)
+{
+    const B86PM1Cache *cs = &c->pm386.seg[B86_CS];
+    return (c->msw & 1u) && !(c->flags & (0x20000u | B86_TF)) &&
+           cs->valid && !cs->reserved && !(cs->flags & 4u) &&
+           (cs->access & 0x18u) == 0x18u && c->ip <= 0xFFFFu &&
+           c->ip <= cs->limit && (uint64_t)cs->base + c->ip <= UINT32_MAX;
+}
+#endif /* BB_PJ_PM16_REG_TIER */
+
 static B86_PJ_COLD uint32_t b86_pj_translate(B86Cpu *c, uint32_t eip)
 {
     B86Pj *j = b86_pj_state(c);
@@ -1665,14 +2377,24 @@ static B86_PJ_COLD uint32_t b86_pj_translate(B86Cpu *c, uint32_t eip)
     if (j->cap - j->used < 4096u) { b86_pj_flush(c); ++j->flush_full; }
     memset(&t, 0, sizeof t);
     t.c = c;
+#if BB_PJ_PM16_REG_TIER
+    t.n = j->pm16_active ? pj_fetch_pm16(c, eip, bytes, sizeof bytes)
+                          : pj_fetch(c, eip, bytes, sizeof bytes);
+#else
     t.n = pj_fetch(c, eip, bytes, sizeof bytes);
+#endif
     t.b = bytes;
     t.last_kind = -1;
     start_off = (j->used + 3u) & ~3u;
     t.e.p = j->code + start_off; t.e.end = j->code + j->cap;
     while (t.ninsn < B86_PJ_MAXI && t.pos + 16u <= t.n) {
+#if BB_PJ_PM16_REG_TIER
+        t.ip0 = j->pm16_active ? ((eip + t.pos) & 0xFFFFu) : eip + t.pos;
+        r = j->pm16_active ? pjt_insn_pm16(&t) : pjt_insn(&t);
+#else
         t.ip0 = eip + t.pos;
         r = pjt_insn(&t);
+#endif
         if (r != 1) break;
     }
     if (r == 1 || r == 0) {                       /* fall into the next instruction */
@@ -1692,14 +2414,25 @@ static B86_PJ_COLD uint32_t b86_pj_translate(B86Cpu *c, uint32_t eip)
                 break;
             }
         }
+#if BB_PJ_PM16_REG_TIER
+        pjt_exit(&t, j->pm16_active ? ((eip + t.pos) & 0xFFFFu) : eip + t.pos,
+                 t.ninsn, j->pm16_active ? 2 : 0);
+#else
         pjt_exit(&t, eip + t.pos, t.ninsn, 0);
+#endif
     }
     if (t.ninsn == 0u || t.e.bad) return 0u;
     for (i = 0; i < t.nex; ++i) pjt_stub(&t, &t.ex[i], j);
     if (t.e.bad) return 0u;
     for (i = 0; i < t.pos; i += 1u) {             /* mark code pages */
+#if BB_PJ_PM16_REG_TIER
+        const uint32_t lin = (j->pm16_active ? j->pm16_base : 0u) + eip + i;
+        const uint32_t pg = lin >> 12, h = PJ_PGH(pg);
+        if (i && pg == ((lin - 1u) >> 12)) continue;
+#else
         const uint32_t pg = (eip + i) >> 12, h = PJ_PGH(pg);
         if (i && pg == ((eip + i - 1u) >> 12)) continue;
+#endif
         j->cpg[h >> 5] |= 1u << (h & 31u);
         if (!pj_cps_add(j, pg)) { b86_pj_flush(c); return 0u; }
     }
@@ -1732,6 +2465,38 @@ static inline int pj_es_flat(const B86Cpu *c)
     return s[B86_ES].valid && s[B86_ES].base == 0u &&
            s[B86_ES].limit == UINT32_MAX &&
            (s[B86_ES].access & 0x1Au) == 0x12u;
+}
+
+/* ES-dependent instruction guard. Called from emitted Thumb-2 before
+ * the guest instruction has any side effects. Denied instruction remains
+ * at original EIP, for the checked C interpreter to execute exactly once. */
+static B86_PM_HOT uint32_t b86_pj_es_runtime_check(B86Cpu *c, uint32_t eip)
+{
+    B86Pj *j = b86_pj_state(c);
+    if (pj_es_flat(c)) return 1u;
+    if (j) {
+        ++j->es_guarded_ops;
+        /* Never record the reserved zero tag. The C instruction remains
+         * responsible for descriptor validation and all guest side effects. */
+        if (eip != UINT32_MAX) {
+#if B86_PJ_ES_SKIP_WAYS == 1
+            /* Original direct-mapped 64-site behavior; A/B control. */
+            const unsigned h = ((eip * 2654435761u) >> 26) & 63u;
+            j->es_skip_eip[h] = eip + 1u;
+#else
+            /* 32 buckets x 2 ways, MRU in slot 0; same 256-byte arena.
+             * A guard rejection has no guest-visible effects. */
+            const unsigned h = (((eip * 2654435761u) >> 27) & 31u) * 2u;
+            const uint32_t tag = eip + 1u;
+            if (j->es_skip_eip[h] != tag) {
+                j->es_skip_eip[h + 1u] = j->es_skip_eip[h];
+                j->es_skip_eip[h] = tag;
+            }
+#endif
+            ++j->es_skip_marks;
+        }
+    }
+    return 0u;
 }
 
 /* Patch the static exit the last run left by into a direct jump to the
@@ -1771,25 +2536,118 @@ static B86_PM_HOT unsigned b86_pj_try(B86Cpu *c)
     B86Pj *j = b86_pj_state(c);
     uint32_t h, ent;
     unsigned n;
-    if (!j || !pj_flat(c)) return 0u;
-    /* ES changes are visible only after a native block exits into C:
-     * native MOV ES/DS,reg exits immediately; no other compiled operation
-     * loads ES. Flush on the next entry, before any linked code is run. */
+#if BB_PJ_PM16_REG_TIER
     {
-        const unsigned mode = pj_es_flat(c) ? 1u : 2u;
-        if (j->es_mode && j->es_mode != mode) {
-            b86_pj_flush(c);
-            ++j->es_mode_flushes;
+        const unsigned flat = j && pj_flat(c);
+        const unsigned reg16 = BB_PJ_PM16_PERF_GATE && j && !flat && pj_pm16_reg_ok(c);
+        const B86PM1Cache *cs = &c->pm386.seg[B86_CS];
+        const uint32_t kind = (uint32_t)cs->selector | ((uint32_t)cs->flags << 16) |
+                              ((uint32_t)cs->access << 24);
+        if (!flat && !reg16) return 0u;
+#if BB_PJ_PM16_ADAPTIVE
+        /* Skip BEFORE the PM16 cache/mode transition, translation and
+         * potential full flush. This deoptimizes to the checked interpreter.
+         * Even if the guest changes code while skipped, no native code is
+         * entered; the next sampled entry repeats normal PJ validity checks. */
+        if (reg16 && j->pm16_adapt_cooldown) {
+            --j->pm16_adapt_cooldown;
+            ++j->pm16_adapt_skips;
+            return 0u;
         }
+#endif
+        if (reg16) {
+            if (!j->pm16_active || j->pm16_base != cs->base ||
+                j->pm16_limit != cs->limit || j->pm16_kind != kind) {
+                b86_pj_flush(c);
+                j->es_mode = 0u;
+            }
+            j->pm16_active = 1u;
+            j->pm16_base = cs->base;
+            j->pm16_limit = cs->limit;
+            j->pm16_kind = kind;
+        } else if (j->pm16_active) {
+            b86_pj_flush(c);
+            j->pm16_active = 0u;
+            j->es_mode = 0u;
+        }
+    }
+#else
+    if (!j || !pj_flat(c)) return 0u;
+#endif
+    /* No cache flush on ES transitions. EVERY compiled ES-sensitive form
+     * now emits a runtime check; linked blocks use the same guards. */
+    {
+#if BB_PJ_PM16_REG_TIER
+        const unsigned mode = j->pm16_active ? 0u : (pj_es_flat(c) ? 1u : 2u);
+#else
+        const unsigned mode = pj_es_flat(c) ? 1u : 2u;
+#endif
+        if (j->es_mode && j->es_mode != mode) ++j->es_mode_switches;
         j->es_mode = mode;
         if (mode == 2u) ++j->es_relaxed_entries;
     }
     if (j->flush_pending) { b86_pj_flush(c); ++j->flush_smc; }
+    /* After an ES-dependent instruction refuses native execution, the
+     * exact EIP is run directly in C on later non-flat ES visits. This
+     * avoids millions of zero-retirement native entry/exit roundtrips. */
+    if (j->es_mode == 2u) {
+        ++j->es_skip_checks;
+        /* The reserved tag zero is never recorded, and never matches. */
+        if (c->ip != UINT32_MAX) {
+#if B86_PJ_ES_SKIP_WAYS == 1
+            const unsigned sh = ((c->ip * 2654435761u) >> 26) & 63u;
+            if (j->es_skip_eip[sh] == c->ip + 1u) {
+                ++j->es_skip_hits;
+                return 0u;
+            }
+#else
+            const unsigned sh = (((c->ip * 2654435761u) >> 27) & 31u) * 2u;
+            const uint32_t tag = c->ip + 1u;
+            if (j->es_skip_eip[sh] == tag) {
+                ++j->es_skip_hits;
+                return 0u;
+            }
+            if (j->es_skip_eip[sh + 1u] == tag) {
+                /* Maintain MRU ordering for a two-way LRU approximation.
+                 * No invalidation or translation is performed here. */
+                j->es_skip_eip[sh + 1u] = j->es_skip_eip[sh];
+                j->es_skip_eip[sh] = tag;
+                ++j->es_skip_hits;
+                return 0u;
+            }
+#endif
+        }
+    }
     h = ((c->ip * 2654435761u) >> 16) & (B86_PJ_HASH - 1u);
     if (j->tag[h] != (c->ip | 1u)) {
+/* BB_PJ_PM16_NEGCACHE_V1: check persistent negative key only on a
+     * miss in the ordinary EIP cache. Linear keys eliminate most CS-base
+     * aliasing. A false/stale hit only runs the checked interpreter. */
+    if (j->pm16_active) {
+        const uint32_t pm16_lin = j->pm16_base + c->ip;
+        const uint32_t pm16_slot = (pm16_lin * 2654435761u) >> 23;
+        const uint32_t *const pm16_neg =
+            (const uint32_t *)(const void *)(j->code + j->cap);
+        if (pm16_neg[pm16_slot] == pm16_lin + 1u) {
+            ++j->pm16_neg_hits;
+            return 0u;
+        }
+    }
+
         j->tag[h] = c->ip | 1u;
         j->ent[h] = b86_pj_translate(c, c->ip);
         if (!j->ent[h]) ++j->declines;
+/* BB_PJ_PM16_NEGCACHE_V1: record only a failed PM16 translation.
+         * It is safe to remember this across code and descriptor changes:
+         * later hits always interpret instead of executing old native code. */
+        if (!j->ent[h] && j->pm16_active) {
+            const uint32_t pm16_lin = j->pm16_base + c->ip;
+            uint32_t *const pm16_neg =
+                (uint32_t *)(void *)(j->code + j->cap);
+            pm16_neg[(pm16_lin * 2654435761u) >> 23] = pm16_lin + 1u;
+            ++j->pm16_neg_inserts;
+        }
+
     }
     ent = j->ent[h];
     if (!ent) return 0u;
@@ -1840,6 +2698,23 @@ static B86_PM_HOT unsigned b86_pj_try(B86Cpu *c)
         }
     }
 #endif
+#if BB_PJ_PM16_ADAPTIVE
+    /* Only PM16 actual native calls contribute to the admission sample.
+     * A 64-entry window below 4 guest instructions/entry indicates that
+     * the short register-only tier is not amortizing its dispatcher costs.
+     * Probe again after 4096 interpreter entry opportunities. */
+    if (j->pm16_active) {
+        j->pm16_adapt_insns += n;
+        if (++j->pm16_adapt_calls >= 64u) {
+            if (j->pm16_adapt_insns < 256u) {
+                j->pm16_adapt_cooldown = 4096u;
+                ++j->pm16_adapt_triggers;
+            }
+            j->pm16_adapt_calls = 0u;
+            j->pm16_adapt_insns = 0u;
+        }
+    }
+#endif
     ++j->runs; j->insns += n;
     if (c->pj_exit && n && pj_flat(c)) b86_pj_link(c);
     if (!n) ++j->exits_mem;
@@ -1854,17 +2729,31 @@ void b86_pj_es_stats(const B86Cpu *c, unsigned long out[4])
     memset(out, 0, 4u * sizeof out[0]);
     if (!j) return;
     out[0] = j->es_mode;
-    out[1] = j->es_mode_flushes;
+    out[1] = j->es_mode_switches;
     out[2] = j->es_relaxed_entries;
     out[3] = j->es_guarded_ops;
 }
+/* BB_PJ_ES_GUARD_BYPASS_V1: lightweight counters; no per-frame log. */
+void b86_pj_es_skip_stats(const B86Cpu *c, unsigned long out[3])
+{
+    const B86Pj *j = c ? (const B86Pj *)c->pj : NULL;
+    memset(out, 0, 3u * sizeof out[0]);
+    if (!j) return;
+    out[0] = j->es_skip_checks;
+    out[1] = j->es_skip_hits;
+    out[2] = j->es_skip_marks;
+}
+#if defined(PICO_ON_DEVICE) && PICO_ON_DEVICE
+_Static_assert(sizeof(B86Pj) <= 8192u, "ES skip cache exceeds existing 8 KiB PJ arena");
+#endif
 size_t b86_pj_state_bytes(void) { return sizeof(B86Pj); }
 int b86_pj_attach(B86Cpu *c, void *state, size_t state_bytes, void *code, size_t code_bytes)
 {
     B86Pj *j = (B86Pj *)state;
-    if (!c || !state || state_bytes < sizeof(B86Pj) || !code || code_bytes < 16384u) return 0;
+    if (!c || !state || state_bytes < sizeof(B86Pj) || !code || code_bytes < 16384u + 512u * sizeof(uint32_t) || (((uintptr_t)code) & 3u)) return 0;
     memset(j, 0, sizeof *j);
-    j->code = (uint8_t *)code; j->cap = (uint32_t)code_bytes;
+    j->code = (uint8_t *)code; j->cap = (uint32_t)code_bytes - 512u * sizeof(uint32_t);
+    memset(j->code + j->cap, 0, 512u * sizeof(uint32_t)); /* persistent negative table, outside emitter bounds */
     c->pj = j;
     pj_emit_shared(j);
     return 1;
@@ -1915,6 +2804,24 @@ void b86_pj_mem_profile(const B86Cpu *c, unsigned long out[8])
     out[5] = j->prof_mem_cross;
     out[6] = j->prof_mem_bounds;
     out[7] = j->prof_mem_writes;
+#if BB_PJ_PM16_TRUTHDIAG
+    /* Same point as the existing [bb386-mem] dump. Read-only: no JIT state
+     * mutation, no serial traffic on translated/native hot paths. */
+    printf("[bb386-pm16diag] emit-attempt=%lu emit-ok=%lu emit-fail=%lu 66=%lu 66-mov=%lu 66-stack=%lu 66-0f=%lu 66-other=%lu read-attempt=%lu read-ok=%lu write-attempt=%lu write-ok=%lu\n",
+           (unsigned long)bb_pm16_diag.emit_attempt,
+           (unsigned long)bb_pm16_diag.emit_ok,
+           (unsigned long)bb_pm16_diag.emit_fail,
+           (unsigned long)bb_pm16_diag.pref66,
+           (unsigned long)bb_pm16_diag.pref66_mov,
+           (unsigned long)bb_pm16_diag.pref66_stack,
+           (unsigned long)bb_pm16_diag.pref66_0f,
+           (unsigned long)bb_pm16_diag.pref66_other,
+           (unsigned long)bb_pm16_diag.read_attempt,
+           (unsigned long)bb_pm16_diag.read_success,
+           (unsigned long)bb_pm16_diag.write_attempt,
+           (unsigned long)bb_pm16_diag.write_success);
+#endif
+
 }
 unsigned b86_pj_tlb_mode(void) { return BB_PJ_TLB_MODE; }
 
