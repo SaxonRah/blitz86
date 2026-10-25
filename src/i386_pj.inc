@@ -344,7 +344,10 @@ static B86_PM_HOT uint8_t *b86_pj_mem(B86Cpu *c, uint32_t lin, uint32_t sw)
     }
     if (sw & 0x100u) {
         if (BB_PJ_MEMSTATS && j) ++j->prof_mem_writes;
-        b86_pj_note_store(c, lin, size);
+        /* STAGE4Y: smc() itself calls b86_pj_note_store() under PE.
+         * The previous explicit call doubled every native-write code-page
+         * lookup. Keep the common SMC handler for both PJ and RM JIT.
+         * Installer validates the common handler before changing this file. */
         smc(c, lin, size);
     }
 #ifdef B86_PJ_VERIFY
@@ -483,6 +486,22 @@ static B86_PM_HOT uint32_t b86_pj_cond(B86Cpu *c, uint32_t cc)
     return (uint32_t)p40_cond(c->flags, cc);
 }
 
+/* BB_STAGE5I_PORT_TRACE: report full 32-bit guest EIP for actual native
+ * protected-mode PIT I/O, bounded output. Never changes port result/state. */
+extern int printf(const char *restrict, ...); /* Stage5I V2: Pico TU declaration */
+static unsigned long bb5i_pit_in_count, bb5i_pit_out_count;
+static void bb5i_pit_trace(const B86Cpu *c, uint32_t port, unsigned out)
+{
+    unsigned long *const count = out ? &bb5i_pit_out_count : &bb5i_pit_in_count;
+    if ((!out && port != 0x40u) || (out && port != 0x43u)) return;
+    ++*count;
+    if (*count <= 8u || ((*count & 65535u) == 0u))
+        printf("[bb5i-pit] io=%s total=%lu eip=%08lX base=%08lX selector=%04X pg=%u\n",
+               out ? "out43" : "in40", *count, (unsigned long)c->ip,
+               (unsigned long)c->pm386.seg[B86_CS].base,
+               (unsigned)c->seg[B86_CS], (unsigned)!!c->pg);
+}
+/* BB_STAGE5I_PORT_TRACE_END */
 /* BB_PJ_FASTIO_V1: execute common control/I-O instructions inside native PJ.
  * Privilege refusal is side-effect-free: the exit-stay path delegates to the
  * existing protected-mode interpreter for its architectural exception.
@@ -500,8 +519,21 @@ static B86_PM_HOT uint32_t b86_pj_fast_outimm8(B86Cpu *c, uint32_t port, uint32_
     /* Interpreter normally has materialized arithmetic flags by this point.
      * This also makes the flag state visible if the device hook inspects it. */
     b86_flags_materialize(c);
+    bb5i_pit_trace(c, port, 1u);
     c->out8(c, (uint16_t)port, (uint8_t)al);
     return 1u;
+}
+
+/* BB_STAGE4Z_BYTEIO: successful byte IN returns 0..255; refusal returns
+ * 256, which cannot be confused with a valid zero-byte port value.
+ * Same CPL<=IOPL and callback presence requirements as PM40's E4/EC.
+ * I/O callbacks see the synchronized guest IP/registers and flags. */
+static B86_PM_HOT uint32_t b86_pj_fast_in8(B86Cpu *c, uint32_t port)
+{
+    if (!c->in8 || (c->seg[B86_CS] & 3u) > ((c->flags >> 12) & 3u)) return 256u;
+    b86_flags_materialize(c);
+    bb5i_pit_trace(c, port, 0u);
+    return (uint32_t)c->in8(c, (uint16_t)port);
 }
 
 /* BB_PJ_LOWFRUIT_V1: hot helpers for additional 386 instructions.
@@ -547,7 +579,7 @@ static B86_PM_HOT uint32_t b86_pj_rotate1(B86Cpu *c, uint32_t a, uint32_t desc)
  * Preserve the last CMP's full flags even when yielding or declining memory.
  * Crucially this does NOT conflate a budget yield with a memory refusal. */
 #ifndef B86_PJ_REPNE_BUDGET
-#define B86_PJ_REPNE_BUDGET 256u
+#define B86_PJ_REPNE_BUDGET 1024u /* Stage5B: bounded scan, still restartable */
 #endif
 static B86_PM_HOT uint32_t b86_pj_repne_cmp(B86Cpu *c, uint32_t desc)
 {
@@ -583,6 +615,23 @@ static B86_PM_HOT uint32_t b86_pj_repne_cmp(B86Cpu *c, uint32_t desc)
          * the whole span. A crossing re-enters the checked mapper above. */
         if (!take) { refused = 1; break; }
         if (j) ++j->repne_spans;
+        /* BB_STAGE5B_REPNE_SCASB: A mapped, read-only, forward SCASB span
+         * is already validated not to cross a 4-KiB guest page. memchr
+         * identifies exactly the first equality, preserving x86 REPNE
+         * stop semantics. The final comparison alone defines EFLAGS.
+         * Reverse, CMPS, 16/32-bit, and mapping-failure cases are unchanged. */
+        if (w == 1u && !cmps && !backwards) {
+            const uint8_t target = (uint8_t)c->r[B86_AX];
+            const uint8_t *found = (const uint8_t *)memchr(dp, target, take);
+            const unsigned count = found ? (unsigned)(found - dp) + 1u : take;
+            final_a = (uint32_t)target;
+            final_b = found ? (uint32_t)*found : (uint32_t)dp[take - 1u];
+            c->r[B86_DI] += count;
+            c->r[B86_CX] -= count;
+            performed += count;
+            if (found) { equal = 1; break; }
+            continue;
+        }
         for (i = 0u; i < take; ++i) {
             const size_t offset = (size_t)i * w;
             const uint8_t *pdi = backwards ? dp - offset : dp + offset;
@@ -1205,6 +1254,41 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
         pj_dpi(&t->e, 13u, 1, PC, R0, 0u);     /* CMP result, #0 */
         pjt_exit_stay(t, 0 /* EQ */, t->ip0, t->ninsn - 1u);
         return 1;
+    /* BB_STAGE4Z_BYTEIO: byte IN AL,imm8 / IN AL,DX / OUT DX,AL.
+     * All other port widths retain the checked PM interpreter. No prefix
+     * variants are translated. The existing E6 OUT imm8,AL stays intact.
+     * In particular, do not emulate I/O privilege bitmap semantics here:
+     * CPL>IOPL refuses and falls back before calling any device hook. */
+    case 0xE4: case 0xEC: case 0xEE: {
+        const unsigned input = op != 0xEEu;
+        if (np != 1u) PJ_FAIL();
+        if (op == 0xE4u && !pjt_u8(t, &imm)) PJ_FAIL();
+        pjt_c(t);
+        /* Expose the live guest state to the existing device callback. */
+        pje32(&t->e, 0xE880u | CREG, 0x0FF0u); /* STMIA r12,{r4-r11} */
+        pj_imm32(&t->e, R3, t->ip0);
+        pj_ldst(&t->e, PJ_STR, R3, CREG, (unsigned)offsetof(B86Cpu, ip));
+        pj_mov(&t->e, R0, CREG);
+        if (op == 0xE4u) pj_movw(&t->e, R1, imm);
+        else pj_mov(&t->e, R1, GR(B86_DX)); /* helper masks DX to 16 bits */
+        if (!input) pj_mov(&t->e, R2, GR(0)); /* current EAX supplies AL */
+        pjt_call(t, input ? (const void *)b86_pj_fast_in8
+                          : (const void *)b86_pj_fast_outimm8);
+        pj_ldst(&t->e, PJ_LDR, CREG, SP, 0u);
+        pje32(&t->e, 0xE890u | CREG, 0x0FF0u); /* callback may update registers */
+        t->creg_ok = 1;
+        t->last_kind = -1;
+        t->ikind_clear = 1;  /* helper materializes pending flags on success */
+        if (input) {
+            /* Only refused calls return 256; valid input is always 0..255. */
+            pj_dpi(&t->e, 13u, 1, PC, R0, 256u);
+            pjt_exit_stay(t, 0 /* EQ */, t->ip0, t->ninsn - 1u);
+            pjt_put8(t, 0u, R0); /* update AL without disturbing upper EAX */
+        } else {
+            pj_dpi(&t->e, 13u, 1, PC, R0, 0u);
+            pjt_exit_stay(t, 0 /* EQ */, t->ip0, t->ninsn - 1u);
+        }
+        return 1; }
     case 0xF5: case 0xF8: case 0xF9: case 0xFC: case 0xFD:
         pjt_c(t);
         pj_mov(&t->e, R0, CREG);
@@ -1950,7 +2034,7 @@ static B86_PJ_COLD unsigned pj_fetch(B86Cpu *c, uint32_t eip, uint8_t *buf, unsi
 #define BB_PJ_PM16_MOV_READ 1
 #endif
 /* BB_PJ_PM16_PERF_GATE_V1: identical firmware except PM16 admission gate. */
-#define BB_PJ_PM16_PERF_GATE 0
+#define BB_PJ_PM16_PERF_GATE 1
 /* BB_PJ_PM16_TRUTHDIAG_V1: read-only counters; DEBUG BUILD ONLY. */
 #ifndef BB_PJ_PM16_TRUTHDIAG
 #define BB_PJ_PM16_TRUTHDIAG 1
@@ -2594,6 +2678,90 @@ static B86_PJ_COLD void b86_pj_link(B86Cpu *c)
 #endif
     }
 }
+
+/* BB_STAGE5I_OPCODE_PROBE: one-time read-only capture of the exact full-EIP
+ * hot paths observed during Stage5H run2. Uses normal JIT fetch, not the
+ * 16-bit real-mode watch physical-address conversion. Flat CS only. */
+static void bb5i_capture_hot_opcodes(B86Cpu *c)
+{
+    static const uint32_t hot[] = {
+        0x100C8C6Cu, 0x100C8C6Du, 0x100C9B8Cu, 0x100C9B8Du,
+        0x100DFF35u, 0x100DFD7Au, 0x100DFC98u, 0x100DFCA9u
+    };
+    static uint32_t emitted;
+    unsigned i;
+    for (i = 0u; i < sizeof hot / sizeof hot[0]; ++i) {
+        uint8_t buf[24];
+        unsigned n, x;
+        if (c->ip != hot[i] || (emitted & (1u << i))) continue;
+        /* pj_flat was already established by the caller, hence page/segment
+         * validity is unchanged. In particular this never reads IO regions. */
+        n = pj_fetch(c, c->ip, buf, sizeof buf);
+        emitted |= 1u << i;
+        printf("[bb5i-code] eip=%08lX base=%08lX size=%u bytes=",
+               (unsigned long)c->ip,
+               (unsigned long)c->pm386.seg[B86_CS].base, n);
+        for (x = 0u; x < n; ++x) printf("%02X", (unsigned)buf[x]);
+        printf("\n");
+        return;
+    }
+}
+/* BB_STAGE5I_OPCODE_PROBE_END */
+/* BB_STAGE5H_DISPATCH_PROFILE: observation only; samples one in 2048 JIT
+ * entry attempts and one in 128 translation misses. The 32-entry SpaceSaving
+ * table tracks entry-point frequency, NOT time inside linked native loops.
+ * Nothing here changes cache tags, translation, guest state or native code. */
+#define BB5H_SLOTS 32u
+static struct Bb5HHot { uint32_t eip, base, mode, count, misses; } bb5h_hot[BB5H_SLOTS];
+static uint32_t bb5h_try_clock, bb5h_miss_clock;
+static unsigned long bb5h_try_samples, bb5h_miss_samples, bb5h_last_block_report;
+static void bb5h_note(const B86Cpu *c, uint32_t mode, unsigned miss)
+{
+    unsigned i, free_slot = BB5H_SLOTS, min_slot = 0u;
+    const uint32_t ip = c->ip, base = c->pm386.seg[B86_CS].base;
+    for (i = 0u; i < BB5H_SLOTS; ++i) {
+        if (bb5h_hot[i].count && bb5h_hot[i].eip == ip &&
+            bb5h_hot[i].base == base && bb5h_hot[i].mode == mode) {
+            ++bb5h_hot[i].count;
+            bb5h_hot[i].misses += (uint32_t)!!miss;
+            return;
+        }
+        if (!bb5h_hot[i].count && free_slot == BB5H_SLOTS) free_slot = i;
+        if (bb5h_hot[i].count < bb5h_hot[min_slot].count) min_slot = i;
+    }
+    i = free_slot != BB5H_SLOTS ? free_slot : min_slot;
+    { const uint32_t prior = bb5h_hot[i].count;
+      bb5h_hot[i].eip = ip;
+      bb5h_hot[i].base = base;
+      bb5h_hot[i].mode = mode;
+      bb5h_hot[i].count = prior + 1u;
+      bb5h_hot[i].misses = (uint32_t)!!miss;
+    }
+}
+static void bb5h_dump(void)
+{
+    unsigned r, i;
+    uint32_t seen = 0u;
+    printf("[bb5h-summary] entry-samples=%lu miss-samples=%lu one-entry-in=2048 one-miss-in=128\n",
+           bb5h_try_samples, bb5h_miss_samples);
+    for (r=0u; r<6u; ++r) {
+        unsigned best = BB5H_SLOTS;
+        for (i=0u; i<BB5H_SLOTS; ++i) {
+            if ((seen & (1u << i)) || !bb5h_hot[i].count) continue;
+            if (best == BB5H_SLOTS || bb5h_hot[i].count > bb5h_hot[best].count) best = i;
+        }
+        if (best == BB5H_SLOTS) break;
+        seen |= (1u << best);
+        printf("[bb5h-hot] rank=%u mode=%lu base=%08lX eip=%08lX linear=%08lX samples=%lu missed=%lu\n",
+               r+1u, (unsigned long)bb5h_hot[best].mode,
+               (unsigned long)bb5h_hot[best].base, (unsigned long)bb5h_hot[best].eip,
+               (unsigned long)(bb5h_hot[best].base+bb5h_hot[best].eip),
+               (unsigned long)bb5h_hot[best].count,
+               (unsigned long)bb5h_hot[best].misses);
+    }
+}
+/* BB_STAGE5H_DISPATCH_PROFILE_END */
+
 /* Run one native block at EIP if possible. Returns retired instructions (0 = none). */
 static B86_PM_HOT unsigned b86_pj_try(B86Cpu *c)
 {
@@ -2607,6 +2775,13 @@ static B86_PM_HOT unsigned b86_pj_try(B86Cpu *c)
         const B86PM1Cache *cs = &c->pm386.seg[B86_CS];
         const uint32_t kind = (uint32_t)cs->selector | ((uint32_t)cs->flags << 16) |
                               ((uint32_t)cs->access << 24);
+        /* Sample before early deoptimization, so unsupported PM16 visits
+         * can be identified without affecting their execution. */
+        if (((++bb5h_try_clock) & 2047u) == 0u) {
+            ++bb5h_try_samples;
+            bb5h_note(c, reg16 ? 16u : (flat ? 32u : 0u), 0u);
+            if (flat) bb5i_capture_hot_opcodes(c);
+        }
         if (!flat && !reg16) return 0u;
 #if BB_PJ_PM16_ADAPTIVE
         /* Skip BEFORE the PM16 cache/mode transition, translation and
@@ -2685,6 +2860,11 @@ static B86_PM_HOT unsigned b86_pj_try(B86Cpu *c)
     h = ((c->ip * 2654435761u) >> 16) & (B86_PJ_HASH - 1u);
     if (j->tag[h] != (c->ip | 1u)) {
         ++j->profile_lookup_misses;
+        if (((++bb5h_miss_clock) & 127u) == 0u) {
+            ++bb5h_miss_samples;
+            bb5h_note(c, j->pm16_active ? 16u : 32u, 1u);
+        }
+
         if (j->tag[h]) ++j->profile_slot_replacements;
 /* BB_PJ_PM16_NEGCACHE_V1: check persistent negative key only on a
      * miss in the ordinary EIP cache. Linear keys eliminate most CS-base
@@ -2829,6 +3009,13 @@ void b86_pj_stats(const B86Cpu *c, unsigned long out[8])
     const B86Pj *j = (const B86Pj *)c->pj;
     memset(out, 0, 8 * sizeof out[0]);
     if (!j) return;
+#if defined(PICO_ON_DEVICE) && PICO_ON_DEVICE
+    /* Reporting is outside the native/JIT hot path. */
+    if (j->blocks >= bb5h_last_block_report + 20000ul) {
+        bb5h_last_block_report = j->blocks;
+        bb5h_dump();
+    }
+#endif
     out[0] = j->blocks; out[1] = j->flushes; out[2] = j->runs; out[3] = j->insns;
     out[4] = j->exits_mem; out[5] = j->declines; out[6] = j->used; out[7] = j->cap;
 #if defined(PICO_ON_DEVICE) && PICO_ON_DEVICE && \
