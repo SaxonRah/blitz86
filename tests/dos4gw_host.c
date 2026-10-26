@@ -50,6 +50,9 @@ static unsigned long long g_tick_at;
 static void logf_(const char *fmt, ...);
 static uint8_t g_pic_mask[2] = { 0xB8, 0xFF };
 static int g_irq_on, g_pj;
+static unsigned long long g_stats_from;
+static unsigned g_pj_kb = 512u;
+static unsigned g_pj_hot_kb = 0u;          /* r72: SRAM tier size (0 = off) */
 static double g_vmips = 25e6;
 static uint32_t g_pit_reload = 65536u;
 static int g_pit_lo_pending, g_pit_lo;
@@ -75,8 +78,44 @@ static void kb_feed(unsigned long long retired)
         g_kb_data = g_kb_q[0]; memmove(g_kb_q, g_kb_q + 1, --g_kb_qn); g_kb_obf = 1; g_pic_irr |= 2u;
     }
 }
+/* r71: --shot INSN writes shot_<INSN>.ppm (mode 13h) when that many instructions retired */
+#define MAXSHOTS 32
+static unsigned long long g_shot_at[MAXSHOTS]; static int g_nshots, g_shot_next;
+static void write_ppm(const char *name)
+{
+    FILE *pf = fopen(name, "wb");
+    if (!pf) return;
+    fprintf(pf, "P6\n320 200\n255\n");
+    for (unsigned k = 0; k < 64000u; ++k) { const uint8_t *e = g_pal[M[0xA0000u + k]];
+        fputc(e[0] * 255 / 63, pf); fputc(e[1] * 255 / 63, pf); fputc(e[2] * 255 / 63, pf); }
+    fclose(pf);
+}
+unsigned long long b86_harness_retired(void) { return C.icount; }
+static void stats_reset(void)
+{
+#if defined(B86_PJ) && B86_PJ
+    extern uint64_t b86_pm_pj_guest_insns, b86_pm_c_guest_insns;
+    b86_pm_pj_guest_insns = b86_pm_c_guest_insns = 0;
+#endif
+#ifdef B86_PJ_CPROF
+    { extern unsigned long b86_pm_c_op_exec[512]; memset(b86_pm_c_op_exec, 0, sizeof b86_pm_c_op_exec); }
+#endif
+#if defined(B86_PJ) && B86_PJ
+    if (g_pj) { unsigned long st[8]; b86_pj_stats(&C, st);
+        logf_("pj at reset: blocks %lu flushes %lu runs %lu insns %lu code %lu/%lu", st[0], st[1], st[2], st[3], st[6], st[7]);
+        { extern unsigned long b86_pg_stat_faults; logf_("paging faults so far %lu", b86_pg_stat_faults); }
+        { extern void b86_pj_flush_causes(const B86Cpu *, unsigned long *); unsigned long fc[10]; b86_pj_flush_causes(&C, fc);
+          logf_("pj flushes: total %lu smc %lu full %lu pm16-ctx %lu codepage-set %lu; smc stores %lu kills %lu refinds %lu evictions %lu unlinks %lu", fc[0], fc[1], fc[2], fc[3], fc[4], fc[5], fc[6], fc[7], fc[8], fc[9]); } }
+#endif
+    logf_("statistics reset");
+}
 static void irq_service(unsigned long long retired)
 {
+    if (g_stats_from && retired >= g_stats_from) { g_stats_from = 0; stats_reset(); }
+    while (g_shot_next < g_nshots && retired >= g_shot_at[g_shot_next]) {
+        char nm[64]; snprintf(nm, sizeof nm, "shot_%llu.ppm", g_shot_at[g_shot_next]);
+        write_ppm(nm); logf_("wrote %s", nm); ++g_shot_next;
+    }
     if (!g_irq_on) return;
     kb_feed(retired);
     if (!g_irq_next) g_irq_next = retired + irq_period();
@@ -715,7 +754,11 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--jit")) use_jit = 1;
         else if (!strcmp(argv[i], "--pico-ivt")) g_pico_ivt = 1;
         else if (!strcmp(argv[i], "--irq")) g_irq_on = 1;
+        else if (!strcmp(argv[i], "--stats-from") && i + 1 < argc) g_stats_from = strtoull(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--shot") && i + 1 < argc && g_nshots < MAXSHOTS) g_shot_at[g_nshots++] = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--pj")) g_pj = 1;
+        else if (!strcmp(argv[i], "--pj-kb") && i + 1 < argc) g_pj_kb = (unsigned)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--pj-hot-kb") && i + 1 < argc) g_pj_hot_kb = (unsigned)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--key") && i + 1 < argc && g_nkeys + 2 <= MAXKEYS) {
             unsigned long long at; unsigned sc;
             if (sscanf(argv[++i], "%llu:%x", &at, &sc) == 2) {
@@ -763,10 +806,20 @@ int main(int argc, char **argv)
     if (!load_exe(exe, tail)) return 2;
 #if defined(B86_PJ) && B86_PJ
     if (g_pj) {                                  /* r70: native PM translator */
-        size_t cb = 512u * 1024u;
+        size_t cb = (size_t)g_pj_kb * 1024u;
         void *code = mmap(NULL, cb, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         void *st = calloc(1, b86_pj_state_bytes());
         if (code == MAP_FAILED || !st || !b86_pj_attach(&C, st, b86_pj_state_bytes(), code, cb)) { logf_("pj attach failed"); return 2; }
+        if (g_pj_hot_kb) {   /* r72: a separate mapping stands in for Pico SRAM */
+            extern int b86_pj_attach_hot(B86Cpu *, void *, size_t);
+            /* like the Pico (SRAM ~240 MiB from PSRAM): place the tier far
+             * outside BL/B.W reach of the main buffer */
+            void *hint = (void *)(((uintptr_t)code + 0x0E000000u) & ~(uintptr_t)0xFFFFu);
+            void *hot = mmap(hint, (size_t)g_pj_hot_kb * 1024u, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            logf_("hot tier at %p, main code at %p (distance %ld MiB)", hot, code, (long)(((intptr_t)hot - (intptr_t)code) >> 20));
+            if (hot == MAP_FAILED || !b86_pj_attach_hot(&C, hot, (size_t)g_pj_hot_kb * 1024u)) { logf_("pj hot tier attach failed"); return 2; }
+            logf_("PJ hot tier: %u KiB", g_pj_hot_kb);
+        }
         logf_("PJ on: %u KiB code, %u B state", (unsigned)(cb / 1024u), (unsigned)b86_pj_state_bytes());
     }
 #endif
@@ -849,9 +902,39 @@ int main(int argc, char **argv)
     if (g_pj) { unsigned long st[8], so[256]; b86_pj_stats(&C, st); b86_pj_stop_ops(&C, so);
         fprintf(stderr, "[host] pj: blocks %lu flushes %lu runs %lu insns %lu (%.1f/run) mem-exits %lu declined %lu code %lu/%lu\n",
                 st[0], st[1], st[2], st[3], st[2] ? (double)st[3] / st[2] : 0.0, st[4], st[5], st[6], st[7]);
+        { extern void b86_pj_flush_causes(const B86Cpu *, unsigned long *); { extern void b86_pj_hot_stats(const B86Cpu *, unsigned long *); unsigned long hs[6]; b86_pj_hot_stats(&C, hs);
+            fprintf(stderr, "[host] pj hot tier: promotions %lu resets %lu refused %lu used %lu/%lu trampolines %lu\n", hs[0], hs[1], hs[2], hs[3], hs[4], hs[5]); }
+          unsigned long fc[10]; b86_pj_flush_causes(&C, fc);
+          fprintf(stderr, "[host] pj flushes: total %lu smc %lu full %lu pm16-ctx %lu codepage-set %lu; smc stores %lu blocks killed %lu refinds %lu evictions %lu unlinks %lu\n", fc[0], fc[1], fc[2], fc[3], fc[4], fc[5], fc[6], fc[7], fc[8], fc[9]); }
+        { extern unsigned long b86_pg_stat_faults, b86_pg_stat_tswitch, b86_pg_stat_walks, b86_pg_stat_flush;
+          fprintf(stderr, "[host] paging: faults %lu task-switches %lu walks %lu tlb-flushes %lu\n", b86_pg_stat_faults, b86_pg_stat_tswitch, b86_pg_stat_walks, b86_pg_stat_flush); }
         fprintf(stderr, "[host] pj blocks end at:");
         for (int k = 0; k < 16; ++k) { int best = 0; for (int q = 1; q < 256; ++q) if (so[q] > so[best]) best = q; if (!so[best]) break; fprintf(stderr, " %02X:%lu", best, so[best]); so[best] = 0; }
         fprintf(stderr, "\n"); }
+#endif
+#if defined(B86_PJ) && B86_PJ
+    { extern uint64_t b86_pm_pj_guest_insns, b86_pm_c_guest_insns;
+      fprintf(stderr, "[host] pm coverage: pj %llu c %llu (%.2f%% native)\n", (unsigned long long)b86_pm_pj_guest_insns,
+              (unsigned long long)b86_pm_c_guest_insns, 100.0 * (double)b86_pm_pj_guest_insns / (double)(b86_pm_pj_guest_insns + b86_pm_c_guest_insns + 1)); }
+#endif
+#ifdef B86_PJ_CPROF
+    { extern unsigned long b86_pm_c_op_exec[512]; unsigned idx[512]; for (unsigned k = 0; k < 512; ++k) idx[k] = k;
+      for (unsigned a = 0; a < 30; ++a) for (unsigned b = a + 1; b < 512; ++b) if (b86_pm_c_op_exec[idx[b]] > b86_pm_c_op_exec[idx[a]]) { unsigned t = idx[a]; idx[a] = idx[b]; idx[b] = t; }
+      fprintf(stderr, "[host] pm C-executed by opcode:");
+      for (unsigned a = 0; a < 30 && b86_pm_c_op_exec[idx[a]]; ++a) fprintf(stderr, " %s%02X:%lu", idx[a] >= 256 ? "0F" : "", idx[a] & 255, b86_pm_c_op_exec[idx[a]]);
+      fprintf(stderr, "\n"); }
+#endif
+#ifdef B86_PJ_CPROF
+    { extern unsigned long b86_pj_op_bytes[512], b86_pj_op_count[512], b86_pj_stub_bytes, b86_pj_blocks_x, b86_pj_insns_x;
+      unsigned long tot = b86_pj_stub_bytes; unsigned idx[512];
+      for (unsigned k = 0; k < 512; ++k) { tot += b86_pj_op_bytes[k]; idx[k] = k; }
+      fprintf(stderr, "[host] pj code: %lu bytes for %lu blocks / %lu insns (%.1f B/insn, %.0f B/block); exit stubs %lu B (%.0f%%)\n",
+              tot, b86_pj_blocks_x, b86_pj_insns_x, b86_pj_insns_x ? (double)tot / b86_pj_insns_x : 0.0, b86_pj_blocks_x ? (double)tot / b86_pj_blocks_x : 0.0,
+              b86_pj_stub_bytes, tot ? 100.0 * b86_pj_stub_bytes / tot : 0.0);
+      for (unsigned a = 0; a < 16; ++a) for (unsigned b = a + 1; b < 512; ++b) if (b86_pj_op_bytes[idx[b]] > b86_pj_op_bytes[idx[a]]) { unsigned t = idx[a]; idx[a] = idx[b]; idx[b] = t; }
+      fprintf(stderr, "[host] pj code by opcode (bytes/avg):");
+      for (unsigned a = 0; a < 16; ++a) fprintf(stderr, " %s%02X:%lu/%.0f", idx[a] >= 256 ? "0F" : "", idx[a] & 255, b86_pj_op_bytes[idx[a]], b86_pj_op_count[idx[a]] ? (double)b86_pj_op_bytes[idx[a]] / b86_pj_op_count[idx[a]] : 0.0);
+      fprintf(stderr, "\n"); }
 #endif
 #ifdef B86_PJ_VERIFY
     { extern unsigned long b86_pj_vfy_checked, b86_pj_vfy_bad;
