@@ -16,6 +16,13 @@
 #include <dirent.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <signal.h>
+#include <sys/time.h>
+#include <ucontext.h>
+static volatile unsigned int g_xip_fake_hit;
+unsigned long dbg_pcs[4];
+extern void b86_pj_pc_sample(unsigned int pc);
+static void pcs_handler(int sig, siginfo_t *si, void *uc) { (void)sig; (void)si; b86_pj_pc_sample((unsigned int)((ucontext_t *)uc)->uc_mcontext.arm_pc); }
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -818,6 +825,17 @@ int main(int argc, char **argv)
             void *hot = mmap(hint, (size_t)g_pj_hot_kb * 1024u, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             logf_("hot tier at %p, main code at %p (distance %ld MiB)", hot, code, (long)(((intptr_t)hot - (intptr_t)code) >> 20));
             if (hot == MAP_FAILED || !b86_pj_attach_hot(&C, hot, (size_t)g_pj_hot_kb * 1024u)) { logf_("pj hot tier attach failed"); return 2; }
+            if (getenv("B86_PCS_US")) {     /* r72f test: PC sampling from a timer signal */
+                struct sigaction sa; struct itimerval it;
+                memset(&sa, 0, sizeof sa); sa.sa_sigaction = pcs_handler; sa.sa_flags = SA_SIGINFO | SA_RESTART;
+                sigaction(SIGALRM, &sa, NULL);
+                it.it_interval.tv_sec = 0; it.it_interval.tv_usec = atoi(getenv("B86_PCS_US")); it.it_value = it.it_interval;
+                setitimer(ITIMER_REAL, &it, NULL);
+            }
+            if (getenv("B86_XIP_FAKE")) {   /* r72e test: counters advance with retired instructions */
+                extern void b86_pj_set_xip_counters(B86Cpu *, const volatile uint32_t *, const volatile uint32_t *, const volatile uint32_t *);
+                b86_pj_set_xip_counters(&C, (const volatile uint32_t *)&C.icount, (const volatile uint32_t *)&g_xip_fake_hit, (const volatile uint32_t *)&C.icount);
+            }
             logf_("PJ hot tier: %u KiB", g_pj_hot_kb);
         }
         logf_("PJ on: %u KiB code, %u B state", (unsigned)(cb / 1024u), (unsigned)b86_pj_state_bytes());
@@ -904,6 +922,13 @@ int main(int argc, char **argv)
                 st[0], st[1], st[2], st[3], st[2] ? (double)st[3] / st[2] : 0.0, st[4], st[5], st[6], st[7]);
         { extern void b86_pj_flush_causes(const B86Cpu *, unsigned long *); { extern void b86_pj_hot_stats(const B86Cpu *, unsigned long *); unsigned long hs[6]; b86_pj_hot_stats(&C, hs);
             fprintf(stderr, "[host] pj hot tier: promotions %lu resets %lu refused %lu used %lu/%lu trampolines %lu\n", hs[0], hs[1], hs[2], hs[3], hs[4], hs[5]); }
+        if (getenv("B86_PCS_US")) { extern void b86_pj_pc_stats(unsigned long *); unsigned long ps[8]; b86_pj_pc_stats(ps);
+            fprintf(stderr, "[host] pc samples: psram-blocks %lu psram-shared %lu sram-tier %lu sram-other %lu flash %lu psram-other %lu other %lu | sample promotions %lu\n",
+                    ps[0], ps[1], ps[2], ps[3], ps[4], ps[5], ps[6], ps[7]); }
+        if (getenv("B86_XIP_FAKE")) { extern void b86_pj_xip_split(const B86Cpu *, unsigned long *); unsigned long xs[12];
+            b86_pj_xip_split(&C, xs);
+            fprintf(stderr, "[host] xip split: sram runs %lu insns %lu miss %lu us %lu | psram runs %lu insns %lu miss %lu us %lu | gaps %lu miss %lu us %lu | dropped %lu\n",
+                    xs[0], xs[1], xs[2], xs[3], xs[4], xs[5], xs[6], xs[7], xs[8], xs[9], xs[10], xs[11]); }
           unsigned long fc[10]; b86_pj_flush_causes(&C, fc);
           fprintf(stderr, "[host] pj flushes: total %lu smc %lu full %lu pm16-ctx %lu codepage-set %lu; smc stores %lu blocks killed %lu refinds %lu evictions %lu unlinks %lu\n", fc[0], fc[1], fc[2], fc[3], fc[4], fc[5], fc[6], fc[7], fc[8], fc[9]); }
         { extern unsigned long b86_pg_stat_faults, b86_pg_stat_tswitch, b86_pg_stat_walks, b86_pg_stat_flush;

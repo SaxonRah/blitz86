@@ -333,6 +333,7 @@ void     b86_jit_flush(struct B86Jit *j);
 /* Host code wrote guest memory [lin, lin+len) behind the JIT's back (disk
    DMA, another interpreter): drop translations that depend on it. */
 void     b86_jit_invalidate(struct B86Jit *j, uint32_t lin, uint32_t len);
+void     b86_jit_flush_causes(const struct B86Jit *j, unsigned long out[3]);   /* r73 */
 /* Count retired guest instructions exactly in cpu->icnt (one add per block
    exit, not per instruction). Takes effect for code translated afterwards;
    call before running or follow with b86_jit_flush. */

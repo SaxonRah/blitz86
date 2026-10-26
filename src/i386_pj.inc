@@ -98,6 +98,13 @@ typedef struct B86Pj {
     uint32_t hot_base, hot_cap, hot_start, hot_used;   /* offsets relative to code (mod 2^32) */
     uint32_t nredir, maxredir, tr_hot, hot_after;   /* r72c: adaptive promotion threshold */
     unsigned long promo_at_reset, hot_tick;          /* r72d: threshold decay */
+    /* r72e: XIP-cache split. Host gives the XIP access / hit counters and a
+     * microsecond timer; each native run and each gap between runs is charged
+     * to SRAM-tier runs, PSRAM runs or "outside" (everything else). */
+    const volatile uint32_t *xacc, *xhit, *xus;
+    uint32_t xla, xlh, xlt;
+    unsigned long xs[12];
+    uint32_t gshift, pcs_n;                          /* r72f: granule size, PC samples taken */
     unsigned long promotions, hot_resets, hot_refused;
     unsigned long blocks, flushes, runs, insns, exits_mem, declines, fallback;
     unsigned long stop_op[256];         /* which opcode ended blocks           */
@@ -175,7 +182,69 @@ unsigned long b86_pj_stat_runs, b86_pj_stat_insns;
 #define B86_PJ_LINKS (PJ_SMALL_TAIL ? 1024u : 8192u)   /* link log entries (stub, target) */
 #endif
 #define PJ_LINK_BYTES (B86_PJ_LINKS * 2u * sizeof(uint32_t))
-#define PJ_TAIL_BYTES (PJ_NEG_BYTES + 2u * B86_PJ_CPS * sizeof(uint32_t) + PJ_PM16_BYTES + PJ_LINK_BYTES)
+/* r72f: granule index: first PSRAM block starting in each 2^gshift-byte granule
+ * of the code buffer (offset + 1), so a sampled PC can be mapped to its block */
+#define PJ_GIDX_N (PJ_SMALL_TAIL ? 256u : 2048u)
+#define PJ_GIDX_BYTES (PJ_GIDX_N * sizeof(uint32_t))
+#define PJ_TAIL_BYTES (PJ_NEG_BYTES + 2u * B86_PJ_CPS * sizeof(uint32_t) + PJ_PM16_BYTES + PJ_LINK_BYTES + PJ_GIDX_BYTES)
+/* r72f: PC sampler state (host timer interrupt -> b86_pj_pc_sample) */
+#define PJ_PCS_RING 64u
+static volatile uint32_t pj_pcs_ring[PJ_PCS_RING], pj_pcs_w, pj_pcs_r;
+static volatile uint32_t pj_pcs_lo, pj_pcs_hi, pj_pcs_sh, pj_pcs_hlo, pj_pcs_hhi;
+static volatile unsigned long pj_pcs_cls[8];
+/* r73: heavy-hitter table of C-code PCs (SRAM other than the tier, and flash):
+ * 256 slots, 4-way probing, space-saving replacement; key = pc >> 3 */
+#define PJ_PCS_TOPN 256u
+static volatile uint32_t pj_pcs_tkey[PJ_PCS_TOPN], pj_pcs_tcnt[PJ_PCS_TOPN];
+static volatile uint8_t pj_pcs_promote_on = 1u;
+static B86_PM_HOT void pj_pcs_top_add(uint32_t pc)
+{
+    const uint32_t key = (pc >> 3) | 0x80000000u;
+    uint32_t i = (key * 0x9E3779B1u) >> 24, k, mi = i, mc = 0xFFFFFFFFu;
+    for (k = 0u; k < 4u; ++k, i = (i + 1u) & (PJ_PCS_TOPN - 1u)) {
+        if (pj_pcs_tkey[i] == key) { ++pj_pcs_tcnt[i]; return; }
+        if (!pj_pcs_tkey[i]) { pj_pcs_tkey[i] = key; pj_pcs_tcnt[i] = 1u; return; }
+        if (pj_pcs_tcnt[i] < mc) { mc = pj_pcs_tcnt[i]; mi = i; }
+    }
+    pj_pcs_tkey[mi] = key; pj_pcs_tcnt[mi] = mc + 1u;
+}
+/* r73: the n most-sampled C-code PCs since the last call (8-byte buckets),
+ * largest first; clears the table. Returns how many were written. */
+unsigned b86_pj_pc_top(unsigned n, uint32_t *pc, uint32_t *cnt)
+{
+    unsigned k, m = 0u, i;
+    for (k = 0u; k < n; ++k) {
+        uint32_t best = 0u, bi = 0u;
+        for (i = 0u; i < PJ_PCS_TOPN; ++i) if (pj_pcs_tkey[i] && pj_pcs_tcnt[i] > best) { best = pj_pcs_tcnt[i]; bi = i; }
+        if (!best) break;
+        pc[m] = (pj_pcs_tkey[bi] & 0x7FFFFFFFu) << 3; cnt[m] = best; ++m;
+        pj_pcs_tcnt[bi] = 0u;
+    }
+    for (i = 0u; i < PJ_PCS_TOPN; ++i) { pj_pcs_tkey[i] = 0u; pj_pcs_tcnt[i] = 0u; }
+    return m;
+}
+/* r73: switch sample-driven promotion on or off (profiling stays on) */
+void b86_pj_pc_promote(int on) { pj_pcs_promote_on = on ? 1u : 0u; }
+/* Interrupt-safe; classifies the sample and queues PCs in PSRAM blocks.
+ * cls: 0 PSRAM blocks, 1 PSRAM shared routines, 2 SRAM tier, 3 other SRAM,
+ * 4 flash, 5 other PSRAM, 6 anything else; 7 = promotions made from samples */
+B86_PM_HOT void b86_pj_pc_sample(uint32_t pc)
+{
+    pc &= ~1u;
+    if (pj_pcs_hi && pc - pj_pcs_lo < pj_pcs_hi - pj_pcs_lo) {
+        if (pc - pj_pcs_lo < pj_pcs_sh) ++pj_pcs_cls[1];
+        else { const uint32_t w = pj_pcs_w; ++pj_pcs_cls[0]; pj_pcs_ring[w & (PJ_PCS_RING - 1u)] = pc; pj_pcs_w = w + 1u; }
+    } else if (pj_pcs_hhi && pc - pj_pcs_hlo < pj_pcs_hhi - pj_pcs_hlo) ++pj_pcs_cls[2];
+    else if (pc - 0x20000000u < 0x00082000u) { ++pj_pcs_cls[3]; pj_pcs_top_add(pc); }
+    else if (pc - 0x10000000u < 0x01000000u) { ++pj_pcs_cls[4]; pj_pcs_top_add(pc); }
+    else if (pc - 0x11000000u < 0x01000000u) ++pj_pcs_cls[5];
+    else ++pj_pcs_cls[6];
+}
+void b86_pj_pc_stats(unsigned long out[8])
+{
+    unsigned k;
+    for (k = 0u; k < 8u; ++k) out[k] = pj_pcs_cls[k];
+}
 static inline uint32_t *pj_cpsv(const B86Pj *j) { return (uint32_t *)(void *)(j->code + j->cap + PJ_NEG_BYTES); }
 static inline uint32_t *pj_heads(const B86Pj *j) { return pj_cpsv(j) + B86_PJ_CPS; }
 static inline uint32_t *pj_hdr(const B86Pj *j, uint32_t off) { return (uint32_t *)(void *)(j->code + off); }
@@ -205,6 +274,7 @@ static inline uint32_t *pj_pm16_desc(const B86Pj *j, unsigned k) { return pj_pm1
 static inline uint32_t *pj_pm16_tag(const B86Pj *j, unsigned k) { return pj_pm16_region(j) + 4u * PJ_PM16_CTX + 2u * PJ_PM16_ENT * k; }
 static inline uint32_t *pj_pm16_ent(const B86Pj *j, unsigned k) { return pj_pm16_tag(j, k) + PJ_PM16_ENT; }
 static inline uint32_t *pj_links(const B86Pj *j) { return pj_pm16_region(j) + PJ_PM16_BYTES / sizeof(uint32_t); }
+static inline uint32_t *pj_gidx(const B86Pj *j) { return pj_links(j) + 2u * B86_PJ_LINKS; }
 
 /* BB_PJ_ES_SKIP_ASSOC_V1: A/B mode controls only the ES refusal-site
  * lookup policy; both policies occupy the same 64-word state array. */
@@ -2324,6 +2394,7 @@ static B86_PJ_COLD void b86_pj_flush(B86Cpu *c)
     j->used = 0u;
     j->flush_pending = 0;
     c->pj_stop = 0u;
+    memset(pj_gidx(j), 0, PJ_GIDX_BYTES);           /* r72f */
     pj_emit_shared(j);
     if (j->hot) { j->hot_used = j->hot_start; j->nredir = 0u; }
     ++j->flushes;
@@ -2869,6 +2940,10 @@ static B86_PJ_COLD void pj_evict_switch(B86Cpu *c, B86Pj *j)
         if (e && e - 1u >= lo && e - 1u < hi) { en[k % PJ_PM16_ENT] = 0u; tg[k % PJ_PM16_ENT] = 0u; }
     }
     memset(j->es_skip_eip, 0, sizeof j->es_skip_eip);
+    {   uint32_t *gi = pj_gidx(j), g;                 /* r72f: granule index entries into the evicted half */
+        for (g = lo >> j->gshift; g <= (hi - 1u) >> j->gshift && g < PJ_GIDX_N; ++g)
+            if (gi[g] && gi[g] - 1u >= lo && gi[g] - 1u < hi) gi[g] = 0u;
+    }
     if (j->hot) {                                   /* r72: trampolines in the evicted half are gone */
         uint32_t *rd = pj_redir(j), m = 0u;
         for (i = 0; i < j->nredir; ++i) if (!(rd[4u * i] >= lo && rd[4u * i] < hi)) {
@@ -3105,6 +3180,7 @@ static B86_PJ_COLD uint32_t b86_pj_translate(B86Cpu *c, uint32_t eip)
     pj_hdr(j, start_off)[5] = j->used - start_off;    /* r71: walkable block chain */
     if (!j->tr_hot) j->half_fill[j->cur_half] = j->used;
     pj_hdr(j, start_off)[7] = 0u;
+    if (!j->tr_hot) { uint32_t *gi = pj_gidx(j) + (start_off >> j->gshift); if (!*gi) *gi = start_off + 1u; }   /* r72f */
 #if defined(__linux__)
     __builtin___clear_cache((char *)j->code + start_off, (char *)t.e.p);
 #else
@@ -3288,12 +3364,85 @@ static void bb5h_dump(void)
 }
 /* BB_STAGE5H_DISPATCH_PROFILE_END */
 
+/* r72f: PC-sample promotion. Dispatch counts only see blocks entered from
+ * C; a loop chained inside PSRAM is entered once and then runs for millions
+ * of instructions without being counted. The host samples core 0's PC from a
+ * timer interrupt (b86_pj_pc_sample); samples that land in a PSRAM block are
+ * mapped to it here, and a block that collects PJ_PCS_HOT samples within one
+ * epoch (2048 samples) is moved to the SRAM tier. hd[7]: bits 0-19 dispatch
+ * count, 20-27 sample count, 28-31 epoch of the sample count. */
+#ifndef PJ_PCS_HOT
+#define PJ_PCS_HOT 3u
+#endif
+static B86_PM_HOT uint32_t pj_pcs_block(const B86Pj *j, uint32_t pcoff)
+{
+    const uint32_t *gi = pj_gidx(j);
+    uint32_t g = pcoff >> j->gshift, k, off = 0u;
+    if (g >= PJ_GIDX_N) return 0u;
+    for (k = 0u; k < 8u && k <= g; ++k) {
+        const uint32_t v = gi[g - k];
+        if (v && v - 1u <= pcoff) { off = v - 1u; break; }
+    }
+    if (!off) return 0u;
+    for (k = 0u; k < 64u; ++k) {
+        const uint32_t sz = pj_hdr(j, off)[5];
+        if (sz < PJ_HDR_BYTES || sz > 0x10000u || off + sz > j->cap) return 0u;
+        if (pcoff < off + sz) return pcoff >= off + PJ_HDR_BYTES ? off + 1u : 0u;
+        off += sz;
+    }
+    return 0u;
+}
+static B86_PJ_COLD void pj_pcs_promote(B86Cpu *c, B86Pj *j, uint32_t off)
+{
+    const uint32_t ent = off + PJ_HDR_BYTES + 1u, lin = pj_hdr(j, off)[0], eip = pj_hdr(j, off)[4];
+    uint32_t e2, k;
+    if (pj_find_block(j, lin, eip, 0u) != ent) { pj_hdr(j, off)[7] &= 0xF00FFFFFu; return; }   /* not a live block start */
+    e2 = pj_hot_translate(c, j, eip);
+    if (e2 && !(pj_hdr(j, off)[1] & 0x80000000u) && pj_hdr(j, off)[4] == eip && pj_hdr(j, off)[0] == lin) {   /* (the new SRAM copy now heads the page list) */
+        pj_redirect(j, off, e2);
+        for (k = 0; k < B86_PJ_HASH; ++k) if (j->ent[k] == ent) j->ent[k] = e2;
+        ++j->promotions; ++pj_pcs_cls[7];
+    } else pj_hdr(j, off)[7] &= 0xF00FFFFFu;
+}
+static B86_PM_HOT void pj_pcs_drain(B86Cpu *c, B86Pj *j)
+{
+    const uint32_t w = pj_pcs_w;
+    uint32_t r = pj_pcs_r;
+    int ok = pj_flat(c);
+#if BB_PJ_PM16_REG_TIER
+    if (j->pm16_active) ok = 0;
+#endif
+    /* the sample bar follows the adaptive dispatch bar: a thrashing tier raises both */
+    const uint32_t pcs_thr = PJ_PCS_HOT * j->hot_after / PJ_HOT_AFTER < 255u ? PJ_PCS_HOT * j->hot_after / PJ_HOT_AFTER : 255u;
+    pj_pcs_sh = j->shared_end;
+    if (w - r > PJ_PCS_RING) r = w - PJ_PCS_RING;
+    for (; ok && r != w; ++r) {
+        const uint32_t pcoff = pj_pcs_ring[r & (PJ_PCS_RING - 1u)] - (uint32_t)(uintptr_t)j->code;
+        uint32_t off, *hd, v, ep;
+        if (pcoff < j->shared_end || pcoff >= j->cap) continue;
+        off = pj_pcs_block(j, pcoff);
+        if (!off) continue;
+        hd = pj_hdr(j, --off);
+        if (hd[1] & 0xC0000000u) continue;           /* dead / redirected, or PM16 */
+        ep = (j->pcs_n++ >> 11) & 15u;
+        v = hd[7];
+        if ((v >> 28) != ep) v = (v & 0xFFFFFu) | (ep << 28);
+        v += 1u << 20;
+        hd[7] = v;
+        if (pj_pcs_promote_on && ((v >> 20) & 0xFFu) >= pcs_thr) {
+            pj_pcs_r = r + 1u;
+            pj_pcs_promote(c, j, off);
+        }
+    }
+    pj_pcs_r = w;
+}
 /* Run one native block at EIP if possible. Returns retired instructions (0 = none). */
 static B86_PM_HOT unsigned b86_pj_try(B86Cpu *c)
 {
     B86Pj *j = b86_pj_state(c);
     uint32_t h, ent;
     unsigned n;
+    if (j && j->hot && pj_pcs_r != pj_pcs_w) pj_pcs_drain(c, j);   /* r72f */
 #if BB_PJ_PM16_REG_TIER
     {
         const unsigned flat = j && pj_flat(c);
@@ -3495,7 +3644,7 @@ static B86_PM_HOT unsigned b86_pj_try(B86Cpu *c)
          * tier has room (resets during loading must not freeze it high) */
         if (!(++j->hot_tick & 0xFFFFu) && j->hot_after > PJ_HOT_AFTER &&
             j->hot_used - j->hot_start < (j->hot_cap - (j->hot_start - j->hot_base)) / 2u) j->hot_after /= 2u;
-        if (!(hd[1] & 0x80000000u) && ++hd[7] >= j->hot_after) {
+        if (!(hd[1] & 0x80000000u) && (++hd[7] & 0xFFFFFu) >= j->hot_after) {
             hd[7] = 0u;                              /* r72d: a refused promotion backs off */
             const uint32_t e2 = pj_hot_translate(c, j, c->ip);
             if (e2 && !(hd[1] & 0x80000000u) && pj_hdr(j, off)[4] == c->ip) {
@@ -3506,7 +3655,27 @@ static B86_PM_HOT unsigned b86_pj_try(B86Cpu *c)
         }
     }
     c->pj_exit = 0u;
-    n = ((unsigned (*)(B86Cpu *, uintptr_t))(void *)(uintptr_t)((uintptr_t)(pj_in_hot(j, ent - 1u) ? j->hsh.entry : j->entry) | 1u))(c, (uintptr_t)(j->code + ent - 1u) | 1u);
+    {
+        const unsigned hot = pj_in_hot(j, ent - 1u) != 0;
+        uint32_t a0 = 0u, h0 = 0u, t0 = 0u;
+        if (j->xacc) {                               /* r72e: XIP split */
+            a0 = *j->xacc; h0 = *j->xhit; t0 = *j->xus;
+            if (j->xlt) {
+                if (a0 >= j->xla && h0 >= j->xlh && a0 - j->xla >= h0 - j->xlh) {
+                    j->xs[8]++; j->xs[9] += (a0 - j->xla) - (h0 - j->xlh); j->xs[10] += t0 - j->xlt;
+                } else j->xs[11]++;
+            }
+        }
+        n = ((unsigned (*)(B86Cpu *, uintptr_t))(void *)(uintptr_t)((uintptr_t)(hot ? j->hsh.entry : j->entry) | 1u))(c, (uintptr_t)(j->code + ent - 1u) | 1u);
+        if (j->xacc) {
+            const uint32_t a1 = *j->xacc, h1 = *j->xhit, t1 = *j->xus;
+            if (a1 >= a0 && h1 >= h0 && a1 - a0 >= h1 - h0) {
+                unsigned long *x = j->xs + (hot ? 0u : 4u);
+                x[0]++; x[1] += n; x[2] += (a1 - a0) - (h1 - h0); x[3] += t1 - t0;
+            } else j->xs[11]++;
+            j->xla = a1; j->xlh = h1; j->xlt = t1 ? t1 : 1u;
+        }
+    }
 #ifdef B86_PJ_VERIFY
     if (n) {
         uint32_t nr[8], nip = c->ip, nfl;
@@ -3627,8 +3796,10 @@ int b86_pj_attach(B86Cpu *c, void *state, size_t state_bytes, void *code, size_t
     memset(j, 0, sizeof *j);
     j->code = (uint8_t *)code; j->cap = (uint32_t)(code_bytes - PJ_TAIL_BYTES);
     memset(j->code + j->cap, 0, PJ_TAIL_BYTES); /* negative table, code-page set, block lists: outside emitter bounds */
+    for (j->gshift = 6u; (j->cap >> j->gshift) >= PJ_GIDX_N; ++j->gshift) {}
     c->pj = j;
     pj_emit_shared(j);
+    pj_pcs_lo = (uint32_t)(uintptr_t)j->code; pj_pcs_hi = pj_pcs_lo + j->cap; pj_pcs_sh = j->shared_end;
     return 1;
 }
 void b86_pj_stats(const B86Cpu *c, unsigned long out[8])
@@ -3780,7 +3951,25 @@ int b86_pj_attach_hot(B86Cpu *c, void *buf, size_t bytes)
         (unsigned)(j->hsh.tail_z-j->hot),(unsigned)(j->hsh.exit_s-j->hot),(unsigned)(j->hsh.chk-j->hot),
         (unsigned)(j->hsh.memtramp-j->hot),(unsigned)(j->hsh.entry-j->hot),(unsigned)(j->hsh.dyn-j->hot),(unsigned)(j->hsh.lzh[0]-j->hot),(unsigned)(j->hsh.memt[0]-j->hot),(unsigned)(j->hot_start-j->hot_base));
 #endif
+    pj_pcs_hlo = (uint32_t)(uintptr_t)j->hot; pj_pcs_hhi = pj_pcs_hlo + j->hot_cap;   /* r72f */
     return 1;
+}
+/* r72e: host passes &xip_ctrl_hw->ctr_acc, &xip_ctrl_hw->ctr_hit and a
+ * free-running microsecond counter (e.g. &timer_hw->timerawl); NULLs disable. */
+void b86_pj_set_xip_counters(B86Cpu *c, const volatile uint32_t *acc, const volatile uint32_t *hit, const volatile uint32_t *us)
+{
+    B86Pj *j = c ? (B86Pj *)c->pj : NULL;
+    if (!j) return;
+    j->xacc = (acc && hit && us) ? acc : NULL; j->xhit = hit; j->xus = us; j->xlt = 0u;
+}
+/* out: [0..3] SRAM-tier runs, insns, XIP misses, us; [4..7] the same for PSRAM
+ * runs; [8..10] gaps between runs (count, misses, us); [11] samples dropped
+ * because a counter was cleared or saturated meanwhile. Cumulative. */
+void b86_pj_xip_split(const B86Cpu *c, unsigned long out[12])
+{
+    const B86Pj *j = c ? (const B86Pj *)c->pj : NULL;
+    unsigned k;
+    for (k = 0u; k < 12u; ++k) out[k] = j ? j->xs[k] : 0u;
 }
 void b86_pj_hot_stats(const B86Cpu *c, unsigned long out[6])
 {

@@ -86,3 +86,45 @@ promoted (tier 17-44 KiB used of 89 KiB).
     blocks already past it); the count restarts after each attempt
 Verification (far layout): stress 160,106 runs 0 mismatches; menus -> demo,
 96 KiB tier: 4,767 promotions, 9 resets, 17,155,194 runs, 0 mismatches.
+
+r72e (after the Pico run of r72d): measurement only
+---------------------------------------------------
+r72d did what it was meant to (tier 21-81 KiB used, 4,307 promotions) but the
+demo stayed at 1.75-1.91 MIPS and ~0.89 XIP misses per instruction. So the
+SRAM copy is no longer what limits speed, and the remaining misses need to be
+located on the device rather than in the model.
+  * b86_pj_set_xip_counters(c, &ctr_acc, &ctr_hit, &us_timer): charge every
+    native run (by the tier it starts in) and every gap between runs
+  * b86_pj_xip_split(c, out[12]): sram runs/insns/misses/us, psram the same,
+    gaps count/misses/us, dropped samples (counter cleared or saturated)
+No change to emulation; with no counters attached the cost is one test per run.
+
+r72f (after the Pico run of r72e): promote loops by time
+--------------------------------------------------------
+r72e on the Pico, Descent demo intervals:
+  SRAM runs  ~61% of PM instructions, 2.9 MIPS, 0.31-0.38 XIP misses/insn
+  PSRAM runs ~39% of PM instructions, 2.0 MIPS, 1.05-1.10 misses/insn,
+             ~250 instructions per run (loops chained inside PSRAM)
+  gaps       16-18% of wall time
+Dispatch counts only see blocks entered from C. A loop chained in PSRAM is
+entered once and never reaches the bar, however much time it takes.
+  * b86_pj_pc_sample(pc): interrupt-safe; the host calls it from a timer
+    interrupt with the interrupted PC. Samples are classified (PSRAM blocks,
+    PSRAM shared routines, SRAM tier, other SRAM, flash, other) and PCs in
+    PSRAM blocks are queued (64-entry ring)
+  * b86_pj_pc_stats(out[8]): the class counts, [7] = promotions from samples
+  * granule index in the PSRAM tail (2048 words): first block per granule,
+    maintained on translate / half eviction / flush; maps a PC to its block
+  * drained at the start of b86_pj_try (flat, non-PM16 only): a block with
+    PJ_PCS_HOT (3) samples within one 2048-sample epoch, scaled by the
+    adaptive dispatch bar (hot_after/32, max 255), moves to the SRAM tier
+  * hd[7]: bits 0-19 dispatch count, 20-27 sample count, 28-31 epoch
+Harness (qemu, SIGALRM sampler every 200 us, 900M insns menus -> demo):
+                       PSRAM-block samples  SRAM-tier samples  total samples
+  no sample promotion        2,800,018           312,331         4.86M
+  r72f                         277,430           399,659         2.05M
+  (19,413 promotions, 40 resets; total samples ~ wall time)
+Verification (far layout, sampling on so promotions happen at arbitrary points):
+  stress (32 KiB tier, promote-after-1, 100 us sampling): 159,986 runs, 0 mismatches
+  menus -> demo 1.0G insns, 96 KiB tier: 16,827,609 runs, 0 mismatches,
+  22,994 promotions (21,278 from samples), 59 resets

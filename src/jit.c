@@ -248,6 +248,7 @@ typedef struct B86Jit {
     int no_lookahead;
     int single_step;            /* testing: never enter a block from the fast table */
     int pm_seen;                /* r55: 386 left real mode since the last flush */
+    unsigned long pm_flushes, pm_keeps;   /* r73: real-mode cache kept / flushed after PM */
     uint32_t *h386;             /* r56: interpreter steps in 386 real mode by form:
                                    [op] plain, [256 + op] 66h, [512 + op2] 0F op2 */
     int no_chain;               /* testing: never patch chain exits */
@@ -4002,6 +4003,14 @@ int b86_jit_evict_enabled(J *j) { return j && j->evict; }
 B86_HOT void b86_jit_set_hot_threshold(J *j, unsigned n) { j->hot_threshold = n > 255u ? 255u : n; }
 B86_HOT void b86_jit_set_count_retired(J *j, int on) { j->e.count_ret = on; }
 B86_HOT void b86_jit_invalidate(J *j, uint32_t lin, uint32_t len) { if (len) invalidate(j, lin, lin + len); }
+/* r73: out[0] whole-cache flushes, [1] of them on return from protected mode,
+ * [2] returns from protected mode that kept the cache */
+void b86_jit_flush_causes(const J *j, unsigned long out[3])
+{
+    out[0] = j ? (unsigned long)j->st.flushes : 0ul;
+    out[1] = j ? j->pm_flushes : 0ul;
+    out[2] = j ? j->pm_keeps : 0ul;
+}
 
 B86_HOT void b86_jit_set_shadow(J *j, uint8_t *shadow)
 {
@@ -4227,7 +4236,16 @@ B86_HOT int b86_jit_run(B86Cpu *c, uint64_t max_dispatch)
             /* A protected-mode exit can land in 386 real-mode system code
              * (e.g. MOV FS/GS,r/m16). The legacy 16-bit native translator
              * must not own the FIRST slice after the far-jump reload. */
+#if !defined(B86_RM_KEEP_ON_PM) || B86_RM_KEEP_ON_PM
+            /* r73: protected-mode stores already invalidate real-mode code
+             * through smc(); flush only if one could not be placed */
+            if (c->pg_pad & 1u) { b86_jit_flush(c->jit); ++c->jit->pm_flushes; }
+            else ++c->jit->pm_keeps;
+            c->pg_pad = 0u;
+#else
             b86_jit_flush(c->jit);
+            ++c->jit->pm_flushes;
+#endif
             c->jit->pm_seen = 0;
             return b86_386_rm0_run(c, max_dispatch);
         }
@@ -4236,6 +4254,7 @@ B86_HOT int b86_jit_run(B86Cpu *c, uint64_t max_dispatch)
         r386_merge(c);
         if (r == B86_PM_ENTER) {               /* switched to protected mode mid-run */
             c->jit->pm_seen = 1;
+            c->pg_pad = 0u;                    /* r73: unsure-store flag for this excursion */
             return b86_386_rm0_run(c, max_dispatch);
         }
         return r;

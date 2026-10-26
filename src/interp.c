@@ -172,10 +172,28 @@ B86_HOT static inline __attribute__((always_inline)) uint32_t lin(const B86Cpu *
 }
 
 static inline void b86_pj_note_store(B86Cpu *c, uint32_t lin, uint32_t n);   /* r70 */
+/* r73: keep the real-mode code cache across protected-mode excursions.
+ * Real-mode blocks are indexed by physical address. With paging on, a
+ * protected-mode store is translated through the TLB; if that is not
+ * possible (miss, page crossing) the store is recorded as "unsure" in
+ * c->pg_pad and the real-mode cache is flushed on the way back, as before. */
+#ifndef B86_RM_KEEP_ON_PM
+#define B86_RM_KEEP_ON_PM 1
+#endif
 B86_HOT static inline void smc(B86Cpu *c, uint32_t a, uint32_t n)
 {
 #if defined(B86_PJ) && B86_PJ
     if (c->pj && (c->msw & 1u)) b86_pj_note_store(c, a, n);     /* r70: PM code-page filter */
+#endif
+#if B86_RM_KEEP_ON_PM
+    if ((c->msw & 1u) && c->pg) {
+        const unsigned slot = (a >> 12) & 63u;
+        if (c->tlb_tag[slot] != ((a & 0xFFFFF000u) | 1u) || (a & 0xFFFu) + n > 0x1000u) {
+            c->pg_pad |= 1u;
+            return;
+        }
+        a = c->tlb_phys[slot] + (a & 0xFFFu);
+    }
 #endif
 #if B86_RAM_BYTES > B86_MEM_BYTES
     if (a >= B86_MEM_BYTES) return;               /* r63: never translated */
