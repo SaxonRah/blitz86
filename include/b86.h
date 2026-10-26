@@ -45,6 +45,11 @@ extern "C" {
    (the JIT's model) seg*16+off is never wrapped, so every segment is a flat
    64 KiB window starting at mem + seg*16. */
 #define B86_MEM_BYTES   (0x110000u + 0x20u)
+/* r73: keep the real-mode code cache across protected-mode excursions
+ * (interp.c smc() + jit.c). r73d: off by default for the Pico A/B run. */
+#ifndef B86_RM_KEEP_ON_PM
+#define B86_RM_KEEP_ON_PM 0
+#endif
 #define B86_LINE_SHIFT  6u                         /* SMC line = 64 bytes */
 /* r63: total guest RAM. B86_MEM_BYTES above stays the *low window*: real
    mode (1 MiB + HMA), everything the JIT translates, the SMC line table,

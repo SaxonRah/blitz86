@@ -128,3 +128,58 @@ Verification (far layout, sampling on so promotions happen at arbitrary points):
   stress (32 KiB tier, promote-after-1, 100 us sampling): 159,986 runs, 0 mismatches
   menus -> demo 1.0G insns, 96 KiB tier: 16,827,609 runs, 0 mismatches,
   22,994 promotions (21,278 from samples), 59 resets
+
+r73b (after the Pico run of r73)
+--------------------------------
+Pico r73: Descent halted at ~111M instructions (DOS/4GW dispatched to
+0268:00000005). r72f stopped at a similar point (back at the DOS prompt).
+Both builds had the 20 kHz core-0 PC sampler; r72e (no sampler) ran on.
+  * the sample drain no longer touches block headers unless sample promotion
+    is on, and then only for a block the page lists confirm (a granule walk
+    over stale headers could otherwise write into native code; not seen in
+    the harness: 87,383 sampled lookups, 0 bogus)
+  * blitzBUS bb386_pj_pcs_v3.py: sampler OFF by default ($env:BB_PCS='1' on)
+Loading with r73 (real-mode cache kept), Pico, first PM entry -> PM entry
+#256: 41.6 s (r72f) -> 31.7 s; real-mode flushes 1,949 -> 58.
+
+r73c (after the Pico run of r73b)
+---------------------------------
+r73b with the sampler OFF still died at ~114M instructions (USB gone: host
+crash). So the sampler is not the cause. What r73/r73b share and r72e lacks:
+the real-mode cache kept across protected mode. Kept, the 128 KiB cache
+filled and region eviction (r52) ran under DOS/4GW for the first time
+(Pico r73b: 28 evictions, 367 blocks, 198 unchains in 7 s); before r73 the
+cache was flushed on every return and never filled.
+  * once a program enters protected mode, a full real-mode cache is flushed
+    whole (region eviction stays for pure real-mode programs)
+  * the r72f sample index and drain are compiled out (B86_PJ_PCS=0, default):
+    the protected-mode translator is r72e's again (stress verify 160,106 runs,
+    the same count as r72d/e, 0 mismatches)
+  * b86_pj_pc_sample_lr / b86_pj_pc_top_lr: caller (LR) profile
+Harness (--jit --pj, 128 KiB real-mode cache): 55 flushes, 1,712 returns
+kept the cache, identical final screen to the flushing build.
+
+r73d (A/B build after r73c)
+---------------------------
+r73c (translator = r72e, sampler off, real-mode cache kept, region eviction
+off after the first PM return) still died at ~117M instructions. The r73b
+crash left a hard-fault record at the next boot: stacked PC 11724BDC, inside
+the PSRAM protected-mode code buffer (116FA000 + 0x2ABDC).
+r73d = r73c with B86_RM_KEEP_ON_PM 0 (now in include/b86.h, so interp.c and
+jit.c agree): the real-mode cache is flushed on every PM return and smc()
+checks linear addresses, exactly as in r72e. Harness: 1,767 flushes on PM
+return, 0 kept.
+
+r73e (baseline after r73d)
+--------------------------
+r73d (real-mode keep off) did not hard-fault, but at ~113M instructions the
+SD layer started failing every access to DRIVE_C.IMG (FatFs FR_INVALID_OBJECT
+on FAT sectors 610/90/342, then writes), DOS saw disk errors and Descent fell
+back to the prompt behind the mode-13h screen. Every build since r72f has
+died at 99-117M instructions, each time differently (DOS prompt, guest halt,
+hard fault in PSRAM code twice at 11724BDx, SD failure): consistent with a
+host memory overwrite triggered at one point of Descent's loading, or with a
+damaged disk image.
+r73e: sampler tables compiled out (B86_PJ_PCS=0 now also shrinks the ring and
+heavy-hitter tables to 4 entries: SRAM back to the r72e size). Stress verify:
+160,106 runs, 0 mismatches.

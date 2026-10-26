@@ -850,7 +850,7 @@ int main(int argc, char **argv)
 #else
     if (use_jit) {
         static uint8_t hot[64 * 1024] __attribute__((aligned(64)));
-        size_t code_bytes = 224u * 1024u;
+        size_t code_bytes = (getenv("B86_RMJIT_KB") ? (size_t)atoi(getenv("B86_RMJIT_KB")) : 224u) * 1024u;   /* r73c */
         void *code = mmap(NULL, code_bytes, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (code == MAP_FAILED || b86_jit_hot_bytes() > sizeof hot) { logf_("jit buffers"); return 2; }
         J = b86_jit_create_ex(&C, code, code_bytes, hot, sizeof hot);
@@ -922,6 +922,10 @@ int main(int argc, char **argv)
                 st[0], st[1], st[2], st[3], st[2] ? (double)st[3] / st[2] : 0.0, st[4], st[5], st[6], st[7]);
         { extern void b86_pj_flush_causes(const B86Cpu *, unsigned long *); { extern void b86_pj_hot_stats(const B86Cpu *, unsigned long *); unsigned long hs[6]; b86_pj_hot_stats(&C, hs);
             fprintf(stderr, "[host] pj hot tier: promotions %lu resets %lu refused %lu used %lu/%lu trampolines %lu\n", hs[0], hs[1], hs[2], hs[3], hs[4], hs[5]); }
+#ifdef DOS4GW_JIT
+        if (J) { unsigned long fc[3]; b86_jit_flush_causes(J, fc);
+            fprintf(stderr, "[host] rm jit: flushes %lu (on PM return %lu), PM returns that kept the cache %lu, region eviction %d (evictions %llu blocks %llu unchains %llu)\n", fc[0], fc[1], fc[2], b86_jit_evict_enabled(J), (unsigned long long)b86_jit_stats(J)->evictions, (unsigned long long)b86_jit_stats(J)->evicted_blocks, (unsigned long long)b86_jit_stats(J)->unchains); }
+#endif
         if (getenv("B86_PCS_US")) { extern void b86_pj_pc_stats(unsigned long *); unsigned long ps[8]; b86_pj_pc_stats(ps);
             fprintf(stderr, "[host] pc samples: psram-blocks %lu psram-shared %lu sram-tier %lu sram-other %lu flash %lu psram-other %lu other %lu | sample promotions %lu\n",
                     ps[0], ps[1], ps[2], ps[3], ps[4], ps[5], ps[6], ps[7]); }

@@ -4236,10 +4236,17 @@ B86_HOT int b86_jit_run(B86Cpu *c, uint64_t max_dispatch)
             /* A protected-mode exit can land in 386 real-mode system code
              * (e.g. MOV FS/GS,r/m16). The legacy 16-bit native translator
              * must not own the FIRST slice after the far-jump reload. */
-#if !defined(B86_RM_KEEP_ON_PM) || B86_RM_KEEP_ON_PM
+#if B86_RM_KEEP_ON_PM
             /* r73: protected-mode stores already invalidate real-mode code
              * through smc(); flush only if one could not be placed */
-            if (c->pg_pad & 1u) { b86_jit_flush(c->jit); ++c->jit->pm_flushes; }
+            /* r73c: once a program uses protected mode, a full cache makes
+             * room by a whole flush; region eviction (r52) is kept for pure
+             * real-mode programs. On the Pico, r73 kept the cache and then
+             * evicted regions, and the guest or the host died soon after. */
+            if ((c->pg_pad & 1u) || c->jit->evict) {
+                b86_jit_flush(c->jit); ++c->jit->pm_flushes;
+                if (c->jit->evict) { c->jit->evict = 0; c->jit->e.end = c->jit->buf_end; }
+            }
             else ++c->jit->pm_keeps;
             c->pg_pad = 0u;
 #else

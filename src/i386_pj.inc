@@ -184,45 +184,57 @@ unsigned long b86_pj_stat_runs, b86_pj_stat_insns;
 #define PJ_LINK_BYTES (B86_PJ_LINKS * 2u * sizeof(uint32_t))
 /* r72f: granule index: first PSRAM block starting in each 2^gshift-byte granule
  * of the code buffer (offset + 1), so a sampled PC can be mapped to its block */
+/* r73c: B86_PJ_PCS=0 (default) builds without the sample index and drain:
+ * the code buffer and translation path are exactly r72e's */
+#ifndef B86_PJ_PCS
+#define B86_PJ_PCS 0
+#endif
 #define PJ_GIDX_N (PJ_SMALL_TAIL ? 256u : 2048u)
-#define PJ_GIDX_BYTES (PJ_GIDX_N * sizeof(uint32_t))
+#define PJ_GIDX_BYTES (B86_PJ_PCS ? PJ_GIDX_N * sizeof(uint32_t) : 0u)
 #define PJ_TAIL_BYTES (PJ_NEG_BYTES + 2u * B86_PJ_CPS * sizeof(uint32_t) + PJ_PM16_BYTES + PJ_LINK_BYTES + PJ_GIDX_BYTES)
 /* r72f: PC sampler state (host timer interrupt -> b86_pj_pc_sample) */
-#define PJ_PCS_RING 64u
+#define PJ_PCS_RING (B86_PJ_PCS ? 64u : 4u)   /* r73e: tiny when the sampler is compiled out */
 static volatile uint32_t pj_pcs_ring[PJ_PCS_RING], pj_pcs_w, pj_pcs_r;
 static volatile uint32_t pj_pcs_lo, pj_pcs_hi, pj_pcs_sh, pj_pcs_hlo, pj_pcs_hhi;
 static volatile unsigned long pj_pcs_cls[8];
 /* r73: heavy-hitter table of C-code PCs (SRAM other than the tier, and flash):
  * 256 slots, 4-way probing, space-saving replacement; key = pc >> 3 */
-#define PJ_PCS_TOPN 256u
-static volatile uint32_t pj_pcs_tkey[PJ_PCS_TOPN], pj_pcs_tcnt[PJ_PCS_TOPN];
+#define PJ_PCS_TOPN (B86_PJ_PCS ? 256u : 4u)
+static volatile uint32_t pj_pcs_tkey[2][PJ_PCS_TOPN], pj_pcs_tcnt[2][PJ_PCS_TOPN];
 static volatile uint8_t pj_pcs_promote_on = 1u;
-static B86_PM_HOT void pj_pcs_top_add(uint32_t pc)
+static B86_PM_HOT void pj_pcs_top_add2(unsigned t, uint32_t pc)
 {
+    volatile uint32_t *tk = pj_pcs_tkey[t], *tc = pj_pcs_tcnt[t];
     const uint32_t key = (pc >> 3) | 0x80000000u;
-    uint32_t i = (key * 0x9E3779B1u) >> 24, k, mi = i, mc = 0xFFFFFFFFu;
+    uint32_t i = ((key * 0x9E3779B1u) >> 24) & (PJ_PCS_TOPN - 1u), k, mi = i, mc = 0xFFFFFFFFu;
     for (k = 0u; k < 4u; ++k, i = (i + 1u) & (PJ_PCS_TOPN - 1u)) {
-        if (pj_pcs_tkey[i] == key) { ++pj_pcs_tcnt[i]; return; }
-        if (!pj_pcs_tkey[i]) { pj_pcs_tkey[i] = key; pj_pcs_tcnt[i] = 1u; return; }
-        if (pj_pcs_tcnt[i] < mc) { mc = pj_pcs_tcnt[i]; mi = i; }
+        if (tk[i] == key) { ++tc[i]; return; }
+        if (!tk[i]) { tk[i] = key; tc[i] = 1u; return; }
+        if (tc[i] < mc) { mc = tc[i]; mi = i; }
     }
-    pj_pcs_tkey[mi] = key; pj_pcs_tcnt[mi] = mc + 1u;
+    tk[mi] = key; tc[mi] = mc + 1u;
 }
-/* r73: the n most-sampled C-code PCs since the last call (8-byte buckets),
- * largest first; clears the table. Returns how many were written. */
-unsigned b86_pj_pc_top(unsigned n, uint32_t *pc, uint32_t *cnt)
+#define pj_pcs_top_add(pc) pj_pcs_top_add2(0u, (pc))
+static unsigned pj_pcs_top_get(unsigned t, unsigned n, uint32_t *pc, uint32_t *cnt)
 {
+    volatile uint32_t *tk = pj_pcs_tkey[t], *tc = pj_pcs_tcnt[t];
     unsigned k, m = 0u, i;
     for (k = 0u; k < n; ++k) {
         uint32_t best = 0u, bi = 0u;
-        for (i = 0u; i < PJ_PCS_TOPN; ++i) if (pj_pcs_tkey[i] && pj_pcs_tcnt[i] > best) { best = pj_pcs_tcnt[i]; bi = i; }
+        for (i = 0u; i < PJ_PCS_TOPN; ++i) if (tk[i] && tc[i] > best) { best = tc[i]; bi = i; }
         if (!best) break;
-        pc[m] = (pj_pcs_tkey[bi] & 0x7FFFFFFFu) << 3; cnt[m] = best; ++m;
-        pj_pcs_tcnt[bi] = 0u;
+        pc[m] = (tk[bi] & 0x7FFFFFFFu) << 3; cnt[m] = best; ++m;
+        tc[bi] = 0u;
     }
-    for (i = 0u; i < PJ_PCS_TOPN; ++i) { pj_pcs_tkey[i] = 0u; pj_pcs_tcnt[i] = 0u; }
+    for (i = 0u; i < PJ_PCS_TOPN; ++i) { tk[i] = 0u; tc[i] = 0u; }
     return m;
 }
+/* r73: the n most-sampled C-code PCs since the last call (8-byte buckets),
+ * largest first; clears the table. Returns how many were written. */
+unsigned b86_pj_pc_top(unsigned n, uint32_t *pc, uint32_t *cnt) { return pj_pcs_top_get(0u, n, pc, cnt); }
+/* r73c: the same for the interrupted code's LR (its caller, for leaf
+ * functions such as divides, memchr or busy waits) */
+unsigned b86_pj_pc_top_lr(unsigned n, uint32_t *pc, uint32_t *cnt) { return pj_pcs_top_get(1u, n, pc, cnt); }
 /* r73: switch sample-driven promotion on or off (profiling stays on) */
 void b86_pj_pc_promote(int on) { pj_pcs_promote_on = on ? 1u : 0u; }
 /* Interrupt-safe; classifies the sample and queues PCs in PSRAM blocks.
@@ -239,6 +251,15 @@ B86_PM_HOT void b86_pj_pc_sample(uint32_t pc)
     else if (pc - 0x10000000u < 0x01000000u) { ++pj_pcs_cls[4]; pj_pcs_top_add(pc); }
     else if (pc - 0x11000000u < 0x01000000u) ++pj_pcs_cls[5];
     else ++pj_pcs_cls[6];
+}
+/* r73c: sample with the interrupted LR; the LR is counted for C-code PCs */
+B86_PM_HOT void b86_pj_pc_sample_lr(uint32_t pc, uint32_t lr)
+{
+    b86_pj_pc_sample(pc);
+    pc &= ~1u;
+    if (pc - 0x20000000u < 0x00082000u ? !(pj_pcs_hhi && pc - pj_pcs_hlo < pj_pcs_hhi - pj_pcs_hlo)
+                                       : pc - 0x10000000u < 0x01000000u)
+        pj_pcs_top_add2(1u, lr & ~1u);
 }
 void b86_pj_pc_stats(unsigned long out[8])
 {
@@ -2394,7 +2415,7 @@ static B86_PJ_COLD void b86_pj_flush(B86Cpu *c)
     j->used = 0u;
     j->flush_pending = 0;
     c->pj_stop = 0u;
-    memset(pj_gidx(j), 0, PJ_GIDX_BYTES);           /* r72f */
+    if (B86_PJ_PCS) memset(pj_gidx(j), 0, PJ_GIDX_BYTES);           /* r72f */
     pj_emit_shared(j);
     if (j->hot) { j->hot_used = j->hot_start; j->nredir = 0u; }
     ++j->flushes;
@@ -2940,7 +2961,7 @@ static B86_PJ_COLD void pj_evict_switch(B86Cpu *c, B86Pj *j)
         if (e && e - 1u >= lo && e - 1u < hi) { en[k % PJ_PM16_ENT] = 0u; tg[k % PJ_PM16_ENT] = 0u; }
     }
     memset(j->es_skip_eip, 0, sizeof j->es_skip_eip);
-    {   uint32_t *gi = pj_gidx(j), g;                 /* r72f: granule index entries into the evicted half */
+    if (B86_PJ_PCS) {   uint32_t *gi = pj_gidx(j), g;                 /* r72f: granule index entries into the evicted half */
         for (g = lo >> j->gshift; g <= (hi - 1u) >> j->gshift && g < PJ_GIDX_N; ++g)
             if (gi[g] && gi[g] - 1u >= lo && gi[g] - 1u < hi) gi[g] = 0u;
     }
@@ -3180,7 +3201,7 @@ static B86_PJ_COLD uint32_t b86_pj_translate(B86Cpu *c, uint32_t eip)
     pj_hdr(j, start_off)[5] = j->used - start_off;    /* r71: walkable block chain */
     if (!j->tr_hot) j->half_fill[j->cur_half] = j->used;
     pj_hdr(j, start_off)[7] = 0u;
-    if (!j->tr_hot) { uint32_t *gi = pj_gidx(j) + (start_off >> j->gshift); if (!*gi) *gi = start_off + 1u; }   /* r72f */
+    if (B86_PJ_PCS && !j->tr_hot) { uint32_t *gi = pj_gidx(j) + (start_off >> j->gshift); if (!*gi) *gi = start_off + 1u; }   /* r72f */
 #if defined(__linux__)
     __builtin___clear_cache((char *)j->code + start_off, (char *)t.e.p);
 #else
@@ -3408,7 +3429,7 @@ static B86_PM_HOT void pj_pcs_drain(B86Cpu *c, B86Pj *j)
 {
     const uint32_t w = pj_pcs_w;
     uint32_t r = pj_pcs_r;
-    int ok = pj_flat(c);
+    int ok = pj_flat(c) && pj_pcs_promote_on;          /* r73b: no promotion, no header writes */
 #if BB_PJ_PM16_REG_TIER
     if (j->pm16_active) ok = 0;
 #endif
@@ -3424,6 +3445,10 @@ static B86_PM_HOT void pj_pcs_drain(B86Cpu *c, B86Pj *j)
         if (!off) continue;
         hd = pj_hdr(j, --off);
         if (hd[1] & 0xC0000000u) continue;           /* dead / redirected, or PM16 */
+        /* r73b: the granule walk can reach stale headers left in the code
+         * buffer by an earlier generation; only a block the page lists know
+         * is real. Writing hd[7] at a wrong offset corrupted native code. */
+        if (pj_find_block(j, hd[0], hd[4], 0u) != off + PJ_HDR_BYTES + 1u) continue;
         ep = (j->pcs_n++ >> 11) & 15u;
         v = hd[7];
         if ((v >> 28) != ep) v = (v & 0xFFFFFu) | (ep << 28);
@@ -3442,7 +3467,7 @@ static B86_PM_HOT unsigned b86_pj_try(B86Cpu *c)
     B86Pj *j = b86_pj_state(c);
     uint32_t h, ent;
     unsigned n;
-    if (j && j->hot && pj_pcs_r != pj_pcs_w) pj_pcs_drain(c, j);   /* r72f */
+    if (B86_PJ_PCS && j && j->hot && pj_pcs_r != pj_pcs_w) pj_pcs_drain(c, j);   /* r72f */
 #if BB_PJ_PM16_REG_TIER
     {
         const unsigned flat = j && pj_flat(c);

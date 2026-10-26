@@ -177,9 +177,6 @@ static inline void b86_pj_note_store(B86Cpu *c, uint32_t lin, uint32_t n);   /* 
  * protected-mode store is translated through the TLB; if that is not
  * possible (miss, page crossing) the store is recorded as "unsure" in
  * c->pg_pad and the real-mode cache is flushed on the way back, as before. */
-#ifndef B86_RM_KEEP_ON_PM
-#define B86_RM_KEEP_ON_PM 1
-#endif
 B86_HOT static inline void smc(B86Cpu *c, uint32_t a, uint32_t n)
 {
 #if defined(B86_PJ) && B86_PJ
