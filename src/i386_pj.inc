@@ -2229,6 +2229,10 @@ static B86_PJ_COLD void pj_emit_shared_at(B86Pj *j, uint8_t *base, uint8_t *end)
      * [sp+4] and [sp+16] belong to callers; never use them as scratch.
      * Fail closed for unusual widths, paging off, crossings, TLB misses,
      * and out-of-RAM addresses. No new B86Cpu/B86Pj fields. */
+/* BB_PJ_MEMFAST_V1: fixed-size emit stubs provide only 1/2/4 reads and 0x101/0x102/0x104 writes. */
+#ifndef BB_PJ_MEMSIZE_TRUSTED_STUBS_V1
+#define BB_PJ_MEMSIZE_TRUSTED_STUBS_V1 1
+#endif
 #ifndef BB_PJ_SHARED_MEMTRAMP_FAST
 #define BB_PJ_SHARED_MEMTRAMP_FAST 1
 #endif
@@ -2249,12 +2253,23 @@ static B86_PJ_COLD void pj_emit_shared_at(B86Pj *j, uint8_t *base, uint8_t *end)
             pj_ldst(&t->e, PJ_LDRB, R0, CREG, (unsigned)offsetof(B86Cpu, pg));
             pj_dpi(&t->e, 13u, 1, PC, R0, 0u);
             miss[nm++] = pj_b(&t->e, 0 /* EQ: paging disabled */);
+#if BB_PJ_MEMSIZE_TRUSTED_STUBS_V1
+            /* All native callers enter through memt[k] stubs which load
+             * R2 from the six compile-time constants 1,2,4,0x101,0x102,
+             * 0x104. No direct callers enter memtramp. Thus a single
+             * unsigned R2>4 check admits all reads and rejects all writes.
+             * The original size, crossing, TLB and RAM checks remain in
+             * the #else control and the common paths below unchanged. */
+            pj_dpi(&t->e, 13u, 1, PC, R2, 4u);
+            miss[nm++] = pj_b(&t->e, 8 /* HI: all write stubs */);
+#else
             pj_dpi(&t->e, 13u, 1, PC, R2, 1u);
             miss[nm++] = pj_b(&t->e, 3 /* LO: invalid size */);
             pj_dpi(&t->e, 13u, 1, PC, R2, 4u);
             miss[nm++] = pj_b(&t->e, 8 /* HI: write/invalid size */);
             pj_dpi(&t->e, 13u, 1, PC, R2, 3u);
             miss[nm++] = pj_b(&t->e, 0 /* EQ: invalid size */);
+#endif
             pj_ubfx(&t->e, R0, R1, 0u, 12u);
             pj_dpr(&t->e, 8u, 0, R0, R0, R2, 0u, 0u);
             pj_dpi(&t->e, 13u, 1, PC, R0, 4096u);
@@ -4100,6 +4115,31 @@ int b86_pj_attach_hot(B86Cpu *c, void *buf, size_t bytes)
         (unsigned)(j->hsh.tail_z-j->hot),(unsigned)(j->hsh.exit_s-j->hot),(unsigned)(j->hsh.chk-j->hot),
         (unsigned)(j->hsh.memtramp-j->hot),(unsigned)(j->hsh.entry-j->hot),(unsigned)(j->hsh.dyn-j->hot),(unsigned)(j->hsh.lzh[0]-j->hot),(unsigned)(j->hsh.memt[0]-j->hot),(unsigned)(j->hot_start-j->hot_base));
 #endif
+    /* BB_PJ_SHARED_ATLAS_V1: read-only emitter boundary report, attach only. */
+    printf("[bb386-shared-layout] tier=psram base=%08lX shared-end=%lu tail_z=%lu tail=%lu exit_s=%lu chk=%lu lzh0=%lu memtramp=%lu memt0=%lu entry=%lu dyn=%lu\n",
+        (unsigned long)(uintptr_t)j->code, (unsigned long)j->shared_end,
+        (unsigned long)(uintptr_t)(j->tail_z - j->code),
+        (unsigned long)(uintptr_t)(j->tail - j->code),
+        (unsigned long)(uintptr_t)(j->exit_s - j->code),
+        (unsigned long)(uintptr_t)(j->chk - j->code),
+        (unsigned long)(uintptr_t)(j->lzh[0] - j->code),
+        (unsigned long)(uintptr_t)(j->memtramp - j->code),
+        (unsigned long)(uintptr_t)(j->memt[0] - j->code),
+        (unsigned long)(uintptr_t)(j->entry - j->code),
+        (unsigned long)(uintptr_t)(j->dyn - j->code));
+    printf("[bb386-shared-layout] tier=sram base=%08lX shared-end=%lu tail_z=%lu tail=%lu exit_s=%lu chk=%lu lzh0=%lu memtramp=%lu memt0=%lu entry=%lu dyn=%lu\n",
+        (unsigned long)(uintptr_t)j->hot, (unsigned long)(j->hot_start - j->hot_base),
+        (unsigned long)(uintptr_t)(j->hsh.tail_z - j->hot),
+        (unsigned long)(uintptr_t)(j->hsh.tail - j->hot),
+        (unsigned long)(uintptr_t)(j->hsh.exit_s - j->hot),
+        (unsigned long)(uintptr_t)(j->hsh.chk - j->hot),
+        (unsigned long)(uintptr_t)(j->hsh.lzh[0] - j->hot),
+        (unsigned long)(uintptr_t)(j->hsh.memtramp - j->hot),
+        (unsigned long)(uintptr_t)(j->hsh.memt[0] - j->hot),
+        (unsigned long)(uintptr_t)(j->hsh.entry - j->hot),
+        (unsigned long)(uintptr_t)(j->hsh.dyn - j->hot));
+    fflush(stdout);
+    /* BB_PJ_SHARED_ATLAS_V1_END */
     pj_pcs_hlo = (uint32_t)(uintptr_t)j->hot; pj_pcs_hhi = pj_pcs_hlo + j->hot_cap;   /* r72f */
     return 1;
 }
