@@ -2927,6 +2927,79 @@ static B86_PJ_COLD void pj_rebuild_walk(B86Pj *j, uint32_t lo, uint32_t hi)
         off += size;
     }
 }
+/* r73h: integrity audit after every eviction and tier reset (rare events).
+ * Checks that every logged chained jump, every hash entry and every SRAM
+ * redirect still points at a live block of the right EIP. Prints a summary
+ * line and the first few violations. Read-only: changes nothing. */
+static unsigned long pj_aud_runs, pj_aud_bad_total;
+static int pj_aud_live(const B86Pj *j, uint32_t off)
+{
+    unsigned h;
+    if (pj_in_hot(j, off)) return off >= j->hot_start && off < j->hot_used;
+    for (h = 0u; h < 2u; ++h) {
+        const uint32_t lo = j->shared_end + j->half * h;
+        const uint32_t hi = h == j->cur_half ? j->used : (j->half_fill[h] ? j->half_fill[h] : lo);
+        if (off >= lo && off < hi) return 1;
+    }
+    return 0;
+}
+static uint32_t pj_aud_bw(const uint8_t *at)       /* decode B.W/BL T4 target as code offset */
+{
+    const uint32_t h1 = (uint32_t)at[0] | ((uint32_t)at[1] << 8), h2 = (uint32_t)at[2] | ((uint32_t)at[3] << 8);
+    const uint32_t s = (h1 >> 10) & 1u, j1 = (h2 >> 13) & 1u, j2 = (h2 >> 11) & 1u;
+    const uint32_t i1 = (~(j1 ^ s)) & 1u, i2 = (~(j2 ^ s)) & 1u;
+    uint32_t imm = (s << 24) | (i1 << 23) | (i2 << 22) | ((h1 & 0x3FFu) << 12) | ((h2 & 0x7FFu) << 1);
+    if (s) imm |= 0xFE000000u;
+    return (uint32_t)(uintptr_t)(at + 4) + imm;
+}
+static B86_PJ_COLD void pj_audit(B86Pj *j, const char *where)
+{
+    uint32_t i, k, *lk = pj_links(j);
+    unsigned long badl = 0, bade = 0, badr = 0, shown = 0;
+    const uint32_t base = (uint32_t)(uintptr_t)j->code;
+    for (i = 0; i < j->nlinks; ++i) {
+        const uint32_t so = lk[2u * i], to = lk[2u * i + 1u];
+        const uint32_t tgt = pj_aud_bw(j->code + so + 10u) - base;
+        const int ok_src = pj_aud_live(j, so), ok_to = pj_aud_live(j, to);
+        if (!ok_src || !ok_to || tgt != to) {
+            ++badl;
+            if (shown++ < 4u) printf("[bb386-audit]   link #%lu so=%08lX to=%08lX bw=%08lX src-live=%d to-live=%d\n",
+                                     (unsigned long)i, (unsigned long)so, (unsigned long)to, (unsigned long)tgt, ok_src, ok_to);
+        }
+    }
+    for (k = 0; k < B86_PJ_HASH; ++k) {
+        uint32_t e, *hd;
+        if (!j->ent[k]) continue;
+        e = j->ent[k] - 1u;
+        if (!pj_aud_live(j, e) || e < PJ_HDR_BYTES) { ++bade;
+            if (shown++ < 8u) printf("[bb386-audit]   ent[%lu] tag=%08lX off=%08lX NOT LIVE\n", (unsigned long)k, (unsigned long)j->tag[k], (unsigned long)e);
+            continue; }
+        hd = pj_hdr(j, e - PJ_HDR_BYTES);
+        if ((hd[4] | 1u) != j->tag[k]) { ++bade;
+            if (shown++ < 8u) printf("[bb386-audit]   ent[%lu] tag=%08lX off=%08lX hdr-eip=%08lX dead=%lu\n", (unsigned long)k,
+                                     (unsigned long)j->tag[k], (unsigned long)e, (unsigned long)hd[4], (unsigned long)(hd[1] >> 31)); }
+    }
+    if (j->hot) {
+        const uint32_t *rd = pj_redir(j);
+        for (i = 0; i < j->nredir; ++i) {
+            const uint32_t off = rd[4u * i], hent = rd[4u * i + 1u] - 1u;
+            const uint8_t *code = j->code + off + PJ_HDR_BYTES;
+            uint32_t w;
+            memcpy(&w, code + 4, 4);
+            if (!pj_aud_live(j, off) || !pj_aud_live(j, hent) || code[0] != 0xDFu || code[1] != 0xF8u ||
+                w != (((uint32_t)(uintptr_t)(j->code + hent)) | 1u) || pj_hdr(j, off)[4] != pj_hdr(j, hent - PJ_HDR_BYTES)[4]) {
+                ++badr;
+                if (shown++ < 12u) printf("[bb386-audit]   redir #%lu off=%08lX hot=%08lX live=%d/%d op=%02X%02X\n", (unsigned long)i,
+                                          (unsigned long)off, (unsigned long)hent, pj_aud_live(j, off), pj_aud_live(j, hent), code[0], code[1]);
+            }
+        }
+    }
+    ++pj_aud_runs; pj_aud_bad_total += badl + bade + badr;
+    printf("[bb386-audit] %s #%lu links=%lu bad-links=%lu bad-ent=%lu redirs=%lu bad-redir=%lu (total-bad=%lu) cur=%u used=%08lX fill=%08lX/%08lX hot=%08lX..%08lX\n",
+           where, pj_aud_runs, (unsigned long)j->nlinks, badl, bade, (unsigned long)j->nredir, badr, pj_aud_bad_total,
+           j->cur_half, (unsigned long)j->used, (unsigned long)j->half_fill[0], (unsigned long)j->half_fill[1],
+           (unsigned long)j->hot_start, (unsigned long)j->hot_used);
+}
 /* r71: the current half is full: empty the other one and continue there. */
 static B86_PJ_COLD void pj_evict_switch(B86Cpu *c, B86Pj *j)
 {
@@ -2983,20 +3056,34 @@ static B86_PJ_COLD void pj_evict_switch(B86Cpu *c, B86Pj *j)
     j->used = lo;
     ++j->evictions; ++j->gen;
     c->pj_stop = 1u;
+    pj_audit(j, "evict");
 }
 static B86_PJ_COLD uint32_t b86_pj_translate(B86Cpu *c, uint32_t eip);
 /* r72: empty the SRAM tier: trampolines become exits to C, entries into
  * the tier are dropped from the tables, links inside it are forgotten. */
+static unsigned long pj_hr_redirs, pj_hr_restored, pj_hr_dead, pj_hr_short;   /* r73g */
 static B86_PJ_COLD void pj_hot_reset(B86Cpu *c, B86Pj *j)
 {
     uint32_t i, k, n = 0u, *rd = pj_redir(j), *lk = pj_links(j);
+    pj_hr_redirs += j->nredir;
     for (i = 0; i < j->nredir; ++i) {
         /* r72c: the PSRAM copy is still a correct translation unless its
          * SRAM copy was killed by a code write: put its first 8 bytes back
          * and make it live again (no retranslation after a tier reset) */
         const uint32_t off = rd[4u * i], hot_off = rd[4u * i + 1u] - 1u - PJ_HDR_BYTES;
         uint8_t *code = j->code + off + PJ_HDR_BYTES;
-        if (!(pj_hdr(j, hot_off)[1] & 0x80000000u)) {
+        /* r73g: the PSRAM copy X was dead while redirected, so SMC kills only
+         * reached the SRAM copy H. X is still valid only if H covered every
+         * guest byte X was translated from (same start, same physical page,
+         * at least the same length). A shorter H let a store into X's tail go
+         * unnoticed; reviving X then ran stale code. */
+        const uint32_t *hx = pj_hdr(j, off), *hh = pj_hdr(j, hot_off);
+        const int h_alive = !(hh[1] & 0x80000000u);
+        const int covered = hh[0] == hx[0] && hh[4] == hx[4] && hh[6] == hx[6] &&
+                            (hh[1] & 0x3FFFFFFFu) >= (hx[1] & 0x3FFFFFFFu);
+        if (!h_alive) ++pj_hr_dead; else if (!covered) ++pj_hr_short;
+        if (h_alive && covered) {
+            ++pj_hr_restored;
             memcpy(code, &rd[4u * i + 2u], 8u);
             pj_hdr(j, off)[1] &= ~0x80000000u;
             pj_hdr(j, off)[7] = 0u;
@@ -3031,6 +3118,9 @@ static B86_PJ_COLD void pj_hot_reset(B86Cpu *c, B86Pj *j)
 #endif
     ++j->hot_resets; ++j->gen;
     c->pj_stop = 1u;
+    printf("[bb386-hotreset] #%lu redirects=%lu restored=%lu stubbed-dead=%lu stubbed-short=%lu (totals) evictions=%lu\n",
+           j->hot_resets, pj_hr_redirs, pj_hr_restored, pj_hr_dead, pj_hr_short, j->evictions);
+    pj_audit(j, "hotreset");
 }
 /* r72: translate eip into the SRAM tier; returns its entry (0 = refused) */
 static B86_PJ_COLD uint32_t pj_hot_translate(B86Cpu *c, B86Pj *j, uint32_t eip)

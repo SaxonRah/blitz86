@@ -48,7 +48,7 @@ extern "C" {
 /* r73: keep the real-mode code cache across protected-mode excursions
  * (interp.c smc() + jit.c). r73d: off by default for the Pico A/B run. */
 #ifndef B86_RM_KEEP_ON_PM
-#define B86_RM_KEEP_ON_PM 0
+#define B86_RM_KEEP_ON_PM 1
 #endif
 #define B86_LINE_SHIFT  6u                         /* SMC line = 64 bytes */
 /* r63: total guest RAM. B86_MEM_BYTES above stays the *low window*: real

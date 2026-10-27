@@ -183,3 +183,13 @@ damaged disk image.
 r73e: sampler tables compiled out (B86_PJ_PCS=0 now also shrinks the ring and
 heavy-hitter tables to 4 entries: SRAM back to the r72e size). Stress verify:
 160,106 runs, 0 mismatches.
+
+r73f
+----
+Pico A/B on r73e: PJ 768 KiB + hot tier 0 -> ran 1.28G insns into the demo
+(12 evictions); PJ 384 KiB + hot 96 KiB -> ran into the demo (184 evictions,
+3 tier resets). Only the 768 + 96 combination has failed (4/4 runs, at the
+first eviction of a non-empty half, ~110-117M insns). The r73 real-mode
+cache keep was never the cause: re-enabled (B86_RM_KEEP_ON_PM 1). Harness:
+55 flushes, 1,712 PM returns kept the cache. Recommended Pico settings:
+BB_PJ_CODE_KB=384, BB_PJ_HOT_KB=96.
