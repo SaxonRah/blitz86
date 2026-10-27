@@ -1,3 +1,4 @@
+#include "b86_div.h"   /* r73i */
 #ifdef B86_PJ_RANGE_CHECK
 #include <stdio.h>
 #endif
@@ -666,28 +667,8 @@ static B86_PM_HOT uint8_t *b86_pj_es_mov8_ptr(B86Cpu *c, uint32_t off)
  * remainder in b86_pj_divres. 0 = #DE (the interpreter raises it). */
 uint32_t b86_pj_divres[2];
 static B86_PM_HOT uint32_t b86_pj_div(uint32_t lo, uint32_t hi, uint32_t d, uint32_t wsgn)
-{
-    const unsigned w = wsgn & 7u, sgn = (wsgn >> 3) & 1u, bits = 8u * w;
-    const uint32_t m = w == 4u ? 0xFFFFFFFFu : (1u << bits) - 1u;
-    d &= m;
-    if (!d) return 0u;
-    if (!sgn) {
-        const uint64_t num = w == 4u ? ((uint64_t)hi << 32) | lo : w == 2u ? (uint64_t)(((hi & 0xFFFFu) << 16) | (lo & 0xFFFFu))
-                                                                 : (uint64_t)(lo & 0xFFFFu);   /* 8-bit: AX */
-        const uint64_t q = num / d;
-        if (q > m) return 0u;
-        b86_pj_divres[0] = (uint32_t)q; b86_pj_divres[1] = (uint32_t)(num % d);
-    } else {
-        const int64_t den = w == 4u ? (int32_t)d : w == 2u ? (int16_t)d : (int8_t)d;
-        const int64_t num = w == 4u ? (int64_t)(((uint64_t)hi << 32) | lo) :
-                            w == 2u ? (int64_t)(int32_t)(((hi & 0xFFFFu) << 16) | (lo & 0xFFFFu)) : (int64_t)(int16_t)lo;
-        int64_t q;
-        if (den == -1 && num == INT64_MIN) return 0u;
-        q = num / den;
-        if (q > (int64_t)(m >> 1) || q < -(int64_t)(m >> 1) - 1) return 0u;
-        b86_pj_divres[0] = (uint32_t)q; b86_pj_divres[1] = (uint32_t)(num % den);
-    }
-    return 1u;
+{   /* r73i: hardware UDIV/SDIV + divlu instead of libgcc 64-bit division */
+    return (uint32_t)b86_divx(lo, hi, d, wsgn & 7u, (wsgn >> 3) & 1u, &b86_pj_divres[0], &b86_pj_divres[1]);
 }
 /* MOVS/STOS/LODS (desc = op | rep<<8 | width<<9), guest registers already in
  * c->r. 1 = instruction completed; 0 = stop here (nothing or part done --

@@ -1,3 +1,4 @@
+#include "b86_div.h"   /* r73i */
 /* B86_PM40_V1 (r68): fast path for 32-bit protected-mode code.
  *
  * One decoder and one set of instruction semantics for the instructions that
@@ -613,24 +614,12 @@ static B86_PM40_FLASH int b86_pm40_step(B86Cpu *c)
             break; }
         default: {                               /* DIV / IDIV */
             if (!(a & m)) NO();
-            if (d.reg == 6u) {
-                const uint64_t num = ww == 1u ? (c->r[0] & 0xFFFFu) :
-                    ((uint64_t)p40_getr(c, 2u, ww) << (ww * 8u)) | p40_getr(c, 0u, ww);
-                const uint64_t q = num / a, r = num % a;
-                if (q > m) NO();
-                if (ww == 1u) p40_setr(c, 0u, 2u, (uint32_t)q | ((uint32_t)r << 8));
-                else { p40_setr(c, 0u, ww, (uint32_t)q); p40_setr(c, 2u, ww, (uint32_t)r); }
-            } else {
-                const int64_t den = ww == 4u ? (int32_t)a : ww == 2u ? (int16_t)a : (int8_t)a;
-                int64_t num, q, r;
-                if (ww == 1u) num = (int16_t)c->r[0];
-                else if (ww == 2u) num = (int32_t)(((uint32_t)p40_getr(c, 2u, 2u) << 16) | p40_getr(c, 0u, 2u));
-                else num = (int64_t)(((uint64_t)c->r[2] << 32) | c->r[0]);
-                if (den == -1 && num == INT64_MIN) NO();
-                q = num / den; r = num % den;
-                if (q > (int64_t)(m >> 1) || q < -(int64_t)(m >> 1) - 1) NO();
-                if (ww == 1u) p40_setr(c, 0u, 2u, ((uint32_t)q & 0xFFu) | (((uint32_t)r & 0xFFu) << 8));
-                else { p40_setr(c, 0u, ww, (uint32_t)q); p40_setr(c, 2u, ww, (uint32_t)r); }
+            {   /* r73i: hardware UDIV/SDIV + divlu instead of libgcc 64-bit division */
+                uint32_t q, r;
+                const uint32_t dlo = ww == 1u ? c->r[0] : p40_getr(c, 0u, ww), dhi = ww == 1u ? 0u : p40_getr(c, 2u, ww);
+                if (!b86_divx(dlo, dhi, a, ww, d.reg == 7u, &q, &r)) NO();
+                if (ww == 1u) p40_setr(c, 0u, 2u, (q & 0xFFu) | ((r & 0xFFu) << 8));
+                else { p40_setr(c, 0u, ww, q); p40_setr(c, 2u, ww, r); }
             }
             c->pm40_undef |= B86_ARITH;
             break; }
