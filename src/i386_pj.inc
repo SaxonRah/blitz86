@@ -2933,6 +2933,12 @@ static uint32_t pj_aud_bw(const uint8_t *at)       /* decode B.W/BL T4 target as
     if (s) imm |= 0xFE000000u;
     return (uint32_t)(uintptr_t)(at + 4) + imm;
 }
+static int pj_aud_dup(const uint32_t *rd, uint32_t n, uint32_t i)   /* r73j: another entry for the same X? */
+{
+    uint32_t k;
+    for (k = 0; k < n; ++k) if (k != i && rd[4u * k] == rd[4u * i]) return (int)k + 1;
+    return 0;
+}
 static B86_PJ_COLD void pj_audit(B86Pj *j, const char *where)
 {
     uint32_t i, k, *lk = pj_links(j);
@@ -2970,8 +2976,11 @@ static B86_PJ_COLD void pj_audit(B86Pj *j, const char *where)
             if (!pj_aud_live(j, off) || !pj_aud_live(j, hent) || code[0] != 0xDFu || code[1] != 0xF8u ||
                 w != (((uint32_t)(uintptr_t)(j->code + hent)) | 1u) || pj_hdr(j, off)[4] != pj_hdr(j, hent - PJ_HDR_BYTES)[4]) {
                 ++badr;
-                if (shown++ < 12u) printf("[bb386-audit]   redir #%lu off=%08lX hot=%08lX live=%d/%d op=%02X%02X\n", (unsigned long)i,
-                                          (unsigned long)off, (unsigned long)hent, pj_aud_live(j, off), pj_aud_live(j, hent), code[0], code[1]);
+                if (shown++ < 12u) printf("[bb386-audit]   redir #%lu off=%08lX hot=%08lX live=%d/%d op=%02X%02X w=%08lX want=%08lX x-eip=%08lX h-eip=%08lX x-hd1=%08lX h-hd1=%08lX dup=%d\n", (unsigned long)i,
+                                          (unsigned long)off, (unsigned long)hent, pj_aud_live(j, off), pj_aud_live(j, hent), code[0], code[1],
+                                          (unsigned long)w, (unsigned long)(((uint32_t)(uintptr_t)(j->code + hent)) | 1u),
+                                          (unsigned long)pj_hdr(j, off)[4], (unsigned long)pj_hdr(j, hent - PJ_HDR_BYTES)[4],
+                                          (unsigned long)pj_hdr(j, off)[1], (unsigned long)pj_hdr(j, hent - PJ_HDR_BYTES)[1], pj_aud_dup(rd, j->nredir, i));
             }
         }
     }
@@ -3042,7 +3051,8 @@ static B86_PJ_COLD void pj_evict_switch(B86Cpu *c, B86Pj *j)
 static B86_PJ_COLD uint32_t b86_pj_translate(B86Cpu *c, uint32_t eip);
 /* r72: empty the SRAM tier: trampolines become exits to C, entries into
  * the tier are dropped from the tables, links inside it are forgotten. */
-static unsigned long pj_hr_redirs, pj_hr_restored, pj_hr_dead, pj_hr_short;   /* r73g */
+static unsigned long pj_hr_redirs, pj_hr_restored, pj_hr_dead, pj_hr_short, pj_hr_bad;   /* r73g, r73j */
+static unsigned long pj_redir_overlap, pj_link_tramp;   /* r73k */
 static B86_PJ_COLD void pj_hot_reset(B86Cpu *c, B86Pj *j)
 {
     uint32_t i, k, n = 0u, *rd = pj_redir(j), *lk = pj_links(j);
@@ -3062,8 +3072,25 @@ static B86_PJ_COLD void pj_hot_reset(B86Cpu *c, B86Pj *j)
         const int h_alive = !(hh[1] & 0x80000000u);
         const int covered = hh[0] == hx[0] && hh[4] == hx[4] && hh[6] == hx[6] &&
                             (hh[1] & 0x3FFFFFFFu) >= (hx[1] & 0x3FFFFFFFu);
+        /* r73j: X must still hold exactly the trampoline this entry wrote
+         * (LDR.W pc,[pc,#0] + this H's address). If anything rewrote X since,
+         * the saved 8 bytes no longer belong to the code around them, and
+         * putting them back would splice two different translations together. */
+        uint32_t w;
+        int intact;
+        memcpy(&w, code + 4, 4);
+        intact = code[0] == 0xDFu && code[1] == 0xF8u && code[2] == 0x00u && code[3] == 0xF0u &&
+                 w == (((uint32_t)(uintptr_t)(j->code + rd[4u * i + 1u] - 1u)) | 1u) &&
+                 (hx[1] & 0x80000000u);
+        if (!intact) {
+            if (pj_hr_bad++ < 16u)
+                printf("[bb386-hotreset]   BAD redir #%lu off=%08lX hot=%08lX op=%02X%02X%02X%02X w=%08lX want=%08lX x-eip=%08lX h-eip=%08lX x-hd1=%08lX h-hd1=%08lX\n",
+                       (unsigned long)i, (unsigned long)off, (unsigned long)(rd[4u * i + 1u] - 1u), code[0], code[1], code[2], code[3],
+                       (unsigned long)w, (unsigned long)(((uint32_t)(uintptr_t)(j->code + rd[4u * i + 1u] - 1u)) | 1u),
+                       (unsigned long)hx[4], (unsigned long)hh[4], (unsigned long)hx[1], (unsigned long)hh[1]);
+        }
         if (!h_alive) ++pj_hr_dead; else if (!covered) ++pj_hr_short;
-        if (h_alive && covered) {
+        if (h_alive && covered && intact) {
             ++pj_hr_restored;
             memcpy(code, &rd[4u * i + 2u], 8u);
             pj_hdr(j, off)[1] &= ~0x80000000u;
@@ -3099,8 +3126,8 @@ static B86_PJ_COLD void pj_hot_reset(B86Cpu *c, B86Pj *j)
 #endif
     ++j->hot_resets; ++j->gen;
     c->pj_stop = 1u;
-    printf("[bb386-hotreset] #%lu redirects=%lu restored=%lu stubbed-dead=%lu stubbed-short=%lu (totals) evictions=%lu\n",
-           j->hot_resets, pj_hr_redirs, pj_hr_restored, pj_hr_dead, pj_hr_short, j->evictions);
+    printf("[bb386-hotreset] #%lu redirects=%lu restored=%lu stubbed-dead=%lu stubbed-short=%lu stubbed-bad=%lu refused-overlap=%lu link-tramp=%lu (totals) evictions=%lu\n",
+           j->hot_resets, pj_hr_redirs, pj_hr_restored, pj_hr_dead, pj_hr_short, pj_hr_bad, pj_redir_overlap, pj_link_tramp, j->evictions);
     pj_audit(j, "hotreset");
 }
 /* r72: translate eip into the SRAM tier; returns its entry (0 = refused) */
@@ -3123,9 +3150,28 @@ static B86_PJ_COLD uint32_t pj_hot_translate(B86Cpu *c, B86Pj *j, uint32_t eip)
     return e;
 }
 /* r72: PSRAM block at off becomes LDR PC,[PC,#0]; .word hot entry */
-static B86_PJ_COLD void pj_redirect(B86Pj *j, uint32_t off, uint32_t hot_ent)
+static B86_PJ_COLD int pj_redirect(B86Pj *j, uint32_t off, uint32_t hot_ent)
 {
     uint8_t *code = j->code + off + PJ_HDR_BYTES;
+    /* r73k: the trampoline overwrites code+0..7. In a tiny block an exit stub
+     * starts inside that range (e.g. at code+4), and if that stub is a logged
+     * chain link, eviction later unlinks it by writing BL exit_s over the
+     * trampoline's address word (seen as w=F7xxFBxx). Never trampoline over a
+     * logged link stub. */
+    {
+        const uint32_t c0 = off + PJ_HDR_BYTES, *lk = pj_links(j);
+        uint32_t i;
+        for (i = 0; i < j->nlinks; ++i) {
+            const uint32_t so = lk[2u * i];
+            if (so + 14u > c0 && so < c0 + 8u) { ++pj_redir_overlap; return 0; }
+        }
+    }
+    if (code[0] == 0xDFu && code[1] == 0xF8u && code[2] == 0x00u && code[3] == 0xF0u) {   /* r73j */
+        static unsigned long twice;
+        if (twice++ < 8u) printf("[bb386-redir] already redirected off=%08lX hd1=%08lX (skipped)\n",
+                                 (unsigned long)off, (unsigned long)pj_hdr(j, off)[1]);
+        return 0;
+    }
     const uint32_t tgt = (uint32_t)(uintptr_t)(j->code + hot_ent - 1u) | 1u;
     {   uint32_t *rd = pj_redir(j) + 4u * j->nredir;
         rd[0] = off; rd[1] = hot_ent; memcpy(&rd[2], code, 8u); }
@@ -3138,6 +3184,7 @@ static B86_PJ_COLD void pj_redirect(B86Pj *j, uint32_t off, uint32_t hot_ent)
 #endif
     pj_hdr(j, off)[1] |= 0x80000000u;              /* dead: SMC and re-find use the SRAM copy */
     ++j->nredir;
+    return 1;
 }
 static B86_PJ_COLD uint32_t b86_pj_translate(B86Cpu *c, uint32_t eip)
 {
@@ -3357,6 +3404,13 @@ static B86_PJ_COLD void b86_pj_link(B86Cpu *c)
     ent = j->ent[h];
     if (!ent || j->flushes + j->gen != gen) return;  /* translation flushed/evicted: stub may be gone */
     if (pj_in_hot(j, (uint32_t)(stub - j->code)) != pj_in_hot(j, ent - 1u)) return;   /* r72: B.W cannot reach */
+    {   /* r73k: never patch a stub that a redirect trampoline (LDR.W pc,[pc,#0]; .word) overlaps */
+        int k;
+        for (k = -6; k <= 0; k += 2) {
+            const uint8_t *t = stub + k;
+            if (t >= j->code && t[0] == 0xDFu && t[1] == 0xF8u && t[2] == 0x00u && t[3] == 0xF0u) { ++pj_link_tramp; return; }
+        }
+    }
     {
         /* r71: +10: B.W target body first, then +0: BL chk */
         stub[10] = 0x00u; stub[11] = 0xF0u; stub[12] = 0x00u; stub[13] = 0x90u;
@@ -3490,8 +3544,8 @@ static B86_PJ_COLD void pj_pcs_promote(B86Cpu *c, B86Pj *j, uint32_t off)
     uint32_t e2, k;
     if (pj_find_block(j, lin, eip, 0u) != ent) { pj_hdr(j, off)[7] &= 0xF00FFFFFu; return; }   /* not a live block start */
     e2 = pj_hot_translate(c, j, eip);
-    if (e2 && !(pj_hdr(j, off)[1] & 0x80000000u) && pj_hdr(j, off)[4] == eip && pj_hdr(j, off)[0] == lin) {   /* (the new SRAM copy now heads the page list) */
-        pj_redirect(j, off, e2);
+    if (e2 && !(pj_hdr(j, off)[1] & 0x80000000u) && pj_hdr(j, off)[4] == eip && pj_hdr(j, off)[0] == lin &&
+        pj_redirect(j, off, e2)) {   /* (the new SRAM copy now heads the page list); r73k: may refuse */
         for (k = 0; k < B86_PJ_HASH; ++k) if (j->ent[k] == ent) j->ent[k] = e2;
         ++j->promotions; ++pj_pcs_cls[7];
     } else pj_hdr(j, off)[7] &= 0xF00FFFFFu;
@@ -3743,8 +3797,7 @@ static B86_PM_HOT unsigned b86_pj_try(B86Cpu *c)
         if (!(hd[1] & 0x80000000u) && (++hd[7] & 0xFFFFFu) >= j->hot_after) {
             hd[7] = 0u;                              /* r72d: a refused promotion backs off */
             const uint32_t e2 = pj_hot_translate(c, j, c->ip);
-            if (e2 && !(hd[1] & 0x80000000u) && pj_hdr(j, off)[4] == c->ip) {
-                pj_redirect(j, off, e2);
+            if (e2 && !(hd[1] & 0x80000000u) && pj_hdr(j, off)[4] == c->ip && pj_redirect(j, off, e2)) {   /* r73k: may refuse */
                 j->tag[h] = c->ip | 1u; j->ent[h] = e2; ent = e2;
                 ++j->promotions;
             }
