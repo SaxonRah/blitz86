@@ -4216,12 +4216,23 @@ B86_PM_HOT static int b86_386_rm0_run(B86Cpu *c, uint64_t budget)   /* r69 */
     return B86_BUDGET;
 }
 
+/* V27: shared RM epoch -> PJ coherence barrier (one entry point for all modes). */
+#if defined(B86_PJ) && B86_PJ
+extern void b86_pj_mark_rm_epoch(B86Cpu *c);
+#endif
 #define B86_PM_ENTER 100                /* r55: internal, never returned to the embedder */
 B86_HOT static int b86_jit_run16(B86Cpu *c, uint64_t max_dispatch);
 B86_HOT int b86_jit_run(B86Cpu *c, uint64_t max_dispatch)
 {
 #ifdef B86_PAGED
     if (be_paged && c->jit && c->jit->cm_table) c->pt = (int32_t *)(void *)c->jit->cm_table;   /* struct copies */
+#endif
+    /* RM may overwrite cached PM32/PM16 code, including via native RM stores.
+     * Mark once per RM episode; the PJ dispatcher consumes it on the next
+     * eligible native entry, outside the guest-instruction fast path. */
+#if defined(B86_PJ) && B86_PJ
+    if (c->model >= B86_CPU_386 && !(c->msw & 1u) && c->pj)
+        b86_pj_mark_rm_epoch(c);
 #endif
     if (c->model >= B86_CPU_386) {
         if (c->shutdown386) return B86_SHUTDOWN;
