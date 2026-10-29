@@ -171,7 +171,35 @@ B86_HOT static inline __attribute__((always_inline)) uint32_t lin(const B86Cpu *
     return ((c->seg[s] << 4) + (off & 0xFFFFu)) & c->amask;
 }
 
+/* V33: physical-page dirty coverage observer. This is intentionally NOT an
+ * authority for skipping exact source validation. Defined in i386_pg.inc. */
+#ifndef B86_PJ_V33_PHYSDIRTY
+#define B86_PJ_V33_PHYSDIRTY 1
+#endif
+#if B86_PJ_V33_PHYSDIRTY != 0 && B86_PJ_V33_PHYSDIRTY != 1
+#error "B86_PJ_V33_PHYSDIRTY must be zero or one"
+#endif
+#if B86_PJ_V33_PHYSDIRTY
+static inline void b86_v33_note_linear(B86Cpu *c, uint32_t a, uint32_t n);
+#endif
 static inline void b86_pj_note_store(B86Cpu *c, uint32_t lin, uint32_t n);   /* r70 */
+/* V30M observer: defined later in i386_pg.inc, which has the physical
+ * translation context. The observer is never used to bypass exact code
+ * validation. This prototype precedes smc(), its common store hook. */
+#ifndef B86_PJ_V30M_OBSERVE
+#if defined(B86_PJ) && B86_PJ
+#define B86_PJ_V30M_OBSERVE 0
+#else
+#define B86_PJ_V30M_OBSERVE 0
+#endif
+#endif
+#if B86_PJ_V30M_OBSERVE != 0 && B86_PJ_V30M_OBSERVE != 1
+#error "B86_PJ_V30M_OBSERVE must be 0 or 1"
+#endif
+#if B86_PJ_V30M_OBSERVE
+static inline void b86_v30m_note_linear(B86Cpu *c, uint32_t lin, uint32_t n);
+#endif
+
 /* r73: keep the real-mode code cache across protected-mode excursions.
  * Real-mode blocks are indexed by physical address. With paging on, a
  * protected-mode store is translated through the TLB; if that is not
@@ -179,6 +207,16 @@ static inline void b86_pj_note_store(B86Cpu *c, uint32_t lin, uint32_t n);   /* 
  * c->pg_pad and the real-mode cache is flushed on the way back, as before. */
 B86_HOT static inline void smc(B86Cpu *c, uint32_t a, uint32_t n)
 {
+#if B86_PJ_V33_PHYSDIRTY
+    /* Covers real-mode and interpreted PM guest stores, plus PJ slow stores.
+     * Native PJ fast stores are instrumented in the Thumb emitter instead. */
+    b86_v33_note_linear(c, a, n);
+#endif
+#if B86_PJ_V30M_OBSERVE
+    /* Observe every store reaching common SMC, including real-mode stores.
+     * Guest-memory writers bypassing SMC are NOT covered by this journal. */
+    b86_v30m_note_linear(c, a, n);
+#endif
 #if defined(B86_PJ) && B86_PJ
     if (c->pj && (c->msw & 1u)) b86_pj_note_store(c, a, n);     /* r70: PM code-page filter */
 #endif
@@ -839,6 +877,23 @@ static uint32_t b86_rm3_segvalue(B86Cpu *c, int which);
 #include "i386_rm3.inc"
 /* BB_386_PM0_V1: GDT descriptor helpers in flash, no PE switch. */
 #include "i386_pg.inc"    /* B86_PG_V1 (r65): 386 paging */
+/* V34 host/BIOS direct writer bridge. Physical GUEST addresses only.
+ * Notes happen before writes and are observational, never coherence authority.
+ * The existing v31 exact checks remain mandatory. */
+#if B86_PJ_V33_PHYSDIRTY
+static unsigned long b86_v34_host_calls;
+void b86_v34_note_host_phys(uint32_t phys, uint32_t n)
+{
+    ++b86_v34_host_calls;
+    b86_v33_note_physical(phys, n);
+}
+#else
+void b86_v34_note_host_phys(uint32_t phys, uint32_t n)
+{
+    (void)phys; (void)n;
+}
+#endif
+
 #include "i386_pm0.inc"
 /* BB_386_STAGE5C5C_V1: shadow cache + checked address helpers, inert in RM. */
 #include "i386_pm1.inc"

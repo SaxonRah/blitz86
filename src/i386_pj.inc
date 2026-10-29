@@ -30,6 +30,31 @@
 #ifdef B86_PJ_VERIFY
 #include <stdio.h>
 #endif
+/* V31: lazy exact RM->PM coherence. This DOES NOT rely on a complete
+ * guest-physical write journal. Before any previously cached native code
+ * can run following a real-mode or mapping epoch, detach every native link,
+ * clear the direct entries, then exact-validate EACH block at its first
+ * subsequent reuse. Unknown/corrupt link metadata fails closed to full
+ * cache flush. Mode 0 restores full V29 scan and is the A/B control. */
+#ifndef B86_PJ_V31_LAZY_EPOCH
+#define B86_PJ_V31_LAZY_EPOCH 1
+#endif
+#if B86_PJ_V31_LAZY_EPOCH != 0 && B86_PJ_V31_LAZY_EPOCH != 1
+#error "B86_PJ_V31_LAZY_EPOCH must be 0 or 1"
+#endif
+/* V30K: all native execution and existing safety checks are unchanged.
+ * Mode 0 (default): remove six volatile hardware counter/timer reads PER
+ * native run and all per-run split-stat accumulation from the hot dispatcher.
+ * Mode 1: exact original v30j XIP split profiling for controlled A/B.
+ * PC sampling, TLB counters, page reconciliations and cache audits remain.
+ * The 12-field XIP split report is intentionally unavailable in mode 0. */
+#ifndef B86_PJ_V30K_XIP_SPLIT
+#define B86_PJ_V30K_XIP_SPLIT 0
+#endif
+#if B86_PJ_V30K_XIP_SPLIT != 0 && B86_PJ_V30K_XIP_SPLIT != 1
+#error B86_PJ_V30K_XIP_SPLIT must be 0 or 1
+#endif
+
 #ifndef B86_PJ_MAXI
 #define B86_PJ_MAXI 32u
 #endif
@@ -85,6 +110,7 @@ typedef struct B86Pj {
     unsigned long smc_events, smc_kills;     /* r71: precise invalidation */
     unsigned long refinds;                   /* r71: hash misses served from the page lists */
     unsigned long fetch_refusals;            /* r71: entry code page not present */
+    unsigned long v30i_tlb_hits, v30i_tlb_walks; /* v30i entry fetch TLB A/B */
     /* BB_PJ_RING_EVICT_V1 (r71): the buffer is two halves filled in turn.
      * When the current half is full the OTHER half is evicted (links into it
      * undone, hash entries dropped, page lists rebuilt from the survivors)
@@ -524,6 +550,29 @@ static void pj_patch_b(uint8_t *at, uint8_t *to)
 /* ---- runtime helpers called from native code --------------------------- */
 #define PJ_PGH(pg) ((((uint32_t)(pg)) * 0x9E3779B1u) >> 20)   /* 4096-bit hashed page filter */
 static B86Pj *b86_pj_state(const B86Cpu *c) { return (B86Pj *)c->pj; }
+#if B86_PJ_V31_LAZY_EPOCH
+#define PJ_V31_MEMO_N 256u
+/* Positive-only, address-tagged memo. The two counters distinguish reuse
+ * after PSRAM half eviction and hot-tier recycling. Every epoch clears it. */
+static uint32_t pj_v31_memo[PJ_V31_MEMO_N];
+static unsigned long pj_v31_gen_seen, pj_v31_flush_seen, pj_v31_hot_seen;
+static uint8_t pj_v31_active;
+static unsigned long pj_v31_epochs, pj_v31_unlinked, pj_v31_exact,
+                     pj_v31_memo_hits, pj_v31_kills, pj_v31_fallbacks;
+static void pj_v31_memo_reset(const B86Pj *j)
+{
+    memset(pj_v31_memo, 0, sizeof pj_v31_memo);
+    pj_v31_gen_seen = j->gen;
+    pj_v31_flush_seen = j->flushes;
+    pj_v31_hot_seen = j->hot_resets;
+}
+static void pj_v31_memo_sync(const B86Pj *j)
+{
+    if (pj_v31_gen_seen != j->gen || pj_v31_flush_seen != j->flushes ||
+        pj_v31_hot_seen != j->hot_resets) pj_v31_memo_reset(j);
+}
+#endif
+
 /* Stage4U: keep native translations when x87 writes ordinary guest data.
  * Each cached translated code page is indexed both by its guest linear page
  * and by its physical page, with distinct keys in the existing exact cps
@@ -670,6 +719,29 @@ unsigned long b86_pj_vfy_checked, b86_pj_vfy_bad;
  * original pg_walk on TLB misses, with the same page/fault/store ordering.
  * Mode 0 profiles the existing page walker for a controlled A/B test. */
 #define BB_PJ_TLB_MODE 1
+/* V30I: native entry instruction-fetch TLB hit. A successful TLB entry
+ * already came from the 386 paging walker and carries its Accessed-bit
+ * effect; the established b86_pj_mem() fast path uses the identical tag.
+ * A miss, out-of-RAM frame, or disabled mode ALWAYS uses b86_pg_walk().
+ * This does not skip mapping-epoch, SMC, or source-byte validation. */
+#ifndef B86_PJ_V30I_ENTRY_TLB
+#define B86_PJ_V30I_ENTRY_TLB 1
+#endif
+#if B86_PJ_V30I_ENTRY_TLB != 0 && B86_PJ_V30I_ENTRY_TLB != 1
+#error B86_PJ_V30I_ENTRY_TLB must be 0 or 1
+#endif
+static inline int pj_v30i_entry_tlb_hit(const B86Cpu *c, uint32_t lin)
+{
+#if B86_PJ_V30I_ENTRY_TLB
+    const unsigned slot = (lin >> 12) & 63u;
+    const uint32_t tag = (lin & 0xFFFFF000u) | 1u;
+    return c->pg && c->tlb_tag[slot] == tag &&
+           c->tlb_phys[slot] <= B86_RAM_BYTES - 0x1000u;
+#else
+    (void)c; (void)lin;
+    return 0;
+#endif
+}
 /* B86_PJ_MEMSTATS_LEAN_V1: hot memory statistics are diagnostic only.
  * Mode 0 keeps all physical/virtual memory, paging, SMC and write behavior;
  * only profiling-counter increments disappear at compile time.
@@ -2442,10 +2514,21 @@ static void pjt_stub(PjT *t, const PjExit *x, const B86Pj *j)
  * enters the target's chain entry with r3 = r0; a miss returns to C. */
 /* V25: experimental fast native store for paged extended guest DATA RAM.
  * This counter is diagnostic and does not change the guest CPU layout. */
+/* V30N LEAN NATIVE FASTWRITE: avoid an expensive volatile SRAM
+ * read-modify-write on every native store.  A/B mode=0 restores the exact
+ * old emitted counter and its telemetry; default=1 preserves all original
+ * fault/SMC/TLB/codemap gates and removes ONLY diagnostic instructions.
+ * No writes are skipped.  No guest behavior changes. */
+#ifndef B86_PJ_V30N_LEAN_FASTWRITE
+#define B86_PJ_V30N_LEAN_FASTWRITE 1
+#endif
+#if B86_PJ_V30N_LEAN_FASTWRITE != 0 && B86_PJ_V30N_LEAN_FASTWRITE != 1
+#error B86_PJ_V30N_LEAN_FASTWRITE must be 0 or 1
+#endif
 #ifndef BB_PJ_V25_FASTWRITE
 #define BB_PJ_V25_FASTWRITE 1
 #endif
-#if BB_PJ_V25_FASTWRITE
+#if BB_PJ_V25_FASTWRITE && !B86_PJ_V30N_LEAN_FASTWRITE
 static volatile uint32_t pj_v25_fastwrite_hits;
 #endif
 static B86_PJ_COLD void pj_emit_shared_at(B86Pj *j, uint8_t *base, uint8_t *end);
@@ -2784,6 +2867,31 @@ static B86_PJ_COLD void pj_emit_shared_at(B86Pj *j, uint8_t *base, uint8_t *end)
         pje32(&t->e, 0xFA20u | CREG, 0xF000u | (CREG << 8) | LR); /* lsr.w r12,r12,lr */
         pj_dpi(&t->e, 0u, 1, CREG, CREG, 1u); /* ands r12,r12,#1 */
         miss[nm++] = pj_b(&t->e, 1); /* NE: possible code page */
+#if B86_PJ_V33_PHYSDIRTY
+        /* V33: the native fast store deliberately bypasses b86_pj_mem/smc.
+         * Record the already-checked physical page, BEFORE the store pointer
+         * is returned. The write-stub rejects page crossings, so marking
+         * exactly one 4 KiB physical page is sufficient. R0 still holds
+         * physical address; R1/R2 and the [sp+12] return slot are untouched.
+         * No page mark authorizes skipping exact x86 code comparison. */
+        pj_shift(&t->e, R3, R0, 1u, 12u);
+        pj_imm32(&t->e, LR, (uint32_t)(uintptr_t)b86_v33_dirty);
+        pj_dpr(&t->e, 8u, 0, LR, LR, R3, 0u, 0u);
+        pj_imm32(&t->e, R3, 1u);
+        pj_ldst(&t->e, PJ_STRB, R3, LR, 0u);
+#if B86_PJ_V37_EPOCH_LEDGER
+        /* BB_V37_EPOCH_LEDGER_V1: same physical frame, current epoch token.
+         * R0 and R1/R2 remain intact; no calls and no native-entry guards.
+         * This precedes the guest write; the original v33 cumulative mark
+         * is still set independently. */
+        pj_shift(&t->e, R3, R0, 1u, 12u);
+        pj_imm32(&t->e, LR, (uint32_t)(uintptr_t)b86_v37_page_epoch);
+        pj_dpr(&t->e, 8u, 0, LR, LR, R3, 0u, 0u);
+        pj_imm32(&t->e, R3, (uint32_t)(uintptr_t)&b86_v37_token);
+        pj_ldst(&t->e, PJ_LDRB, R3, R3, 0u);
+        pj_ldst(&t->e, PJ_STRB, R3, LR, 0u);
+#endif
+#endif
         /* Exactly match b86_host_phys(c, phys): lower guest RAM may be
          * remapped through c->pt[ ((uintptr_t)(c->mem+phys)>>12)&511 ].
          * Above B86_MEM_BYTES no pt delta is applied. */
@@ -2809,12 +2917,15 @@ static B86_PJ_COLD void pj_emit_shared_at(B86Pj *j, uint8_t *base, uint8_t *end)
         }
 #endif
 #endif
-        /* Diagnostic: one exact hit count per completed native address
-         * preparation, never counted on any fallback. */
+        /* When lean=1 the successful native data-store path jumps
+         * directly to the same LR restore and BX return as before.
+         * Diagnostic mode=0 preserves all original emitted instructions. */
+#if !B86_PJ_V30N_LEAN_FASTWRITE
         pj_imm32(&t->e, R3, (uint32_t)(uintptr_t)&pj_v25_fastwrite_hits);
         pj_ldst(&t->e, PJ_LDR, LR, R3, 0u);
         pj_dpi(&t->e, 8u, 0, LR, LR, 1u);
         pj_ldst(&t->e, PJ_STR, LR, R3, 0u);
+#endif
         pj_ldst(&t->e, PJ_LDR, LR, SP, 12u);
         pj_dpi(&t->e, 8u, 0, LR, LR, 6u);
         pje16(&t->e, 0x4700u | (LR << 3)); /* bx lr */
@@ -2913,6 +3024,11 @@ static B86_PJ_COLD void b86_pj_flush(B86Cpu *c)
     pj_emit_shared(j);
     if (j->hot) { j->hot_used = j->hot_start; j->nredir = 0u; }
     ++j->flushes;
+#if B86_PJ_V31_LAZY_EPOCH
+    /* A flush destroys all cached code and therefore needs no lazy fence. */
+    pj_v31_active = 0u;
+    pj_v31_memo_reset(j);
+#endif
 }
 
 /* V27: invoked from the *shared* 16-bit JIT dispatcher on real-mode
@@ -2922,7 +3038,13 @@ void b86_pj_mark_rm_epoch(B86Cpu *c)
 {
     B86Pj *j = c ? b86_pj_state(c) : NULL;
     if (!j) return;
-    if (!j->v27_rm_pending) ++j->v27_rm_episodes;
+    if (!j->v27_rm_pending) {
+        ++j->v27_rm_episodes;
+#if B86_PJ_V33_PHYSDIRTY && B86_PJ_V37_EPOCH_LEDGER
+        b86_v42_closing_kind = B86_V42_CLOSE_PM;
+        b86_v37_rotate(c); /* PM window closes; real-mode writes start anew. */
+#endif
+    }
     j->v27_rm_pending = 1u;
 }
 
@@ -2969,6 +3091,35 @@ static B86_PJ_COLD int pj_v30g_phys_id(B86Cpu *c, uint32_t lin,
     e->id = *id;
     return 1;
 }
+/* V30L: exact, bounds-preserving scan comparison, no page-journal claims.
+ * A valid block is still compared byte-for-byte against current mapped RAM
+ * at every reconciliation.  Mode 0 is the original libc memcmp control;
+ * mode 1 compares 32-bit chunks using memcpy to avoid unaligned C lvalues,
+ * then checks every remaining byte.  No hash, no skipped checks. */
+#ifndef B86_PJ_V30L_EXACT_COMPARE
+#define B86_PJ_V30L_EXACT_COMPARE 0
+#endif
+#if B86_PJ_V30L_EXACT_COMPARE != 0 && B86_PJ_V30L_EXACT_COMPARE != 1
+#error B86_PJ_V30L_EXACT_COMPARE must be 0 or 1
+#endif
+#if B86_PJ_V30L_EXACT_COMPARE
+static B86_PJ_COLD int pj_v30l_equal(const uint8_t *a,
+                                    const uint8_t *b, uint32_t n)
+{
+    while (n >= 4u) {
+        uint32_t x, y;
+        memcpy(&x, a, 4u);
+        memcpy(&y, b, 4u);
+        if (x != y) return 0;
+        a += 4u; b += 4u; n -= 4u;
+    }
+    while (n) {
+        if (*a++ != *b++) return 0;
+        --n;
+    }
+    return 1;
+}
+#endif
 /* Check identical bytes with contiguous host spans. b86_host_phys() may
  * remap at a *host*-aligned 4K boundary through c->pt; a guest 4K boundary
  * need not be host-aligned. Respect both, and B86_MEM_BYTES, so each memcmp
@@ -2994,8 +3145,12 @@ static B86_PJ_COLD int pj_v30g_source_equal(B86Cpu *c, uint32_t lin,
         if (phys < B86_MEM_BYTES && span > B86_MEM_BYTES - phys)
             span = B86_MEM_BYTES - phys;
 #endif
-        if (!span || memcmp(b86_host_phys(c, phys), saved + k, span))
-            return 0;
+        if (!span) return 0;
+#if B86_PJ_V30L_EXACT_COMPARE
+        if (!pj_v30l_equal(b86_host_phys(c, phys), saved + k, span)) return 0;
+#else
+        if (memcmp(b86_host_phys(c, phys), saved + k, span)) return 0;
+#endif
         k += span;
     }
     return 1;
@@ -3087,11 +3242,90 @@ static B86_PJ_COLD int pj_v29_walk(B86Cpu *c, B86Pj *j,
     return off == hi;
 }
 
+#if B86_PJ_V31_LAZY_EPOCH
+/* Defined next to the existing V12 exact Thumb link-shape checker. */
+static B86_PJ_COLD int pj_v31_unlink_all(B86Pj *j);
+/* Check the block chosen by the ORIGINAL page-list order, never an older
+ * duplicate picked from a separate cache. All executable entry paths use
+ * this wrapper after the first lazy epoch. */
+static B86_PJ_COLD uint32_t pj_v31_find(B86Cpu *c, B86Pj *j,
+                                       uint32_t lin, uint32_t eip,
+                                       uint32_t pm16)
+{
+    unsigned k;
+    for (k = 0u; k < 128u; ++k) {
+        const uint32_t ent = pj_find_block(j, lin, eip, pm16);
+        uint32_t off, size, *hd;
+        if (!ent || !pj_v31_active) return ent;
+        if (ent <= PJ_HDR_BYTES) goto invalid;
+        off = ent - 1u - PJ_HDR_BYTES;
+        /* The original walker has already located the page-list entry;
+         * only dereference offsets that are inside an allocated half or
+         * the live hot tier, including the COMPLETE header. */
+        {
+            unsigned h, resident = 0u;
+            if (pj_in_hot(j, off)) {
+                if (j->hot_used >= PJ_HDR_BYTES && off >= j->hot_start && off <= j->hot_used - PJ_HDR_BYTES)
+                    resident = 1u;
+            } else for (h = 0u; h < 2u; ++h) {
+                const uint32_t lo = j->shared_end + j->half * h;
+                const uint32_t hi = h == j->cur_half ? j->used :
+                                    (j->half_fill[h] ? j->half_fill[h] : lo);
+                if (off >= lo && hi >= PJ_HDR_BYTES && off <= hi - PJ_HDR_BYTES)
+                    resident = 1u;
+            }
+            if (!resident) goto invalid;
+        }
+        hd = pj_hdr(j, off);
+        size = hd[5];
+        if (size < PJ_HDR_BYTES + 16u || size > 0x10000u ||
+            off > UINT32_MAX - size) goto invalid;
+        if (pj_in_hot(j, off)) {
+            if (off + size > j->hot_used) goto invalid;
+        } else {
+            unsigned h, contained = 0u;
+            for (h = 0u; h < 2u; ++h) {
+                const uint32_t lo = j->shared_end + j->half * h;
+                const uint32_t hi = h == j->cur_half ? j->used :
+                                    (j->half_fill[h] ? j->half_fill[h] : lo);
+                if (off >= lo && off + size <= hi) contained = 1u;
+            }
+            if (!contained) goto invalid;
+        }
+        /* A valid memo entry is scoped to this RM epoch + code-cache
+         * generation; dead entries still cannot be executed. */
+        pj_v31_memo_sync(j);
+        if (pj_v31_memo[(off >> 2) & (PJ_V31_MEMO_N - 1u)] == off + 1u &&
+            !(hd[1] & 0x80000000u)) {
+            ++pj_v31_memo_hits;
+            return ent;
+        }
+        ++pj_v31_exact;
+        if (!pj_v29_walk(c, j, off, off + size)) goto invalid;
+        if (!(hd[1] & 0x80000000u)) {
+            pj_v31_memo[(off >> 2) & (PJ_V31_MEMO_N - 1u)] = off + 1u;
+            return ent;
+        }
+        ++pj_v31_kills; /* stale version killed; search next live copy */
+    }
+invalid:
+    /* An invalid header, incomplete region, or cyclic/duplicate list is
+     * NOT permission to execute old code. Drop everything and retranslate. */
+    ++pj_v31_fallbacks;
+    b86_pj_flush(c);
+    return 0u;
+}
+#endif
+
 static B86_PJ_COLD void b86_pj_v27_reconcile(B86Cpu *c, B86Pj *j)
 {
     uint32_t h;
     if (!j || !j->v27_rm_pending) return;
     j->v27_rm_pending = 0u;
+#if B86_PJ_V33_PHYSDIRTY && B86_PJ_V37_EPOCH_LEDGER
+    b86_v42_closing_kind = B86_V42_CLOSE_RM;
+    b86_v37_rotate(c); /* RM window closes before PM code can be reused. */
+#endif
     /* Observe all current mapping state. A full TLB flush covers CR3,
      * paging enable/disable and INVLPG implementations that flush the TLB. */
     j->v29_map_observed = 1u;
@@ -3115,6 +3349,28 @@ static B86_PJ_COLD void b86_pj_v27_reconcile(B86Cpu *c, B86Pj *j)
         j->v30c_parked = 1u;
         return;
     }
+#if B86_PJ_V31_LAZY_EPOCH
+    /* Native linked exits and the direct C / generated-dyn entry tables
+     * must no longer reach unvalidated code. Unlink EVERY logged exit first;
+     * an inconsistent log fails to the existing full flush. */
+    if (!pj_v31_unlink_all(j)) goto full_flush;
+    memset(j->tag, 0, sizeof j->tag);
+    memset(j->ent, 0, sizeof j->ent);
+    {
+        unsigned ctx;
+        for (ctx = 0; ctx < PJ_PM16_CTX; ++ctx)
+            memset(pj_pm16_tag(j, ctx), 0, 2u * PJ_PM16_ENT * sizeof(uint32_t));
+    }
+    c->pj_exit = 0u;
+    pj_v31_active = 1u;
+    pj_v31_memo_reset(j);
+    ++pj_v31_epochs;
+    if (j->v30c_parked) {
+        j->v30c_parked = 0u;
+        ++j->v30c_resumes;
+    }
+    return;
+#endif
     /* V30A: Every live block carries its translation-time PG mode, exact
      * physical source-page IDs, and all original instruction bytes.  A
      * PG-on block encountered with PG-off cannot match its recorded ID,
@@ -4758,6 +5014,43 @@ static int pj_v12_link_intact(const B86Pj *j, uint32_t so, uint32_t to)
     return pj_aud_bw(branch) == (uint32_t)(uintptr_t)(j->code + to);
 }
 #endif
+#if B86_PJ_V31_LAZY_EPOCH
+/* A conservative epoch fence: no direct B.W connection can cross the
+ * validation boundary. Decode each currently logged stub with the SAME
+ * exact code-form and target checker used during ordinary half eviction.
+ * Never patch an unverified address; a failure forces a full cache flush. */
+static B86_PJ_COLD int pj_v31_unlink_all(B86Pj *j)
+{
+    uint32_t i, *lk = pj_links(j);
+    /* Corrupt metadata must never index beyond the bounded link log. */
+    if (j->nlinks > B86_PJ_LINKS) return 0;
+    /* Preflight every record BEFORE modifying any executable code. */
+    for (i = 0u; i < j->nlinks; ++i) {
+        const uint32_t so = lk[2u * i], to = lk[2u * i + 1u];
+        if (so > UINT32_MAX - 13u ||
+            !pj_aud_live(j, so) || !pj_aud_live(j, so + 13u) ||
+            !pj_aud_live(j, to) || !pj_v12_link_intact(j, so, to))
+            return 0;
+    }
+    for (i = 0u; i < j->nlinks; ++i) {
+        const uint32_t so = lk[2u * i];
+        uint8_t *stub = j->code + so;
+        stub[0] = 0x00u; stub[1] = 0xF0u;
+        stub[2] = 0x00u; stub[3] = 0x90u;
+        pj_patch_b(stub, pj_in_hot(j, so) ? j->hsh.exit_s : j->exit_s);
+        stub[3] |= 0x40u; /* BL exit_s, identical to eviction unchaining */
+#if defined(__linux__)
+        __builtin___clear_cache((char *)stub, (char *)stub + 14);
+#endif
+    }
+#if !defined(__linux__)
+    __asm__ volatile("dsb 0xF\n\tisb 0xF" ::: "memory");
+#endif
+    pj_v31_unlinked += j->nlinks;
+    j->nlinks = 0u;
+    return 1;
+}
+#endif
 /* r71: the current half is full: empty the other one and continue there. */
 static B86_PJ_COLD void pj_evict_switch(B86Cpu *c, B86Pj *j)
 {
@@ -4985,6 +5278,64 @@ static B86_PJ_COLD uint32_t pj_hot_translate(B86Cpu *c, B86Pj *j, uint32_t eip)
     return e;
 }
 /* r72: PSRAM block at off becomes LDR PC,[PC,#0]; .word hot entry */
+/* V30J_LINKFILTER_BEGIN: bit-exact, conservative link-overlap prefilter.
+ * The original 14-byte chain stub protects against overwriting the first
+ * eight bytes of a PSRAM block during a hot-tier redirect. Every NEW link is
+ * marked in a monotonic 16-byte-bin bitset. Bits are NEVER cleared; stale
+ * bits produce only false positives (an ordinary exact scan). No zero bit
+ * can occur for a live link intersecting the proposed 8-byte redirect.
+ * This remains safe across ring evictions, hot resets, separate B86Pj state
+ * objects, and all other link compaction. It does not alter linked code.
+ * A/B mode 0 retains the original linear guard without the 8 KiB bitset. */
+#ifndef B86_PJ_V30J_LINK_FILTER
+#define B86_PJ_V30J_LINK_FILTER 1
+#endif
+#if B86_PJ_V30J_LINK_FILTER != 0 && B86_PJ_V30J_LINK_FILTER != 1
+#error B86_PJ_V30J_LINK_FILTER must be 0 or 1
+#endif
+#if B86_PJ_V30J_LINK_FILTER
+/* V30J_LINKFILTER_HELPER_BEGIN */
+#define PJ_V30J_BITS 65536u
+static uint8_t pj_v30j_bits[PJ_V30J_BITS / 8u];
+static unsigned long pj_v30j_marks, pj_v30j_skips, pj_v30j_scans;
+static inline unsigned pj_v30j_slot(uint32_t bin)
+{
+    return (unsigned)((bin * 2654435761u) >> 16);
+}
+static inline void pj_v30j_mark_bin(uint32_t bin)
+{
+    const unsigned bit = pj_v30j_slot(bin);
+    pj_v30j_bits[bit >> 3] |= (uint8_t)(1u << (bit & 7u));
+}
+static inline int pj_v30j_has_bin(uint32_t bin)
+{
+    const unsigned bit = pj_v30j_slot(bin);
+    return (pj_v30j_bits[bit >> 3] & (uint8_t)(1u << (bit & 7u))) != 0;
+}
+static inline void pj_v30j_mark_link(uint32_t stub_off)
+{
+    /* A linked exit covers [stub_off, stub_off+14). A 14-byte span
+     * intersects at most two 16-byte bins. */
+    const uint32_t first = stub_off >> 4;
+    const uint32_t last = (stub_off + 13u) >> 4;
+    pj_v30j_mark_bin(first);
+    if (last != first) pj_v30j_mark_bin(last);
+    ++pj_v30j_marks;
+}
+static inline int pj_v30j_possible_overlap(uint32_t code_off)
+{
+    /* Redirect overwrites [code_off, code_off+8). It intersects at most
+     * two 16-byte bins. A hash collision can only cause a false positive.
+     * Return TRUE if either bin is marked, not if both are marked. */
+    const uint32_t first = code_off >> 4;
+    const uint32_t last = (code_off + 7u) >> 4;
+    return pj_v30j_has_bin(first) ||
+           (last != first && pj_v30j_has_bin(last));
+}
+/* V30J_LINKFILTER_HELPER_END */
+#endif
+/* V30J_LINKFILTER_END */
+
 static B86_PJ_COLD int pj_redirect(B86Pj *j, uint32_t off, uint32_t hot_ent)
 {
     uint8_t *code = j->code + off + PJ_HDR_BYTES;
@@ -4994,11 +5345,23 @@ static B86_PJ_COLD int pj_redirect(B86Pj *j, uint32_t off, uint32_t hot_ent)
      * trampoline's address word (seen as w=F7xxFBxx). Never trampoline over a
      * logged link stub. */
     {
-        const uint32_t c0 = off + PJ_HDR_BYTES, *lk = pj_links(j);
-        uint32_t i;
-        for (i = 0; i < j->nlinks; ++i) {
-            const uint32_t so = lk[2u * i];
-            if (so + 14u > c0 && so < c0 + 8u) { ++pj_redir_overlap; return 0; }
+        const uint32_t c0 = off + PJ_HDR_BYTES;
+        int need_exact_scan = 1;
+#if B86_PJ_V30J_LINK_FILTER
+        if (!pj_v30j_possible_overlap(c0)) {
+            ++pj_v30j_skips;
+            need_exact_scan = 0;
+        } else {
+            ++pj_v30j_scans;
+        }
+#endif
+        if (need_exact_scan) {
+            const uint32_t *lk = pj_links(j);
+            uint32_t i;
+            for (i = 0; i < j->nlinks; ++i) {
+                const uint32_t so = lk[2u * i];
+                if (so + 14u > c0 && so < c0 + 8u) { ++pj_redir_overlap; return 0; }
+            }
         }
     }
     if (code[0] == 0xDFu && code[1] == 0xF8u && code[2] == 0x00u && code[3] == 0xF0u) {   /* r73j */
@@ -5311,6 +5674,76 @@ static B86_PJ_COLD int pj_v30d_defer(B86Cpu *c, B86Pj *j, uint32_t eip)
     return 0;
 #endif
 }
+/* V30O bounded two-touch doorkeeper for genuine missing native blocks.
+ * The old guarded admission begins after 32 cache evictions, when the game
+ * is already experiencing catastrophic late cache churn. V30O arms after
+ * eight evictions and remembers first sightings in an 8KiB Bloom filter.
+ * False positives only compile MORE native code; false negatives are
+ * impossible before reset (both bits stay set until the eviction changes).
+ * Every deferred instruction follows the ordinary checked C interpreter.
+ * A unique-miss dominated window suspends filtering until next eviction,
+ * avoiding prolonged slow-interpretation under a large cold working set.
+ * The original V30F policy remains byte-for-byte present for A/B mode=0.
+ * The bloom is SRAM BSS; PJ arena and PSRAM code-cache offsets unchanged. */
+#ifndef B86_PJ_V30O_DOORKEEPER
+#define B86_PJ_V30O_DOORKEEPER 1
+#endif
+#if B86_PJ_V30O_DOORKEEPER != 0 && B86_PJ_V30O_DOORKEEPER != 1
+#error B86_PJ_V30O_DOORKEEPER must be 0 or 1
+#endif
+#define PJ_V30O_ARM_EVICTIONS 8u
+#define PJ_V30O_PROBE_LIMIT 512u
+#define PJ_V30O_MIN_REVISITS 48u
+#define PJ_V30O_BLOOM_BYTES 8192u
+#if B86_PJ_V30O_DOORKEEPER
+static uint8_t pj_v30o_bits[PJ_V30O_BLOOM_BYTES];
+static uint32_t pj_v30o_epoch = UINT32_MAX;
+static uint32_t pj_v30o_probe, pj_v30o_repeat, pj_v30o_suspended;
+static unsigned long pj_v30o_resets, pj_v30o_first, pj_v30o_hits;
+static unsigned long pj_v30o_defers, pj_v30o_bypassed, pj_v30o_escapes;
+/* Returns 1 to defer translation to the ORIGINAL interpreter. */
+static B86_PJ_COLD int pj_v30o_defer_key(uint64_t key, uint32_t eviction)
+{
+    uint32_t x, h1, h2, b1, b2;
+    uint8_t m1, m2;
+    int seen;
+    if (pj_v30o_epoch != eviction) {
+        memset(pj_v30o_bits, 0, sizeof pj_v30o_bits);
+        pj_v30o_epoch = eviction;
+        pj_v30o_probe = 0u;
+        pj_v30o_repeat = 0u;
+        pj_v30o_suspended = 0u;
+        ++pj_v30o_resets;
+    }
+    if (pj_v30o_suspended) {
+        ++pj_v30o_bypassed;
+        return 0;
+    }
+    /* Do not hash or probe SRAM at all when the admission filter is
+     * suspended: the unique-working-set case must stay inexpensive. */
+    x = b86_v30f_hash(key);
+    h1 = x & (PJ_V30O_BLOOM_BYTES * 8u - 1u);
+    h2 = ((x >> 16) ^ (x * 0x9E3779B9u)) &
+         (PJ_V30O_BLOOM_BYTES * 8u - 1u);
+    b1 = h1 >> 3; b2 = h2 >> 3;
+    m1 = (uint8_t)(1u << (h1 & 7u));
+    m2 = (uint8_t)(1u << (h2 & 7u));
+    seen = (pj_v30o_bits[b1] & m1) && (pj_v30o_bits[b2] & m2);
+    /* Read both before updating either: even coincident bits cannot make
+     * a first occurrence look like a second. */
+    pj_v30o_bits[b1] |= m1;
+    pj_v30o_bits[b2] |= m2;
+    ++pj_v30o_probe;
+    if (seen) { ++pj_v30o_repeat; ++pj_v30o_hits; }
+    else { ++pj_v30o_first; ++pj_v30o_defers; }
+    if (pj_v30o_probe >= PJ_V30O_PROBE_LIMIT &&
+        pj_v30o_repeat < PJ_V30O_MIN_REVISITS) {
+        pj_v30o_suspended = 1u;
+        ++pj_v30o_escapes;
+    }
+    return !seen;
+}
+#endif
 /* BB_V30F_ADAPTIVE_INTEGRATION_V1: only a cold cache MISS that was already
  * eligible for the old V30D filter may be deferred. A defer executes the
  * checked interpreter. Never modify the tag/entry tables on a defer.
@@ -5338,6 +5771,12 @@ static B86_PJ_COLD int pj_v30f_defer(B86Cpu *c, B86Pj *j, uint32_t eip)
     generation = (uint32_t)j->flushes ^ ((uint32_t)j->v29_map_changes * 0x9E3779B9u)
                ^ ((uint32_t)j->v27_barriers * 0x85EBCA6Bu);
     key = ((uint64_t)lin << 32) | (uint64_t)mix;
+#if B86_PJ_V30O_DOORKEEPER
+    /* Never filter startup: reserve cold filtering for the verified
+     * eviction-churn phase. Original V30F remains an A/B fallback. */
+    if (j->evictions >= PJ_V30O_ARM_EVICTIONS)
+        return pj_v30o_defer_key(key, (uint32_t)j->evictions);
+#endif
     return !b86_v30f_allow(&v30f_admit, key, generation);
 }
 /* Always-on cold telemetry; no eviction policy changes. */
@@ -5353,7 +5792,12 @@ static B86_PJ_COLD void b86_pj_link(B86Cpu *c)
     if (!pj_in_hot(j, (uint32_t)(stub - j->code)) && (stub < j->code + j->shared_end || stub + 14u > j->code + j->cap)) return;
     if (j->nlinks >= B86_PJ_LINKS) return;            /* r71: log full: stop linking until the next eviction */
     if (j->tag[h] != (c->ip | 1u)) {
-        uint32_t e = pj_find_block(j, c->ip, c->ip, 0u);
+        uint32_t e =
+#if B86_PJ_V31_LAZY_EPOCH
+            pj_v31_find(c, j, c->ip, c->ip, 0u);
+#else
+            pj_find_block(j, c->ip, c->ip, 0u);
+#endif
         if (e) ++j->refinds;
         else {
             if (pj_v30f_defer(c, j, c->ip)) return;
@@ -5380,7 +5824,11 @@ static B86_PJ_COLD void b86_pj_link(B86Cpu *c)
         stub[0] = 0x00u; stub[1] = 0xF0u; stub[2] = 0x00u; stub[3] = 0x90u;
         pj_patch_b(stub, pj_in_hot(j, (uint32_t)(stub - j->code)) ? j->hsh.chk : j->chk); stub[3] |= 0x40u;   /* B.W -> BL; r72: the stub's own region */
         ++j->links;
-        { uint32_t *lk = pj_links(j); lk[2u * j->nlinks] = (uint32_t)(stub - j->code); lk[2u * j->nlinks + 1u] = ent - 1u; ++j->nlinks; }
+        { uint32_t *lk = pj_links(j); const uint32_t so = (uint32_t)(stub - j->code); lk[2u * j->nlinks] = so; lk[2u * j->nlinks + 1u] = ent - 1u;
+#if B86_PJ_V30J_LINK_FILTER
+          pj_v30j_mark_link(so); /* before record becomes visible */
+#endif
+          ++j->nlinks; }
 #if defined(__linux__)
         __builtin___clear_cache((char *)stub, (char *)stub + 14);
 #else
@@ -5719,7 +6167,12 @@ static B86_PM_HOT unsigned b86_pj_try(B86Cpu *c)
 #else
             const uint32_t pm16 = 0u, lin = c->ip;
 #endif
-            uint32_t e = pj_find_block(j, lin, c->ip, pm16);
+            uint32_t e =
+#if B86_PJ_V31_LAZY_EPOCH
+                pj_v31_find(c, j, lin, c->ip, pm16);
+#else
+                pj_find_block(j, lin, c->ip, pm16);
+#endif
             if (e) ++j->refinds;
             else {
                 /* Never cache a negative entry for a temporary defer. */
@@ -5758,7 +6211,14 @@ static B86_PM_HOT unsigned b86_pj_try(B86Cpu *c)
 #else
         const uint32_t lip = c->ip;
 #endif
-        if (!b86_pg_walk(c, lip, &ph)) { ++j->fetch_refusals; return 0u; }
+        /* V30I: a valid (already accessed) TLB page needs no second walk.
+         * On miss use the unchanged walker, including all #PF/A-bit effects. */
+        if (pj_v30i_entry_tlb_hit(c, lip)) {
+            ++j->v30i_tlb_hits;
+        } else {
+            ++j->v30i_tlb_walks;
+            if (!b86_pg_walk(c, lip, &ph)) { ++j->fetch_refusals; return 0u; }
+        }
     }
 #ifdef B86_PJ_VERIFY
     uint32_t pr[8], pip = c->ip, pfl = c->flags, plz[7];
@@ -5794,6 +6254,7 @@ static B86_PM_HOT unsigned b86_pj_try(B86Cpu *c)
     c->pj_exit = 0u;
     {
         const unsigned hot = pj_in_hot(j, ent - 1u) != 0;
+#if B86_PJ_V30K_XIP_SPLIT
         uint32_t a0 = 0u, h0 = 0u, t0 = 0u;
         if (j->xacc) {                               /* r72e: XIP split */
             a0 = *j->xacc; h0 = *j->xhit; t0 = *j->xus;
@@ -5803,7 +6264,9 @@ static B86_PM_HOT unsigned b86_pj_try(B86Cpu *c)
                 } else j->xs[11]++;
             }
         }
+#endif /* B86_PJ_V30K_XIP_SPLIT: pre-entry hardware reads */
         n = ((unsigned (*)(B86Cpu *, uintptr_t))(void *)(uintptr_t)((uintptr_t)(hot ? j->hsh.entry : j->entry) | 1u))(c, (uintptr_t)(j->code + ent - 1u) | 1u);
+#if B86_PJ_V30K_XIP_SPLIT
         if (j->xacc) {
             const uint32_t a1 = *j->xacc, h1 = *j->xhit, t1 = *j->xus;
             if (a1 >= a0 && h1 >= h0 && a1 - a0 >= h1 - h0) {
@@ -5812,6 +6275,7 @@ static B86_PM_HOT unsigned b86_pj_try(B86Cpu *c)
             } else j->xs[11]++;
             j->xla = a1; j->xlh = h1; j->xlt = t1 ? t1 : 1u;
         }
+#endif /* B86_PJ_V30K_XIP_SPLIT: post-entry hardware reads */
     }
 #ifdef B86_PJ_VERIFY
     if (n) {
@@ -5984,6 +6448,124 @@ void b86_pj_stats(const B86Cpu *c, unsigned long out[8])
         mut->v29_reported_checks = j->v29_paged_checks;
         mut->v29_reported_changes = j->v29_map_changes;
     }
+#if B86_PJ_V30J_LINK_FILTER
+    printf("[bb386-v30j-linkfilter] mode=1 marks=%lu skipped=%lu exact-scans=%lu overlap-refusals=%lu\n",
+           pj_v30j_marks, pj_v30j_skips, pj_v30j_scans, pj_redir_overlap);
+#else
+    printf("[bb386-v30j-linkfilter] mode=0 (original exact scan) overlap-refusals=%lu\n",
+           pj_redir_overlap);
+#endif
+#if B86_PJ_V30G_FAST_WALK
+    printf("[bb386-v30l-exactcmp] mode=%u exact bytes preserved; no journal bypass\n", (unsigned)B86_PJ_V30L_EXACT_COMPARE);
+#endif
+#if B86_PJ_V30M_OBSERVE
+    printf("[bb386-v30m-pagejournal] mode=1 pages=%lu/%lu rm-stores=%lu pm-stores=%lu pte-writes=%lu unknown=%lu wraps=%lu exact-bypass=0\n",
+           b86_v30m_unique, (unsigned long)B86_V30M_NPAGES,
+           b86_v30m_rm_stores, b86_v30m_pm_stores,
+           b86_v30m_pte_writes, b86_v30m_unknown,
+           b86_v30m_generation_wraps);
+#else
+    printf("[bb386-v30m-pagejournal] mode=0 instrumentation disabled; exact-bypass=0\n");
+#endif
+#if B86_PJ_V31_LAZY_EPOCH
+#if B86_PJ_V33_PHYSDIRTY
+    {
+        unsigned long pages = 0u;
+        uint32_t v33p;
+        for (v33p = 0u; v33p < B86_V33_NPAGES; ++v33p)
+            pages += b86_v33_dirty[v33p] != 0u;
+        printf("[bb386-v33-physdirty] mode=1 pages=%lu/%lu interp-slow=%lu pte=%lu unknown=%lu native-fast=marked exact-bypass=0 host-covered=0 authoritative=0\n",
+               pages, (unsigned long)B86_V33_NPAGES, b86_v33_cpu,
+               b86_v33_pte, b86_v33_unknown);
+        printf("[bb386-v34-host] mode=1 calls=%lu exact-bypass=0 host-covered=0 authoritative=0\n", b86_v34_host_calls);
+#if B86_PJ_V37_EPOCH_LEDGER
+        {
+            unsigned long current_pages = 0u;
+            uint32_t k;
+            for (k = 0u; k < B86_V33_NPAGES; ++k)
+                current_pages += (b86_v37_page_epoch[k] == b86_v37_token);
+            printf("[bb386-v37-epoch] mode=1 windows=%lu last=%lu current=%lu peak=%lu pages-sum=%lu empty=%lu unknown-windows=%lu wraps=%lu token=%u exact-bypass=0 authoritative=0\n",
+                b86_v37_windows, b86_v37_last_pages, current_pages,
+                b86_v37_pages_peak, b86_v37_pages_sum,
+                b86_v37_empty_windows, b86_v37_unsafe_windows,
+                b86_v37_wraps, (unsigned)b86_v37_token);
+#if B86_PJ_V38_SPOT_ORACLE
+            printf("[bb386-v38-oracle] mode=1 windows=%lu checked-pages=%lu changed=%lu covered=%lu missed=%lu missed-windows=%lu alias-skips=%lu incomplete=%lu exact-bypass=0 authoritative=0\n",
+                   b86_v38_windows, b86_v38_compared_pages,
+                   b86_v38_changed, b86_v38_covered, b86_v38_missed,
+                   b86_v38_missed_windows, b86_v38_alias_skips,
+                   b86_v38_incomplete_pages);
+#endif
+#if B86_PJ_V39_HASH_ORACLE
+            printf("[bb386-v39-fullhash] mode=1 windows=%lu checked-pages=%lu changed=%lu covered=%lu missed=%lu missed-windows=%lu alias-skips=%lu incomplete=%lu first-missed-page=%lu first-missed-token=%u exact-bypass=0 authoritative=0\n",
+                b86_v39_windows, b86_v39_compared, b86_v39_changed,
+                b86_v39_covered, b86_v39_missed, b86_v39_missed_windows,
+                b86_v39_alias, b86_v39_incomplete,
+                (unsigned long)b86_v39_first_missed_page,
+                b86_v39_first_missed_token);
+#if B86_PJ_V40_MISSLOC
+            /* Emit each missed-write event only once, outside the hot path. */
+            if (b86_v40_total - b86_v40_printed > B86_V40_EVENT_CAP) {
+                b86_v40_lost += b86_v40_total - b86_v40_printed - B86_V40_EVENT_CAP;
+                b86_v40_printed = b86_v40_total - B86_V40_EVENT_CAP;
+            }
+            while (b86_v40_printed < b86_v40_total) {
+                const B86V40MissEvent *e = &b86_v40_events[b86_v40_printed % B86_V40_EVENT_CAP];
+                unsigned first = 0u;
+                while (first < B86_V40_CHUNKS_PER_PAGE && !(e->chunk_mask & (1u << first)))
+                    ++first;
+                printf("[bb386-v40-missloc] event=%lu window=%lu page=%lu phys=%08lX closing-token=%u observed-stamp=%u first-chunk=%u first-offset=%u mask=%04X closing-kind=%u\n",
+                    b86_v40_printed + 1u, (unsigned long)e->window,
+                    (unsigned long)e->page, (unsigned long)(e->page << 12u),
+                    (unsigned)e->closing_token, (unsigned)e->observed_stamp,
+                    first, first * 256u, (unsigned)e->chunk_mask, (unsigned)e->closing_kind);
+                ++b86_v40_printed;
+            }
+            printf("[bb386-v40-missloc] mode=1 events=%lu lost=%lu exact-bypass=0 authoritative=0\n",
+                b86_v40_total, b86_v40_lost);
+            printf("[bb386-v42-mode] mode=1 rm-windows=%lu pm-windows=%lu unknown-windows=%lu rm-checked=%lu pm-checked=%lu unknown-checked=%lu rm-changed=%lu pm-changed=%lu unknown-changed=%lu rm-missed=%lu pm-missed=%lu unknown-missed=%lu exact-bypass=0 authoritative=0\n",
+                b86_v42_rm_windows, b86_v42_pm_windows, b86_v42_other_windows,
+                b86_v42_rm_checked, b86_v42_pm_checked, b86_v42_other_checked,
+                b86_v42_rm_changed, b86_v42_pm_changed, b86_v42_other_changed,
+                b86_v42_rm_missed, b86_v42_pm_missed, b86_v42_other_missed);
+            printf("[bb386-v41-phase] mode=1 closing-before-token=1 baseline-after-token=1 exact-bypass=0 authoritative=0\n");
+#endif
+#endif
+        }
+#endif
+#if defined(PICO_ON_DEVICE) && PICO_ON_DEVICE
+        {
+            uint32_t md_bulk[4] = {0u, 0u, 0u, 0u};
+            extern void md_v35_bulk_stats(uint32_t out[4]);
+            md_v35_bulk_stats(md_bulk);
+            printf("[bb386-v35-md-bulk] mode=1 direct=%lu wrapped=%lu notify=%lu bytes=%lu exact-bypass=0 authoritative=0\n",
+                   (unsigned long)md_bulk[0], (unsigned long)md_bulk[1],
+                   (unsigned long)md_bulk[2], (unsigned long)md_bulk[3]);
+            /* BB_V36_MD_SCALAR_DIRTY_V1: counts canonical microDOS scalar guest stores. */
+            {
+                uint32_t md_scalar[4] = {0u, 0u, 0u, 0u};
+                extern void md_v36_scalar_stats(uint32_t out[4]);
+                md_v36_scalar_stats(md_scalar);
+                printf("[bb386-v36-md-scalar] mode=1 byte=%lu word=%lu wrapped=%lu notify=%lu exact-bypass=0 authoritative=0\n",
+                       (unsigned long)md_scalar[0], (unsigned long)md_scalar[1],
+                       (unsigned long)md_scalar[2], (unsigned long)md_scalar[3]);
+            }
+        }
+#endif
+    }
+#else
+    printf("[bb386-v33-physdirty] mode=0 exact-bypass=0 authoritative=0\n");
+#endif
+    printf("[bb386-v31-lazy] mode=1 epochs=%lu unlinked=%lu exact-on-use=%lu memo-hits=%lu killed=%lu fallbacks=%lu active=%u\n",
+           pj_v31_epochs, pj_v31_unlinked, pj_v31_exact,
+           pj_v31_memo_hits, pj_v31_kills, pj_v31_fallbacks,
+           (unsigned)pj_v31_active);
+#else
+    printf("[bb386-v31-lazy] mode=0 exact full-scan control\n");
+#endif
+    printf("[bb386-v30i-entrytlb] mode=%u hits=%lu walks=%lu refusals=%lu\n",
+           (unsigned)B86_PJ_V30I_ENTRY_TLB,
+           j->v30i_tlb_hits, j->v30i_tlb_walks, j->fetch_refusals);
     if (j->v30_reported_checks != j->v30_pg0_checks) {
         B86Pj *mut = (B86Pj *)(void *)j;
         printf("[bb386-v30-selective] nonpaged-checks=%lu nonpaged-kills=%lu nonpaged-kept=%lu full-fallback=%lu\n",
@@ -6000,6 +6582,18 @@ void b86_pj_stats(const B86Cpu *c, unsigned long out[8])
         mut->v30c_reported_parks = j->v30c_parks;
         mut->v30c_reported_resumes = j->v30c_resumes;
     }
+/* V30O telemetry prints on existing manual statistics requests only. */
+#if B86_PJ_V30O_DOORKEEPER
+    printf("[bb386-v30o-doorkeeper] mode=1 arm=%u epoch=%lu reset=%lu probe=%lu repeat=%lu first=%lu admits=%lu defers=%lu bypass=%lu escapes=%lu suspended=%lu\n",
+           (unsigned)PJ_V30O_ARM_EVICTIONS,
+           (unsigned long)pj_v30o_epoch, pj_v30o_resets,
+           (unsigned long)pj_v30o_probe, (unsigned long)pj_v30o_repeat,
+           pj_v30o_first, pj_v30o_hits, pj_v30o_defers,
+           pj_v30o_bypassed, pj_v30o_escapes,
+           (unsigned long)pj_v30o_suspended);
+#else
+    printf("[bb386-v30o-doorkeeper] mode=0 original V30F admission\n");
+#endif
 /* BB_V30F_ADAPTIVE_INTEGRATION_V1: read-only cold telemetry. */
     printf("[bb386-v30f-admit] mode=%u hits=%u pressure=%u up=%lu down=%lu first=%lu revisit=%lu replaced=%lu stale=%lu denied=%lu permit=%lu prearm=%lu evictions=%lu blocks=%lu last-bpe=%lu\n",
            (unsigned)v30f_admit.mode,
@@ -6179,11 +6773,19 @@ void b86_pj_mem_profile(const B86Cpu *c, unsigned long out[8])
     printf("[bb386-v23-unified-head] flat32=prefix4 pm16=single-byte policies=2 source-contract=1\n");
     printf("[bb386-v24-unified-modrm] shared=flat32+pm16 ea16-consumers=4 source-contract=1\n");
 #if BB_PJ_V25_FASTWRITE && !defined(B86_PJ_VERIFY)
+#if B86_PJ_V30N_LEAN_FASTWRITE
+    printf("[bb386-v25-fastwrite] enabled=1 native-hits=unavailable gate=tlb+cpg+rm-codemap\n");
+#else
     printf("[bb386-v25-fastwrite] enabled=1 native-hits=%lu gate=tlb+cpg+rm-codemap\n",
            (unsigned long)pj_v25_fastwrite_hits);
+#endif
 #else
     printf("[bb386-v25-fastwrite] enabled=0 native-hits=0 gate=control\n");
 #endif
+    printf("[bb386-v30n-lean] fastwrite-counter=%u pagejournal=%u exactcmp=%u\n",
+           (unsigned)B86_PJ_V30N_LEAN_FASTWRITE,
+           (unsigned)B86_PJ_V30M_OBSERVE,
+           (unsigned)B86_PJ_V30L_EXACT_COMPARE);
     printf("[bb386-v21-unified-pm16-read] native-translations=%lu enabled=%u\n",
            (unsigned long)bb_pm16_diag.v21_pm16_read_native,
            (unsigned)BB_PJ_V21_PM16_INLINE_READ);
@@ -6405,6 +7007,11 @@ void b86_pj_set_xip_counters(B86Cpu *c, const volatile uint32_t *acc, const vola
     B86Pj *j = c ? (B86Pj *)c->pj : NULL;
     if (!j) return;
     j->xacc = (acc && hit && us) ? acc : NULL; j->xhit = hit; j->xus = us; j->xlt = 0u;
+#if B86_PJ_V30K_XIP_SPLIT
+    printf("[bb386-v30k-xip] mode=1 detailed XIP split enabled (baseline overhead)\n");
+#else
+    printf("[bb386-v30k-xip] mode=0 native-entry XIP timing removed; bb386-xip counters unavailable\n");
+#endif
 }
 /* out: [0..3] SRAM-tier runs, insns, XIP misses, us; [4..7] the same for PSRAM
  * runs; [8..10] gaps between runs (count, misses, us); [11] samples dropped
