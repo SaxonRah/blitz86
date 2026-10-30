@@ -173,8 +173,14 @@ B86_HOT static inline __attribute__((always_inline)) uint32_t lin(const B86Cpu *
 
 /* V33: physical-page dirty coverage observer. This is intentionally NOT an
  * authority for skipping exact source validation. Defined in i386_pg.inc. */
+/* V44 TURBO: compile out non-authoritative v33-v42 diagnostic observers.
+ * Their full-page hashing, rotating byte samples, 1024-page window scan,
+ * and per-store bookkeeping do NOT protect native code correctness.
+ * V31 lazy unlink + mandatory exact physical/source byte checks remain ON.
+ * Restore research diagnostics with -DB86_PJ_V33_PHYSDIRTY=1.
+ */
 #ifndef B86_PJ_V33_PHYSDIRTY
-#define B86_PJ_V33_PHYSDIRTY 1
+#define B86_PJ_V33_PHYSDIRTY 0
 #endif
 #if B86_PJ_V33_PHYSDIRTY != 0 && B86_PJ_V33_PHYSDIRTY != 1
 #error "B86_PJ_V33_PHYSDIRTY must be zero or one"

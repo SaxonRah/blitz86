@@ -55,11 +55,76 @@
 #error B86_PJ_V30K_XIP_SPLIT must be 0 or 1
 #endif
 
+/* V46: extend straight-line PM32 translations to reduce cold/native
+ * dispatcher exits. The original 32-insn budget remains available with
+ * B86_PJ_V46_LONG_BLOCKS=0; no guest semantics or validation bypass.
+ * The 192-byte fetch window and 96-exit guard remain unchanged. */
+#ifndef B86_PJ_V46_LONG_BLOCKS
+#define B86_PJ_V46_LONG_BLOCKS 1
+#endif
+#if B86_PJ_V46_LONG_BLOCKS != 0 && B86_PJ_V46_LONG_BLOCKS != 1
+#error B86_PJ_V46_LONG_BLOCKS must be 0 or 1
+#endif
 #ifndef B86_PJ_MAXI
+#if B86_PJ_V46_LONG_BLOCKS
+#define B86_PJ_MAXI 48u
+#else
 #define B86_PJ_MAXI 32u
+#endif
 #endif
 #ifndef B86_PJ_HASH
 #define B86_PJ_HASH 1024u
+#endif
+/* V54: PM16 FF-family /0,/1,/2,/4,/6 + E8 + C3 native translation.
+ * A PM16 dynamic exit MUST NOT use the flat PM32 native hash table.
+ * Dynamic PM16 exits retain r1 and return to the checked C dispatcher.
+ * No interpreter call on successfully emitted forms. */
+#ifndef B86_PJ_V54_NATIVE_CONTROL
+#define B86_PJ_V54_NATIVE_CONTROL 1
+#endif
+#if B86_PJ_V54_NATIVE_CONTROL != 0 && B86_PJ_V54_NATIVE_CONTROL != 1
+#error B86_PJ_V54_NATIVE_CONTROL must be 0 or 1
+#endif
+
+/* V55: PM16 native dynamic target lookup. A value of 0 restores the exact
+ * v54 translator, including its checked-C PM16 target exit. */
+#ifndef B86_PJ_V55_PM16_DYN
+#define B86_PJ_V55_PM16_DYN 1
+#endif
+#if B86_PJ_V55_PM16_DYN != 0 && B86_PJ_V55_PM16_DYN != 1
+#error B86_PJ_V55_PM16_DYN must be 0 or 1
+#endif
+/* V56: PM16 PUSH immediate, POP register, PUSH [EA16], RET imm16,
+ * and context-checked chaining of direct CALL/JMP on a native cache hit.
+ * Zero is a byte-exact preprocessor control for installed v55. */
+#ifndef B86_PJ_V56_STACK_CHAIN
+#define B86_PJ_V56_STACK_CHAIN 1
+#endif
+#if B86_PJ_V56_STACK_CHAIN != 0 && B86_PJ_V56_STACK_CHAIN != 1
+#error B86_PJ_V56_STACK_CHAIN must be 0 or 1
+#endif
+/* V57: Flat PM32 native LOOP/LOOPE/LOOPNE and register-only POP r/m16/32.
+ * Restrict to the 32-bit address-size contract; do not admit 67-prefix or
+ * effective-address POP forms without their separate ordering analysis.
+ * Disabled mode is byte-exact preprocessed v56. */
+#ifndef B86_PJ_V57_PM32_COVERAGE
+#define B86_PJ_V57_PM32_COVERAGE 1
+#endif
+#if B86_PJ_V57_PM32_COVERAGE != 0 && B86_PJ_V57_PM32_COVERAGE != 1
+#error B86_PJ_V57_PM32_COVERAGE must be 0 or 1
+#endif
+
+/* V45: two-way native dynamic lookup using the existing flat PM32 table.
+ * A miss probes the neighboring slot before returning to C. No new state,
+ * guest-memory bypass, or epoch-validation shortcut. PM16 is unchanged. */
+#ifndef B86_PJ_V45_DYN2
+#define B86_PJ_V45_DYN2 1
+#endif
+#if B86_PJ_V45_DYN2 != 0 && B86_PJ_V45_DYN2 != 1
+#error B86_PJ_V45_DYN2 must be 0 or 1
+#endif
+#if B86_PJ_V45_DYN2 && ((B86_PJ_HASH < 2u) || ((B86_PJ_HASH & (B86_PJ_HASH - 1u)) != 0u))
+#error B86_PJ_V45_DYN2 requires a power-of-two hash table with at least two slots
 #endif
 #if !defined(B86_PJ_CHAIN) && defined(B86_PJ_VERIFY)
 #define B86_PJ_CHAIN 64u                         /* verify: short chains fit the write log */
@@ -118,7 +183,11 @@ typedef struct B86Pj {
     uint32_t shared_end, half, cur_half, half_fill[2];
     uint32_t nlinks;                         /* entries in the link log */
     unsigned long evictions, unlinks, gen;
-    uint8_t *tail_z, *tail, *dyn, *chk, *entry, *memtramp;   /* shared code at the start of the buffer */
+#if B86_PJ_V55_PM16_DYN && BB_PJ_PM16_REG_TIER
+    uint8_t *tail_z, *tail, *dyn, *dyn16, *chk, *entry, *memtramp;
+#else
+    uint8_t *tail_z, *tail, *dyn, *chk, *entry, *memtramp;
+#endif   /* shared code at the start of the buffer */
     uint8_t *memt[6];                        /* r71: per size/write entries: MOVW r2,sw; B memtramp */
     uint8_t *exit_s;                         /* r71: unlinked compact static exit */
     uint8_t *lzh[24];                        /* r71: shared lazy-flag record writers (BB_PJ_LAZY_CALL_V1) */
@@ -129,7 +198,11 @@ typedef struct B86Pj {
      * its PSRAM copy becomes a trampoline (LDR PC) to the SRAM copy. The SRAM
      * region has its own copy of the shared routines (BL/B reach is +-16 MiB
      * and SRAM is ~240 MiB from PSRAM). When it fills it is emptied at once. */
+#if B86_PJ_V55_PM16_DYN && BB_PJ_PM16_REG_TIER
+    struct PjSh { uint8_t *tail_z, *tail, *dyn, *dyn16, *chk, *entry, *memtramp, *exit_s, *memt[6], *lzh[24]; } hsh;
+#else
     struct PjSh { uint8_t *tail_z, *tail, *dyn, *chk, *entry, *memtramp, *exit_s, *memt[6], *lzh[24]; } hsh;
+#endif
     uint8_t *hot;                            /* NULL: no SRAM tier */
     uint32_t hot_base, hot_cap, hot_start, hot_used;   /* offsets relative to code (mod 2^32) */
     uint32_t nredir, maxredir, tr_hot, hot_after;   /* r72c: adaptive promotion threshold */
@@ -357,6 +430,9 @@ static void pj_sh_get(const B86Pj *j, struct PjSh *m)
 {
     unsigned k;
     m->tail_z = j->tail_z; m->tail = j->tail; m->dyn = j->dyn; m->chk = j->chk; m->entry = j->entry;
+#if B86_PJ_V55_PM16_DYN && BB_PJ_PM16_REG_TIER
+    m->dyn16 = j->dyn16;
+#endif
     m->memtramp = j->memtramp; m->exit_s = j->exit_s;
     for (k = 0; k < 6u; ++k) m->memt[k] = j->memt[k];
     for (k = 0; k < 24u; ++k) m->lzh[k] = j->lzh[k];
@@ -365,6 +441,9 @@ static void pj_sh_set(B86Pj *j, const struct PjSh *m)
 {
     unsigned k;
     j->tail_z = m->tail_z; j->tail = m->tail; j->dyn = m->dyn; j->chk = m->chk; j->entry = m->entry;
+#if B86_PJ_V55_PM16_DYN && BB_PJ_PM16_REG_TIER
+    j->dyn16 = m->dyn16;
+#endif
     j->memtramp = m->memtramp; j->exit_s = m->exit_s;
     for (k = 0; k < 6u; ++k) j->memt[k] = m->memt[k];
     for (k = 0; k < 24u; ++k) j->lzh[k] = m->lzh[k];
@@ -551,17 +630,44 @@ static void pj_patch_b(uint8_t *at, uint8_t *to)
 #define PJ_PGH(pg) ((((uint32_t)(pg)) * 0x9E3779B1u) >> 20)   /* 4096-bit hashed page filter */
 static B86Pj *b86_pj_state(const B86Cpu *c) { return (B86Pj *)c->pj; }
 #if B86_PJ_V31_LAZY_EPOCH
+/* V47: generation-tagged 512-way positive exact-validation memo. Each
+ * code-cache/mode epoch changes the tag, so steady RM->PM transitions no
+ * longer clear the memo array. A generation wrap clears tags before reuse.
+ * Exact physical IDs and guest bytes are STILL checked on any miss. */
+#ifndef B86_PJ_V47_EPOCH_MEMO
+#define B86_PJ_V47_EPOCH_MEMO 1
+#endif
+#if B86_PJ_V47_EPOCH_MEMO != 0 && B86_PJ_V47_EPOCH_MEMO != 1
+#error B86_PJ_V47_EPOCH_MEMO must be 0 or 1
+#endif
+#if B86_PJ_V47_EPOCH_MEMO
+#define PJ_V31_MEMO_N 512u
+#else
 #define PJ_V31_MEMO_N 256u
+#endif
 /* Positive-only, address-tagged memo. The two counters distinguish reuse
  * after PSRAM half eviction and hot-tier recycling. Every epoch clears it. */
 static uint32_t pj_v31_memo[PJ_V31_MEMO_N];
+#if B86_PJ_V47_EPOCH_MEMO
+static uint8_t pj_v47_memo_tag[PJ_V31_MEMO_N];
+static uint8_t pj_v47_memo_epoch;
+#endif
 static unsigned long pj_v31_gen_seen, pj_v31_flush_seen, pj_v31_hot_seen;
 static uint8_t pj_v31_active;
 static unsigned long pj_v31_epochs, pj_v31_unlinked, pj_v31_exact,
                      pj_v31_memo_hits, pj_v31_kills, pj_v31_fallbacks;
 static void pj_v31_memo_reset(const B86Pj *j)
 {
+#if B86_PJ_V47_EPOCH_MEMO
+    /* Zero is reserved for an invalid/uninitialized tag. All old entries
+     * are rejected after every rotation, including wraparound. */
+    if (++pj_v47_memo_epoch == 0u) {
+        memset(pj_v47_memo_tag, 0, sizeof pj_v47_memo_tag);
+        pj_v47_memo_epoch = 1u;
+    }
+#else
     memset(pj_v31_memo, 0, sizeof pj_v31_memo);
+#endif
     pj_v31_gen_seen = j->gen;
     pj_v31_flush_seen = j->flushes;
     pj_v31_hot_seen = j->hot_resets;
@@ -1623,6 +1729,41 @@ static int pjt_imm(PjT *t, unsigned w, uint32_t *v)
     *v = (uint32_t)t->b[t->pos] | ((uint32_t)t->b[t->pos + 1u] << 8); t->pos += 2u; return 1;
 }
 
+/* V50: first native instruction coverage batch. 0 retains exact v48 code. */
+#ifndef B86_PJ_V50_NATIVE_COVERAGE
+#define B86_PJ_V50_NATIVE_COVERAGE 1
+#endif
+#if B86_PJ_V50_NATIVE_COVERAGE != 0 && B86_PJ_V50_NATIVE_COVERAGE != 1
+#error B86_PJ_V50_NATIVE_COVERAGE must be 0 or 1
+#endif
+
+/* V51: PM16 LEA plus checked segment-stack native coverage.  The legacy
+ * V50 translator is retained byte-for-byte at preprocessor level when off. */
+#ifndef B86_PJ_V51_NATIVE_COVERAGE
+#define B86_PJ_V51_NATIVE_COVERAGE 1
+#endif
+#if B86_PJ_V51_NATIVE_COVERAGE != 0 && B86_PJ_V51_NATIVE_COVERAGE != 1
+#error B86_PJ_V51_NATIVE_COVERAGE must be 0 or 1
+#endif
+
+/* V52: PM16 segment MOV register forms and ES override native reads.
+ * 0 is byte-exact V51 control after preprocessing; 1 adds guarded coverage. */
+#ifndef B86_PJ_V52_NATIVE_SEGMOV_ES
+#define B86_PJ_V52_NATIVE_SEGMOV_ES 1
+#endif
+#if B86_PJ_V52_NATIVE_SEGMOV_ES != 0 && B86_PJ_V52_NATIVE_SEGMOV_ES != 1
+#error B86_PJ_V52_NATIVE_SEGMOV_ES must be 0 or 1
+#endif
+
+/* V53: PM16 checked 8E memory source and native ES store coverage.
+ * 0 is the exact V52 translation/preprocessor control. */
+#ifndef B86_PJ_V53_NATIVE_SEGMEM
+#define B86_PJ_V53_NATIVE_SEGMEM 1
+#endif
+#if B86_PJ_V53_NATIVE_SEGMEM != 0 && B86_PJ_V53_NATIVE_SEGMEM != 1
+#error B86_PJ_V53_NATIVE_SEGMEM must be 0 or 1
+#endif
+
 /* V23: the shared protected-mode instruction-head parser.  This is a
  * translation-time frontend component, not a guest-execution call.  Policies
  * intentionally preserve the historical eligibility boundaries: flat32
@@ -1726,6 +1867,55 @@ static int pjt_unified_ea16(PjT *t, uint32_t mr, unsigned *segment)
     }
     return 1;
 }
+
+#if B86_PJ_V53_NATIVE_SEGMEM
+/* The common protected-mode ES store is emitted as Thumb-2. This guard
+ * admits only cached, writable, expand-up data descriptors, in-limit and
+ * nonwrapping byte/word ranges, with aligned halfword accesses. It makes
+ * NO guest-visible changes before all checks pass. The existing native
+ * memt write trampoline performs the paging, mapped-frame, SMC and MMIO
+ * checks; on refusal it returns to the interpreter before a native store. */
+static void pjt_v53_es_write_guard(PjT *t, unsigned width)
+{
+    const unsigned sc = (unsigned)offsetof(B86Cpu, pm386) +
+        (unsigned)offsetof(B86PM1State, seg) +
+        B86_ES * (unsigned)sizeof(B86PM1Cache);
+    pjt_c(t); /* R12 is CPU pointer, R1 is zero-extended EA16 */
+    pj_ldst(&t->e, PJ_LDRB, R0, CREG,
+            sc + (unsigned)offsetof(B86PM1Cache, valid));
+    pj_dpi(&t->e, 13u, 1, PC, R0, 0u);
+    pjt_exit_stay(t, 0 /* EQ: invalid */, t->ip0, t->ninsn - 1u);
+    pj_ldst(&t->e, PJ_LDRB, R0, CREG,
+            sc + (unsigned)offsetof(B86PM1Cache, reserved));
+    pj_dpi(&t->e, 13u, 1, PC, R0, 0u);
+    pjt_exit_stay(t, 1 /* NE: reserved */, t->ip0, t->ninsn - 1u);
+    pj_ldst(&t->e, PJ_LDRB, R0, CREG,
+            sc + (unsigned)offsetof(B86PM1Cache, access));
+    pj_dpi(&t->e, 0u, 0, R0, R0, 0x1Eu);
+    pj_dpi(&t->e, 13u, 1, PC, R0, 0x12u);
+    pjt_exit_stay(t, 1 /* NE: not writable expand-up data */, t->ip0,
+                  t->ninsn - 1u);
+    pj_ldst(&t->e, PJ_LDR, R3, CREG,
+            sc + (unsigned)offsetof(B86PM1Cache, limit));
+    pjt_addimm(t, R2, R1, width - 1u);
+    pj_dpr(&t->e, 13u, 1, PC, R2, R3, 0u, 0u);
+    pjt_exit_stay(t, 8 /* HI: end offset beyond limit */, t->ip0,
+                  t->ninsn - 1u);
+    pj_ldst(&t->e, PJ_LDR, R0, CREG,
+            sc + (unsigned)offsetof(B86PM1Cache, base));
+    /* Check base + LAST byte as uint32, not merely base + first byte. */
+    pj_dpr(&t->e, 8u, 1, R2, R2, R0, 0u, 0u);
+    pjt_exit_stay(t, 2 /* CS: linear end overflows */, t->ip0,
+                  t->ninsn - 1u);
+    pj_dpr(&t->e, 8u, 0, R1, R1, R0, 0u, 0u);
+    if (width == 2u) {
+        pj_dpi(&t->e, 0u, 1, R2, R1, 1u);
+        pjt_exit_stay(t, 1 /* NE: unaligned halfword */, t->ip0,
+                      t->ninsn - 1u);
+    }
+    t->fuse_at = NULL; /* guard CMP/ANDS changes native condition flags */
+}
+#endif /* B86_PJ_V53_NATIVE_SEGMEM */
 
 /* Translate one instruction at t->b[t->pos]. Returns 1 = continue block,
  * 2 = block ended (exits emitted), 0 = not supported (block ends before it). */
@@ -1889,6 +2079,22 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
         pjt_getr(t, R0, m.reg, ww);
         pjt_alu(t, 4u, ww, R3, R1, R0);
         return 1; }
+#if B86_PJ_V57_PM32_COVERAGE
+    /* 8F /0 with mod=11: POP r16/r32. Reuse the existing PM32 checked
+     * stack read, then increment ESP before writing the destination.
+     * This order is essential for POP ESP and 66 POP SP. 8F memory forms
+     * are refused: POP [ESP+disp] calculates its address after the pop. */
+    case 0x8F:
+        if (!((np == 1u && !o16) || (np == 2u && o16)) ||
+            t->pos >= t->n || (t->b[t->pos] & 0xF8u) != 0xC0u ||
+            !pjt_modrm(t, &m) || m.mod != 3u || m.reg != 0u) PJ_FAIL();
+        pj_mov(&t->e, R1, GR(4));
+        pjt_mem(t, w, 0);
+        pj_dpi(&t->e, 8u, 0, GR(4), GR(4), w);
+        if (w == 4u) pj_ldst(&t->e, PJ_LDR, GR(m.rm), R0, 0u);
+        else { pjt_ld(t, R1, R0, 2u); pjt_putr(t, m.rm, 2u, R1); }
+        return 1;
+#endif /* V57 native POP r/m register */
     case 0x88: case 0x89: case 0x8A: case 0x8B: {
         const unsigned ww = (op & 1u) ? w : 1u;
         if (!pjt_modrm(t, &m)) PJ_FAIL();
@@ -1986,6 +2192,18 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
         }
         return 1; }
     case 0xF5: case 0xF8: case 0xF9: case 0xFC: case 0xFD:
+#if B86_PJ_V50_NATIVE_COVERAGE
+        if (op == 0xFCu || op == 0xFDu) {
+            /* CLD/STD change ONLY DF, which is never covered by lazy arithmetic
+             * records. Do not materialize those records or return to C. */
+            pjt_c(t);
+            pj_ldst(&t->e, PJ_LDR, R1, CREG, (unsigned)offsetof(B86Cpu, flags));
+            pj_dpi(&t->e, op == 0xFCu ? 1u : 2u, 0, R1, R1, B86_DF);
+            pj_ldst(&t->e, PJ_STR, R1, CREG, (unsigned)offsetof(B86Cpu, flags));
+            t->fuse_at = NULL;
+            return 1;
+        }
+#endif
         pjt_c(t);
         pj_mov(&t->e, R0, CREG);
         pj_movw(&t->e, R1, op);
@@ -2210,6 +2428,33 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
         pj_dpi(&t->e, 8u, 0, GR(4), GR(5), 4u);
         pj_ldst(&t->e, PJ_LDR, GR(5), R0, 0u);
         return 1;
+#if B86_PJ_V57_PM32_COVERAGE
+    /* E0/E1/E2: LOOPNE/LOOPE/LOOP in the flat 32-bit-address contract.
+     * Unlike DEC ECX, LOOP does not modify guest EFLAGS. The generated
+     * Thumb-2 subtracts without S-bit and uses a native CMP solely for the
+     * branch. The pre-LOOP guest ZF comes from the existing lazy flag path.
+     * ECX==0 after decrement takes the fallthrough before inspecting ZF.
+     * 67 address-size overrides use CX, not ECX: refuse those for now. */
+    case 0xE0: case 0xE1: case 0xE2: {
+        int zf_arm;
+        if (np != 1u || !pjt_u8(t, &imm)) PJ_FAIL();
+        imm = (uint32_t)(int32_t)(int8_t)imm;
+        pj_dpi(&t->e, 13u, 0, GR(1), GR(1), 1u); /* SUB ECX,#1; S=0 */
+        pj_dpi(&t->e, 13u, 1, PC, GR(1), 0u);     /* CMP ECX,#0 (ARM only) */
+        pjt_exit_cond(t, 0 /* EQ, count exhausted */, PJ_NEXT(), t->ninsn);
+        if (op == 0xE2u) {
+            pjt_exit(t, PJ_NEXT() + imm, t->ninsn, 0);
+        } else {
+            /* b86_pj_cond is called only if the lazy x86 ZF producer cannot
+             * be reconstructed by generated Thumb-2; never interpret LOOP. */
+            zf_arm = pjt_flags_for(t, 4u /* ZF==1 */);
+            pjt_exit_cond(t, op == 0xE1u ? zf_arm : (zf_arm ^ 1),
+                          PJ_NEXT() + imm, t->ninsn);
+            pjt_exit(t, PJ_NEXT(), t->ninsn, 0);
+        }
+        return 2;
+    }
+#endif /* V57 native LOOP/LOOPE/LOOPNE */
     /* BB_PJ_C1_E3_66_V1: E3 rel8 = JECXZ in 32-bit address mode.
      * 67 JCXZ remains on the interpreter path (67 is not decoded here).
      * The branch tests ECX without changing guest arithmetic flags. */
@@ -2504,6 +2749,21 @@ static void pjt_stub(PjT *t, const PjExit *x, const B86Pj *j)
         (void)tail;
         return;
     }
+#if B86_PJ_V54_NATIVE_CONTROL
+    /* dyn=3: PM16 computed EIP already in r1. The native v55 route
+     * probes the CURRENT CS-context's PM16 table, never the flat PM32
+     * table. On any miss/interrupt it falls through the original tail_z
+     * path so C can validate/translate safely. */
+    if (x->dyn == 3) {
+        pj_movw(&t->e, R0, x->n);
+#if B86_PJ_V55_PM16_DYN && BB_PJ_PM16_REG_TIER
+        pj_patch_b(pj_b(&t->e, -1), j->dyn16);
+#else
+        pj_patch_b(pj_b(&t->e, -1), tail_z);
+#endif
+        return;
+    }
+#endif
     if (x->dyn == 2) pj_imm32(&t->e, R1, x->ip);
     pj_movw(&t->e, R0, x->n);
     pj_patch_b(pj_b(&t->e, -1), x->dyn == 1 ? j->dyn : tail_z);   /* EIP in r1: look the target up natively */
@@ -2970,7 +3230,22 @@ static B86_PJ_COLD void pj_emit_shared_at(B86Pj *j, uint8_t *base, uint8_t *end)
     pje32(&t->e, 0xF850u | R2, (LR << 12) | (2u << 4) | R3);          /* LDR lr, [r2, r3, LSL #2] */
     pj_dpi(&t->e, 2u, 0, R12, R1, 1u);                                  /* r12 = eip | 1 */
     pj_dpr(&t->e, 13u, 1, PC, LR, R12, 0u, 0u);
+#if B86_PJ_V45_DYN2
+    /* A first-way hit skips the second probe. R1 (target EIP), R0 (retired
+     * count), R12 (tag) and the native stack frame are unchanged. R3 is
+     * intentionally updated to the successful slot for the ent[] load.
+     * A secondary miss takes the ORIGINAL tail_z/C path below. */
+    {
+        uint8_t *hit1 = pj_b(&t->e, 0 /* EQ */);
+        pj_dpi(&t->e, 4u, 0, R3, R3, 1u); /* EOR.W r3,r3,#1: adjacent slot */
+        pje32(&t->e, 0xF850u | R2, (LR << 12) | (2u << 4) | R3);
+        pj_dpr(&t->e, 13u, 1, PC, LR, R12, 0u, 0u);
+        miss1 = pj_b(&t->e, 1 /* NE */);
+        pj_patch_b(hit1, t->e.p);
+    }
+#else
     miss1 = pj_b(&t->e, 1 /* NE */);
+#endif
     pjt_addimm(t, R2, R2, (uint32_t)(offsetof(B86Pj, ent) - offsetof(B86Pj, tag)));
     pje32(&t->e, 0xF850u | R2, (LR << 12) | (2u << 4) | R3);          /* LDR lr, [r2, r3, LSL #2] (ent) */
     pj_dpi(&t->e, 13u, 1, PC, LR, 0u);
@@ -2993,6 +3268,67 @@ static B86_PJ_COLD void pj_emit_shared_at(B86Pj *j, uint8_t *base, uint8_t *end)
         pj_patch_b(f1, j->tail_z); pj_patch_b(f2, j->tail_z);
     }
     pj_patch_b(miss1, j->tail_z); pj_patch_b(miss2, j->tail_z);
+#if B86_PJ_V55_PM16_DYN && BB_PJ_PM16_REG_TIER
+    /* V55: native PM16 target chaining. PM16 TAG/ENT pairs are indexed
+     * within the current (CS base,limit,kind) context, NOT j->tag/ent.
+     * C alone selects/allocates pm16_cur before native entry. The context
+     * is stable until the native run returns to C. All SMC/IRQ/epoch guards
+     * stay enabled; a hash hit is never a substitute for C admission. */
+    j->dyn16 = t->e.p;               /* r1 = 16-bit target, r0 = retired */
+    {
+        unsigned hb16 = 0u, cs_shift = 0u;
+        uint8_t *miss_tag, *miss_ent, *f_irq, *f_budget;
+        while ((1u << hb16) < PJ_PM16_ENT) ++hb16;
+        while ((1u << cs_shift) < 2u * PJ_PM16_ENT * sizeof(uint32_t)) ++cs_shift;
+        /* This emitted path is only valid for the compile-time power-of-two
+         * PM16 table geometry. Never wrap an invalid context into table 0. */
+        pj_ldst(&t->e, PJ_LDR, CREG, SP, 0u);
+        pj_ldst(&t->e, PJ_LDR, R2, CREG, (unsigned)offsetof(B86Cpu, pj));
+        pj_ldst(&t->e, PJ_LDR, R3, R2, (unsigned)offsetof(B86Pj, pm16_active));
+        pj_dpi(&t->e, 13u, 1, PC, R3, 1u);
+        f_irq = pj_b(&t->e, 1 /* NE: not in PM16 */);
+        pj_ldst(&t->e, PJ_LDR, R3, R2, (unsigned)offsetof(B86Pj, pm16_cur));
+        pj_dpi(&t->e, 13u, 1, PC, R3, PJ_PM16_CTX);
+        f_budget = pj_b(&t->e, 2 /* HS: invalid context */);
+        pj_shift(&t->e, R3, R3, 0u, cs_shift);
+        pj_imm32(&t->e, R2, (uint32_t)(uintptr_t)pj_pm16_tag(j, 0u));
+        pj_dpr(&t->e, 8u, 0, R2, R2, R3, 0u, 0u);
+        pj_movw(&t->e, R3, 0x79B1u);
+        pj_movt(&t->e, R3, 0x9E37u);
+        pje32(&t->e, 0xFB00u | R1, 0xF000u | (R3 << 8) | R3); /* hash MUL */
+        pj_ubfx(&t->e, R3, R3, 16u, hb16);
+        pje32(&t->e, 0xF850u | R2, (LR << 12) | (2u << 4) | R3); /* TAG[hash] */
+        pj_dpi(&t->e, 2u, 0, R12, R1, 1u); /* target|1 */
+        pj_dpr(&t->e, 13u, 1, PC, LR, R12, 0u, 0u);
+        miss_tag = pj_b(&t->e, 1 /* NE: C lookup/validation */);
+        pjt_addimm(t, R2, R2, (uint32_t)(PJ_PM16_ENT * sizeof(uint32_t)));
+        pje32(&t->e, 0xF850u | R2, (LR << 12) | (2u << 4) | R3); /* ENT[hash] */
+        pj_dpi(&t->e, 13u, 1, PC, LR, 0u);
+        miss_ent = pj_b(&t->e, 0 /* EQ: no translated block */);
+        pj_imm32(&t->e, R12, (uint32_t)(uintptr_t)j->code);
+        pj_dpr(&t->e, 8u, 0, LR, LR, R12, 0u, 0u); /* code + ent = Thumb body | 1 */
+        /* Same IRQ, stop, budget, and retired-count logic as flat dyn. */
+        pj_ldst(&t->e, PJ_LDR, CREG, SP, 0u);
+        pj_ldst(&t->e, PJ_LDR, R2, CREG, (unsigned)offsetof(B86Cpu, irq));
+        pj_ldst(&t->e, PJ_LDR, R3, CREG, (unsigned)offsetof(B86Cpu, pj_stop));
+        pj_dpr(&t->e, 2u, 1, R2, R2, R3, 0u, 0u);
+        { uint8_t *f = pj_b(&t->e, 1 /* NE */);
+          pj_ldst(&t->e, PJ_LDR, R2, SP, 8u);
+          pj_dpi(&t->e, 13u, 1, PC, R2, B86_PJ_CHAIN);
+          { uint8_t *g = pj_b(&t->e, 2 /* HS */);
+            pj_dpr(&t->e, 8u, 0, R2, R2, R0, 0u, 0u);
+            pj_ldst(&t->e, PJ_STR, R2, SP, 8u);
+            pje16(&t->e, 0x4700u | (LR << 3)); /* BX translated block */
+            pj_patch_b(g, j->tail_z);
+          }
+          pj_patch_b(f, j->tail_z);
+        }
+        pj_patch_b(f_irq, j->tail_z);
+        pj_patch_b(f_budget, j->tail_z);
+        pj_patch_b(miss_tag, j->tail_z);
+        pj_patch_b(miss_ent, j->tail_z);
+    }
+#endif /* V55 native PM16 dynamic chaining */
     j->used = (uint32_t)(t->e.p - j->code);
     j->used = (j->used + 3u) & ~3u;
     j->shared_end = j->used;                      /* r71: ring halves follow the shared code */
@@ -3296,6 +3632,9 @@ static B86_PJ_COLD uint32_t pj_v31_find(B86Cpu *c, B86Pj *j,
          * generation; dead entries still cannot be executed. */
         pj_v31_memo_sync(j);
         if (pj_v31_memo[(off >> 2) & (PJ_V31_MEMO_N - 1u)] == off + 1u &&
+#if B86_PJ_V47_EPOCH_MEMO
+            pj_v47_memo_tag[(off >> 2) & (PJ_V31_MEMO_N - 1u)] == pj_v47_memo_epoch &&
+#endif
             !(hd[1] & 0x80000000u)) {
             ++pj_v31_memo_hits;
             return ent;
@@ -3304,6 +3643,9 @@ static B86_PJ_COLD uint32_t pj_v31_find(B86Cpu *c, B86Pj *j,
         if (!pj_v29_walk(c, j, off, off + size)) goto invalid;
         if (!(hd[1] & 0x80000000u)) {
             pj_v31_memo[(off >> 2) & (PJ_V31_MEMO_N - 1u)] = off + 1u;
+#if B86_PJ_V47_EPOCH_MEMO
+            pj_v47_memo_tag[(off >> 2) & (PJ_V31_MEMO_N - 1u)] = pj_v47_memo_epoch;
+#endif
             return ent;
         }
         ++pj_v31_kills; /* stale version killed; search next live copy */
@@ -4046,6 +4388,80 @@ static B86_PJ_COLD void pj_v181_note_ba_stop(const uint8_t *bytes,
 }
 #endif /* V18.1 classifier */
 
+#if B86_PJ_V54_NATIVE_CONTROL && BB_PJ_PM16_GS_STACK_V17
+/* V54 shared PM16 checked stack-pointer transition after a successful
+ * 16-bit operand access. SS.B selects full ESP or low-SP16 wrapping.
+ * No flags or other guest registers are modified. */
+static void pjt_v54_sp_step(PjT *t, int is_push)
+{
+    pjt_c(t);
+    pj_ldst(&t->e, PJ_LDRB, R2, CREG,
+            (unsigned)offsetof(B86Cpu, pm386.seg[B86_SS].flags));
+    pj_dpi(&t->e, 0u, 1, PC, R2, 4u); /* TST SS.B */
+    {
+        uint8_t *addr32 = pjt_bfwd(t, 1 /* NE: SS.B=1 */);
+        pjt_addimm(t, R2, GR(4), is_push ? (uint32_t)-2 : 2u);
+        pj_bfi(&t->e, GR(4), R2, 0u, 16u);
+        {
+            uint8_t *done = pjt_bfwd(t, -1);
+            pjt_here(t, addr32);
+            pjt_addimm(t, GR(4), GR(4), is_push ? (uint32_t)-2 : 2u);
+            pjt_here(t, done);
+        }
+    }
+    t->fuse_at = NULL;
+}
+/* Any odd pointer is safe: guest words are always read/stored as bytes. */
+static void pjt_v54_store16(PjT *t) /* host ptr=r0; value=r1 */
+{
+    pj_ldst(&t->e, PJ_STRB, R1, R0, 0u);
+    pj_shift(&t->e, R2, R1, 1u, 8u);
+    pj_ldst(&t->e, PJ_STRB, R2, R0, 1u);
+}
+static void pjt_v54_read16(PjT *t) /* host ptr=r0; result=r1 */
+{
+    pj_ldst(&t->e, PJ_LDRB, R1, R0, 0u);
+    pj_ldst(&t->e, PJ_LDRB, R2, R0, 1u);
+    pj_dpr(&t->e, 2u, 0, R1, R1, R2, 0u, 8u);
+}
+/* Guard first; any rejection returns the original x86 instruction to the
+ * interpreter with no guest memory/register/ESP commit. */
+static void pjt_v54_stack_check(PjT *t, int push)
+{
+    pjt_c(t);
+    pj_mov(&t->e, R0, CREG);
+    pj_mov(&t->e, R1, GR(4));
+    pj_movw(&t->e, R2, push ? 1u : 0u);
+    pjt_call(t, (const void *)b86_pj_pm16_gs16_ptr);
+    pj_dpi(&t->e, 13u, 1, PC, R0, 0u);
+    pjt_exit_stay(t, 0 /* EQ */, t->ip0, t->ninsn - 1u);
+}
+#endif /* V54 guarded 16-bit stack emission */
+#if B86_PJ_V56_STACK_CHAIN && B86_PJ_V54_NATIVE_CONTROL && BB_PJ_PM16_GS_STACK_V17
+/* RET imm16 adjusts the address-size-selected stack pointer AFTER popping
+ * the target. No guest memory access is involved in the additional adjust.
+ * Unlike a raw 16-bit add to ESP, SS.B=0 wraps only SP; SS.B=1 uses ESP. */
+static void pjt_v56_sp_add(PjT *t, uint32_t bytes)
+{
+    pjt_c(t);
+    pj_ldst(&t->e, PJ_LDRB, R2, CREG,
+            (unsigned)offsetof(B86Cpu, pm386.seg[B86_SS].flags));
+    pj_dpi(&t->e, 0u, 1, PC, R2, 4u);
+    {
+        uint8_t *addr32 = pjt_bfwd(t, 1 /* NE: SS.B=1 */);
+        pjt_addimm(t, R2, GR(4), bytes);
+        pj_bfi(&t->e, GR(4), R2, 0u, 16u);
+        {
+            uint8_t *done = pjt_bfwd(t, -1);
+            pjt_here(t, addr32);
+            pjt_addimm(t, GR(4), GR(4), bytes);
+            pjt_here(t, done);
+        }
+    }
+    t->fuse_at = NULL;
+}
+#endif /* V56 checked PM16 stack additions */
+
 static B86_PJ_COLD int pjt_insn_pm16(PjT *t)
 {
     uint32_t op, modrm, imm;
@@ -4288,6 +4704,32 @@ static B86_PJ_COLD int pjt_insn_pm16(PjT *t)
             do { BB_PM16_DIAG_INC(emit_ok); return 2; } while (0);
         }
 #endif /* BB_PJ_PM16_STACK32_V14 */
+#if B86_PJ_V50_NATIVE_COVERAGE
+        /* Operand-size override: CWDE and CDQ; no x86 flags or memory. */
+        if (op66 == 0x98u) {
+            pj_ext(&t->e, 0xFA0Fu, R1, GR(0)); /* SXTH EAX low 16 */
+            pjt_putr(t, 0u, 4u, R1);
+            do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0);
+        }
+        if (op66 == 0x99u) {
+            pj_shift(&t->e, R1, GR(0), 2u, 31u); /* CDQ: EDX=EAX>>31 arithmetic */
+            pjt_putr(t, 2u, 4u, R1);
+            do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0);
+        }
+#endif
+#if B86_PJ_V51_NATIVE_COVERAGE
+        /* 66 8D /r: LEA r32,m16.  The EA16 emitter computes the wrapped
+         * 16-bit effective OFFSET without touching a guest descriptor or
+         * memory. A register-only ModRM (mod=3) is invalid and refused. */
+        if (op66 == 0x8Du) {
+            PjUnifiedModRM lea;
+            unsigned unused_seg;
+            if (!pjt_unified_modrm(t, &lea) || lea.mod == 3u ||
+                !pjt_unified_ea16(t, lea.raw, &unused_seg)) PJ16_FAIL();
+            pjt_putr(t, lea.reg, 4u, R1);
+            do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0);
+        }
+#endif
         if (op66 == 0x90u) do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0); /* XCHG EAX,EAX */
         if (op66 >= 0xB8u && op66 <= 0xBFu) {
             if (!pjt_imm(t, 4u, &imm66)) PJ16_FAIL();
@@ -4490,6 +4932,60 @@ static B86_PJ_COLD int pjt_insn_pm16(PjT *t)
 #ifndef BB_PJ_V171_POP
 #define BB_PJ_V171_POP 1u
 #endif
+#if B86_PJ_V51_NATIVE_COVERAGE && BB_PJ_PM16_GS_STACK_V17
+    /* 0F A0/A1: unprefixed 16-bit PUSH/POP FS.  Same protected SS
+     * pointer admission as the existing proven GS path, including odd
+     * stack addresses, permission/page checks and SMC notification.  POP
+     * validates and commits the FS descriptor before advancing SP. */
+    if (op == 0x0Fu && t->pos < t->n &&
+        (t->b[t->pos] == 0xA0u || t->b[t->pos] == 0xA1u)) {
+        const int push_fs = t->b[t->pos] == 0xA0u;
+        uint32_t op2;
+        if (!pjt_u8(t, &op2)) PJ16_FAIL();
+        pjt_c(t);
+        pj_mov(&t->e, R0, CREG);
+        pj_mov(&t->e, R1, GR(4));
+        pj_movw(&t->e, R2, push_fs ? 1u : 0u);
+        pjt_call(t, (const void *)b86_pj_pm16_gs16_ptr);
+        pj_dpi(&t->e, 13u, 1, PC, R0, 0u);
+        pjt_exit_stay(t, 0 /* EQ */, t->ip0, t->ninsn - 1u);
+        if (push_fs) {
+            pjt_c(t);
+            pj_ldst(&t->e, PJ_LDRH, R1, CREG,
+                    (unsigned)offsetof(B86Cpu, seg386));
+            pj_ldst(&t->e, PJ_STRB, R1, R0, 0u);
+            pj_shift(&t->e, R2, R1, 1u, 8u);
+            pj_ldst(&t->e, PJ_STRB, R2, R0, 1u);
+        } else {
+            pj_ldst(&t->e, PJ_LDRB, R2, R0, 0u);
+            pj_ldst(&t->e, PJ_LDRB, R1, R0, 1u);
+            pj_dpr(&t->e, 2u, 0, R2, R2, R1, 0u, 8u);
+            pjt_c(t);
+            pj_mov(&t->e, R0, CREG);
+            pj_movw(&t->e, R1, B86_FS);
+            pjt_call(t, (const void *)b86_pj_loadseg);
+            pj_dpi(&t->e, 13u, 1, PC, R0, 0u);
+            pjt_exit_stay(t, 0 /* EQ */, t->ip0, t->ninsn - 1u);
+        }
+        pjt_c(t);
+        pj_ldst(&t->e, PJ_LDRB, R2, CREG,
+                (unsigned)offsetof(B86Cpu, pm386.seg[B86_SS].flags));
+        pj_dpi(&t->e, 0u, 1, PC, R2, 4u);
+        {
+            uint8_t *addr32 = pjt_bfwd(t, 1 /* NE: SS.B */);
+            pjt_addimm(t, R2, GR(4), push_fs ? (uint32_t)-2 : 2u);
+            pj_bfi(&t->e, GR(4), R2, 0u, 16u);
+            {
+                uint8_t *done = pjt_bfwd(t, -1);
+                pjt_here(t, addr32);
+                pjt_addimm(t, GR(4), GR(4), push_fs ? (uint32_t)-2 : 2u);
+                pjt_here(t, done);
+            }
+        }
+        pjt_exit(t, PJ16_NEXT(), t->ninsn, 2);
+        do { BB_PM16_DIAG_INC(emit_ok); return 2; } while (0);
+    }
+#endif /* V51 FS stack */
 #if BB_PJ_PM16_GS_STACK_V17
     /* Default PM16 0F A8/A9: PUSH GS / POP GS, 16-bit operand.
      * Only this exact unprefixed form; 66h, LOCK/REP and segment/address
@@ -4633,6 +5129,311 @@ static B86_PJ_COLD int pjt_insn_pm16(PjT *t)
         do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0);
     }
 #endif /* BB_PJ_PM16_MOVEXT_V9 */
+#if B86_PJ_V50_NATIVE_COVERAGE
+    /* Unprefixed MOV r/m16,Sreg, register destination. No descriptor load:
+     * source is the live selector, including FS/GS, not the hidden base.
+     * Memory ModRM and invalid /6,/7 still go to the PM interpreter. */
+    if (op == 0x8Cu) {
+        const unsigned sr = t->pos < t->n ? (t->b[t->pos] >> 3u) & 7u : 7u;
+        if (!pjt_unified_modrm_regonly(t, &modrm) || sr > B86_GS) PJ16_FAIL();
+        pjt_c(t);
+        if (sr <= B86_DS) {
+            pj_ldst(&t->e, PJ_LDR, R1, CREG,
+                    (unsigned)offsetof(B86Cpu, seg) + 4u * sr);
+            pj_ext(&t->e, 0xFA1Fu, R1, R1); /* UXTH */
+        } else {
+            pj_ldst(&t->e, PJ_LDRH, R1, CREG,
+                    (unsigned)offsetof(B86Cpu, seg386) +
+                    2u * (sr - B86_FS));
+        }
+        pjt_putr(t, modrm & 7u, 2u, R1);
+        do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0);
+    }
+    /* CBW/CWD: preserve high GPR halves and ALL guest flags. */
+    if (op == 0x98u) {
+        pj_ext(&t->e, 0xFA4Fu, R1, GR(0)); /* SXTB AL -> AX */
+        pjt_putr(t, 0u, 2u, R1);
+        do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0);
+    }
+    if (op == 0x99u) {
+        pj_ext(&t->e, 0xFA0Fu, R1, GR(0)); /* SXTH AX */
+        pj_shift(&t->e, R1, R1, 2u, 31u); /* CWD: DX=sign(AX) */
+        pjt_putr(t, 2u, 2u, R1);
+        do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0);
+    }
+    /* CLD/STD update only DF; keep all pending arithmetic lazy flags. */
+    if (op == 0xFCu || op == 0xFDu) {
+        pjt_c(t);
+        pj_ldst(&t->e, PJ_LDR, R1, CREG, (unsigned)offsetof(B86Cpu, flags));
+        pj_dpi(&t->e, op == 0xFCu ? 1u : 2u, 0, R1, R1, B86_DF);
+        pj_ldst(&t->e, PJ_STR, R1, CREG, (unsigned)offsetof(B86Cpu, flags));
+        t->fuse_at = NULL;
+        do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0);
+    }
+#if BB_PJ_PM16_GS_STACK_V17
+    /* PUSH ES/CS/SS/DS (06/0E/16/1E): translate the *common checked*
+     * 16-bit PM stack case instead of interpreting it. The existing V17
+     * 2-byte SS.B-aware pointer helper checks descriptors, privilege, paging,
+     * crossing, and SMC before any write. A failed guard replays in C.
+     * Successful PUSH exits unlinked because a stack store can modify code. */
+    if (op == 0x06u || op == 0x0Eu || op == 0x16u || op == 0x1Eu) {
+        const unsigned sr = (op >> 3u) & 3u; /* 06 ES, 0E CS, 16 SS, 1E DS */
+        pjt_c(t);
+        pj_mov(&t->e, R0, CREG);
+        pj_mov(&t->e, R1, GR(4));
+        pj_movw(&t->e, R2, 1u);
+        pjt_call(t, (const void *)b86_pj_pm16_gs16_ptr);
+        pj_dpi(&t->e, 13u, 1, PC, R0, 0u);
+        pjt_exit_stay(t, 0 /* EQ: interpreter retry */, t->ip0, t->ninsn - 1u);
+        pjt_c(t);
+        pj_ldst(&t->e, PJ_LDR, R1, CREG,
+                (unsigned)offsetof(B86Cpu, seg) + 4u * sr);
+        pj_ldst(&t->e, PJ_STRB, R1, R0, 0u);
+        pj_shift(&t->e, R2, R1, 1u, 8u);
+        pj_ldst(&t->e, PJ_STRB, R2, R0, 1u);
+        pj_ldst(&t->e, PJ_LDRB, R2, CREG,
+                (unsigned)offsetof(B86Cpu, pm386.seg[B86_SS].flags));
+        pj_dpi(&t->e, 0u, 1, PC, R2, 4u);
+        {
+            uint8_t *addr32 = pjt_bfwd(t, 1 /* NE: SS.B */);
+            pjt_addimm(t, R2, GR(4), (uint32_t)-2);
+            pj_bfi(&t->e, GR(4), R2, 0u, 16u);
+            {
+                uint8_t *done = pjt_bfwd(t, -1);
+                pjt_here(t, addr32);
+                pjt_addimm(t, GR(4), GR(4), (uint32_t)-2);
+                pjt_here(t, done);
+            }
+        }
+        pjt_exit(t, PJ16_NEXT(), t->ninsn, 2);
+        do { BB_PM16_DIAG_INC(emit_ok); return 2; } while (0);
+    }
+#endif /* BB_PJ_PM16_GS_STACK_V17 */
+#endif /* B86_PJ_V50_NATIVE_COVERAGE */
+#if B86_PJ_V51_NATIVE_COVERAGE && BB_PJ_PM16_GS_STACK_V17
+    /* 07 POP ES / 1F POP DS. The 16-bit SS.B-aware memory admission is
+     * shared with the GS stack path.  Read first, then validate/commit the
+     * target segment before touching SP; failure retries in the interpreter
+     * without a partial stack/selector update.  A changed hidden descriptor
+     * always exits to the checked dispatcher rather than remaining chained. */
+    if (op == 0x07u || op == 0x1Fu) {
+        const unsigned sr = op == 0x07u ? B86_ES : B86_DS;
+        pjt_c(t);
+        pj_mov(&t->e, R0, CREG);
+        pj_mov(&t->e, R1, GR(4));
+        pj_movw(&t->e, R2, 0u);
+        pjt_call(t, (const void *)b86_pj_pm16_gs16_ptr);
+        pj_dpi(&t->e, 13u, 1, PC, R0, 0u);
+        pjt_exit_stay(t, 0 /* EQ */, t->ip0, t->ninsn - 1u);
+        pj_ldst(&t->e, PJ_LDRB, R2, R0, 0u);
+        pj_ldst(&t->e, PJ_LDRB, R1, R0, 1u);
+        pj_dpr(&t->e, 2u, 0, R2, R2, R1, 0u, 8u);
+        pjt_c(t);
+        pj_mov(&t->e, R0, CREG);
+        pj_movw(&t->e, R1, sr);
+        pjt_call(t, (const void *)b86_pj_loadseg);
+        pj_dpi(&t->e, 13u, 1, PC, R0, 0u);
+        pjt_exit_stay(t, 0 /* EQ */, t->ip0, t->ninsn - 1u);
+        pjt_c(t);
+        pj_ldst(&t->e, PJ_LDRB, R2, CREG,
+                (unsigned)offsetof(B86Cpu, pm386.seg[B86_SS].flags));
+        pj_dpi(&t->e, 0u, 1, PC, R2, 4u);
+        {
+            uint8_t *addr32 = pjt_bfwd(t, 1 /* NE: SS.B */);
+            pjt_addimm(t, R2, GR(4), 2u);
+            pj_bfi(&t->e, GR(4), R2, 0u, 16u);
+            {
+                uint8_t *done = pjt_bfwd(t, -1);
+                pjt_here(t, addr32);
+                pjt_addimm(t, GR(4), GR(4), 2u);
+                pjt_here(t, done);
+            }
+        }
+        pjt_exit(t, PJ16_NEXT(), t->ninsn, 2);
+        do { BB_PM16_DIAG_INC(emit_ok); return 2; } while (0);
+    }
+#endif /* V51 ES/DS POP */
+#if B86_PJ_V51_NATIVE_COVERAGE
+    /* 8D /r LEA r16,m16: pure Thumb-2 EA calculation, including mod=00
+     * [disp16] and 16-bit wrap. No descriptor lookup or memory access. */
+    if (op == 0x8Du) {
+        PjUnifiedModRM lea;
+        unsigned unused_seg;
+        if (!pjt_unified_modrm(t, &lea) || lea.mod == 3u ||
+            !pjt_unified_ea16(t, lea.raw, &unused_seg)) PJ16_FAIL();
+        pjt_putr(t, lea.reg, 2u, R1);
+        do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0);
+    }
+#endif
+#if B86_PJ_V53_NATIVE_SEGMEM && BB_PJ_PM16_MOV_READ
+    /* PM16 8E /r, memory-source MOV Sreg,[EA16]: the existing checked
+     * DS/SS pointer validates the access before reading its selector.
+     * The existing segment planner atomically validates/commits it. The
+     * guest remains unchanged on refusal; MOV SS/CS intentionally decline. */
+    if (op == 0x8Eu && t->pos < t->n &&
+        (t->b[t->pos] >> 6u) != 3u) {
+        PjUnifiedModRM m53;
+        unsigned seg53;
+        if (!pjt_unified_modrm(t, &m53) || m53.mod == 3u ||
+            (m53.reg != B86_ES && m53.reg != B86_DS &&
+             m53.reg != B86_FS && m53.reg != B86_GS) ||
+            !pjt_unified_ea16(t, m53.raw, &seg53)) PJ16_FAIL();
+        pjt_c(t);
+        pj_mov(&t->e, R0, CREG);
+        pj_movw(&t->e, R2, 2u | (seg53 << 8u));
+        pjt_call(t, (const void *)b86_pj_pm16_read_ptr);
+        pj_dpi(&t->e, 13u, 1, PC, R0, 0u);
+        pjt_exit_stay(t, 0 /* EQ: read fault/retry */, t->ip0,
+                      t->ninsn - 1u);
+        pj_ldst(&t->e, PJ_LDRH, R2, R0, 0u);
+        pjt_c(t);
+        pj_mov(&t->e, R0, CREG);
+        pj_movw(&t->e, R1, m53.reg);
+        pjt_call(t, (const void *)b86_pj_loadseg);
+        pj_dpi(&t->e, 13u, 1, PC, R0, 0u);
+        pjt_exit_stay(t, 0 /* EQ: segment-load fault/retry */, t->ip0,
+                      t->ninsn - 1u);
+        pjt_exit(t, PJ16_NEXT(), t->ninsn, 2);
+        do { BB_PM16_DIAG_INC(emit_ok); return 2; } while (0);
+    }
+#endif /* V53 checked memory-source segment load */
+#if B86_PJ_V53_NATIVE_SEGMEM && BB_PJ_PM16_MOV_WRITE
+    /* PM16 26 88/89 memory-destination MOV ES:[EA16],reg8/16.
+     * Avoid interpreter and C store helper for the common guarded case.
+     * Native memt write gate preserves exact SMC/paging/MMIO checks.
+     * End this block after every successful store, never chain across it. */
+    if (op == 0x26u && t->pos + 1u < t->n &&
+        (t->b[t->pos] == 0x88u || t->b[t->pos] == 0x89u) &&
+        (t->b[t->pos + 1u] >> 6u) != 3u) {
+        uint32_t store_op53;
+        PjUnifiedModRM m53;
+        unsigned ignored_seg53;
+        if (!pjt_u8(t, &store_op53) ||
+            !pjt_unified_modrm(t, &m53) || m53.mod == 3u ||
+            !pjt_unified_ea16(t, m53.raw, &ignored_seg53)) PJ16_FAIL();
+        {
+            const unsigned width53 = store_op53 == 0x89u ? 2u : 1u;
+            pjt_v53_es_write_guard(t, width53);
+            pjt_mem(t, width53, 1);
+            pjt_getr(t, R1, m53.reg, width53);
+            pjt_st(t, R1, R0, width53);
+            pjt_exit(t, PJ16_NEXT(), t->ninsn, 2);
+        }
+        do { BB_PM16_DIAG_INC(emit_ok); return 2; } while (0);
+    }
+#endif /* V53 native ES stores */
+#if B86_PJ_V52_NATIVE_SEGMOV_ES
+    /* PM16 8C /r, mod=3: MOV r16,Sreg. All six real segment
+     * selectors are readable; mod=3 never needs a memory access.
+     * Leave operand-size/extra-prefix and memory forms to the old C path.
+     * No guest flags, descriptors or caches are changed. */
+    if (op == 0x8Cu) {
+        PjUnifiedModRM sm;
+        if (!pjt_unified_modrm(t, &sm) || sm.mod != 3u || sm.reg > 5u)
+            PJ16_FAIL();
+        pjt_c(t);
+        if (sm.reg <= B86_DS) {
+            pj_ldst(&t->e, PJ_LDR, R2, CREG,
+                    (unsigned)offsetof(B86Cpu, seg) + 4u * sm.reg);
+        } else {
+            pj_ldst(&t->e, PJ_LDRH, R2, CREG,
+                    (unsigned)offsetof(B86Cpu, seg386) + 2u * (sm.reg - 4u));
+        }
+        pjt_putr(t, sm.rm, 2u, R2);
+        do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0);
+    }
+    /* PM16 8E /r, mod=3: MOV Sreg,r16. The existing PM26-compatible
+     * b86_pj_loadseg performs descriptor planning, privilege checks and
+     * atomic selector/cache commit. A failure retries at original EIP.
+     * CS is #UD and SS needs interrupt-shadow handling: both stay in C.
+     * A successful load always exits to recheck hidden segment state. */
+    if (op == 0x8Eu) {
+        PjUnifiedModRM sm;
+        if (!pjt_unified_modrm(t, &sm) || sm.mod != 3u ||
+            (sm.reg != B86_ES && sm.reg != B86_DS &&
+             sm.reg != B86_FS && sm.reg != B86_GS)) PJ16_FAIL();
+        pjt_getr(t, R2, sm.rm, 2u);
+        pjt_c(t);
+        pj_mov(&t->e, R0, CREG);
+        pj_movw(&t->e, R1, sm.reg);
+        pjt_call(t, (const void *)b86_pj_loadseg);
+        pj_dpi(&t->e, 13u, 1, PC, R0, 0u);
+        pjt_exit_stay(t, 0 /* EQ: descriptor fault / interpreter retry */,
+                      t->ip0, t->ninsn - 1u);
+        pjt_exit(t, PJ16_NEXT(), t->ninsn, 2);
+        do { BB_PM16_DIAG_INC(emit_ok); return 2; } while (0);
+    }
+    /* PM16 26 8A/8B: ES override, byte/word MOV r,[EA16]. Decode the
+     * complete instruction; 8/16-bit register-only 88..8B and LEA ignore
+     * segment override and stay entirely native. For a memory source the
+     * SAME V21 hidden-descriptor guard and native TLB are emitted with ES
+     * selected explicitly. No C helper on the successful memory-read path.
+     * Unsupported ES stores, multi-prefixes and bad operands refuse safely. */
+    if (op == 0x26u) {
+        uint32_t esop;
+        PjUnifiedModRM esmr;
+        unsigned default_seg;
+        if (!pjt_u8(t, &esop)) PJ16_FAIL();
+        if (esop == 0x8Du) {
+            if (!pjt_unified_modrm(t, &esmr) || esmr.mod == 3u ||
+                !pjt_unified_ea16(t, esmr.raw, &default_seg)) PJ16_FAIL();
+            pjt_putr(t, esmr.reg, 2u, R1);
+            do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0);
+        }
+        if (esop < 0x88u || esop > 0x8Bu ||
+            !pjt_unified_modrm(t, &esmr)) PJ16_FAIL();
+        if (esmr.mod == 3u) {
+            pjt_unified_regmov(t, esop, esmr.raw,
+                               (esop & 1u) ? 2u : 1u);
+            do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0);
+        }
+#if BB_PJ_PM16_MOV_READ && BB_PJ_V21_PM16_INLINE_READ
+        if (esop == 0x8Au || esop == 0x8Bu) {
+            const unsigned width = esop == 0x8Bu ? 2u : 1u;
+            const unsigned sc = (unsigned)offsetof(B86Cpu, pm386) +
+                 (unsigned)offsetof(B86PM1State, seg) +
+                 B86_ES * (unsigned)sizeof(B86PM1Cache);
+            if (!pjt_unified_ea16(t, esmr.raw, &default_seg)) PJ16_FAIL();
+            pjt_c(t);
+            /* Runtime cache validity and conservative readable data
+             * descriptor checks; original EA16 is still in R1. */
+            pj_ldst(&t->e, PJ_LDRB, R0, CREG,
+                    sc + (unsigned)offsetof(B86PM1Cache, valid));
+            pj_dpi(&t->e, 13u, 1, PC, R0, 0u);
+            pjt_exit_stay(t, 0 /* EQ */, t->ip0, t->ninsn - 1u);
+            pj_ldst(&t->e, PJ_LDRB, R0, CREG,
+                    sc + (unsigned)offsetof(B86PM1Cache, reserved));
+            pj_dpi(&t->e, 13u, 1, PC, R0, 0u);
+            pjt_exit_stay(t, 1 /* NE */, t->ip0, t->ninsn - 1u);
+            pj_ldst(&t->e, PJ_LDRB, R0, CREG,
+                    sc + (unsigned)offsetof(B86PM1Cache, access));
+            pj_dpi(&t->e, 0u, 0, R0, R0, 0x1Eu);
+            pj_dpi(&t->e, 13u, 1, PC, R0, 0x12u);
+            pjt_exit_stay(t, 1 /* NE */, t->ip0, t->ninsn - 1u);
+            pj_ldst(&t->e, PJ_LDR, R3, CREG,
+                    sc + (unsigned)offsetof(B86PM1Cache, limit));
+            pjt_addimm(t, R2, R1, width - 1u);
+            pj_dpr(&t->e, 13u, 1, PC, R2, R3, 0u, 0u);
+            pjt_exit_stay(t, 8 /* HI */, t->ip0, t->ninsn - 1u);
+            pj_ldst(&t->e, PJ_LDR, R0, CREG,
+                    sc + (unsigned)offsetof(B86PM1Cache, base));
+            pj_dpr(&t->e, 8u, 1, R1, R1, R0, 0u, 0u);
+            pjt_exit_stay(t, 2 /* CS: overflow */, t->ip0, t->ninsn - 1u);
+            if (width == 2u) {
+                pj_dpi(&t->e, 0u, 1, R0, R1, 1u);
+                pjt_exit_stay(t, 1 /* NE: odd linear addr */,
+                              t->ip0, t->ninsn - 1u);
+            }
+            pjt_mem(t, width, 0);
+            pjt_ld(t, R1, R0, width);
+            pjt_putr(t, esmr.reg, width, R1);
+            t->fuse_at = NULL;
+            do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0);
+        }
+#endif /* checked native ES read */
+        PJ16_FAIL();
+    }
+#endif /* B86_PJ_V52_NATIVE_SEGMOV_ES */
     if (op == 0x90u) do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0); /* NOP */
     if (op >= 0xB8u && op <= 0xBFu) {
         if (!pjt_imm(t, 2u, &imm)) PJ16_FAIL();
@@ -4800,6 +5601,182 @@ static B86_PJ_COLD int pjt_insn_pm16(PjT *t)
         if (!pjt_alu(t, 4u, w, R3, R1, R0)) PJ16_FAIL();
         do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0);
     }
+#if B86_PJ_V56_STACK_CHAIN && B86_PJ_V54_NATIVE_CONTROL && BB_PJ_PM16_GS_STACK_V17
+    /* 68 iw / 6A ib: PM16 PUSH imm16 and sign-extended PUSH imm8.
+     * Successful writes may overlap executable memory, so terminate the
+     * translated block. The original SS guard runs before any write. */
+    if (op == 0x68u || op == 0x6Au) {
+        if (!pjt_imm(t, op == 0x68u ? 2u : 1u, &imm)) PJ16_FAIL();
+        if (op == 0x6Au) imm = (uint32_t)(int32_t)(int8_t)imm;
+        pjt_v54_stack_check(t, 1);
+        pj_movw(&t->e, R1, imm & 0xFFFFu);
+        pjt_v54_store16(t);
+        pjt_v54_sp_step(t, 1);
+        pjt_exit(t, PJ16_NEXT(), t->ninsn, 2);
+        do { BB_PM16_DIAG_INC(emit_ok); return 2; } while (0);
+    }
+    /* 8F /0, ModRM.mod=3: POP r16. The checked stack read happens
+     * before SP or destination changes. POP SP's loaded value replaces
+     * the post-incremented SP, as required on 286/386. Other /r and
+     * memory-destination forms continue through the interpreter. */
+    if (op == 0x8Fu && t->pos < t->n &&
+        ((t->b[t->pos] >> 3u) & 7u) == 0u &&
+        (t->b[t->pos] >> 6u) == 3u) {
+        if (!pjt_unified_modrm_regonly(t, &modrm)) PJ16_FAIL();
+        pjt_v54_stack_check(t, 0);
+        pjt_v54_read16(t);
+        pjt_v54_sp_step(t, 0);
+        pjt_putr(t, modrm & 7u, 2u, R1);
+        do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0);
+    }
+#if BB_PJ_PM16_MOV_READ
+    /* FF /6, memory operand: read source from the effective data segment
+     * before checking/writing SS. Preserve it across the checked stack
+     * helper's AAPCS call; a refused read/write replays in the interpreter
+     * without committing ESP or guest data. */
+    if (op == 0xFFu && t->pos < t->n &&
+        ((t->b[t->pos] >> 3u) & 7u) == 6u &&
+        (t->b[t->pos] >> 6u) != 3u) {
+        PjUnifiedModRM ff56;
+        unsigned seg56 = B86_DS;
+        if (!pjt_unified_modrm(t, &ff56) || ff56.reg != 6u ||
+            ff56.mod == 3u || !pjt_unified_ea16(t, ff56.raw, &seg56)) PJ16_FAIL();
+        pjt_c(t);
+        pj_mov(&t->e, R0, CREG);
+        pj_movw(&t->e, R2, 2u | (seg56 << 8u));
+        pjt_call(t, (const void *)b86_pj_pm16_read_ptr);
+        pj_dpi(&t->e, 13u, 1, PC, R0, 0u);
+        pjt_exit_stay(t, 0 /* EQ */, t->ip0, t->ninsn - 1u);
+        pjt_v54_read16(t);
+        pj_ldst(&t->e, PJ_STR, R1, SP, 4u);
+        pjt_v54_stack_check(t, 1);
+        pj_ldst(&t->e, PJ_LDR, R1, SP, 4u);
+        pjt_v54_store16(t);
+        pjt_v54_sp_step(t, 1);
+        pjt_exit(t, PJ16_NEXT(), t->ninsn, 2);
+        do { BB_PM16_DIAG_INC(emit_ok); return 2; } while (0);
+    }
+#endif /* PM16 MOV READ */
+    /* C2 iw: near RET with immediate stack cleanup. The target is
+     * read from the checked old SS:SP before the stack is adjusted. */
+    if (op == 0xC2u) {
+        uint32_t cleanup56;
+        if (!pjt_imm(t, 2u, &cleanup56)) PJ16_FAIL();
+        pjt_v54_stack_check(t, 0);
+        pjt_v54_read16(t);
+        pj_ldst(&t->e, PJ_STR, R1, SP, 4u);
+        pjt_v54_sp_step(t, 0);
+        pjt_v56_sp_add(t, cleanup56);
+        pj_ldst(&t->e, PJ_LDR, R1, SP, 4u);
+        pjt_exit(t, 0u, t->ninsn, 3);
+        do { BB_PM16_DIAG_INC(emit_ok); return 2; } while (0);
+    }
+#endif /* V56 PM16 stack-coverage additions */
+#if B86_PJ_V54_NATIVE_CONTROL
+    /* PM16 FF register forms: /0 INC, /1 DEC, /4 near JMP. The
+     * architectural IP is 16-bit and the high halves of guest GPRs stay
+     * intact. /3,/5 far transfers and /7 undefined still decline. */
+    if (op == 0xFFu) {
+        PjUnifiedModRM ff54;
+        unsigned seg54 = B86_DS;
+        if (!pjt_unified_modrm(t, &ff54)) PJ16_FAIL();
+        if ((ff54.reg == 0u || ff54.reg == 1u) && ff54.mod == 3u) {
+            pjt_getr(t, R2, ff54.rm, 2u);
+            if (ff54.reg == 0u) pj_dpi(&t->e, 8u, 0, R3, R2, 1u);
+            else pj_dpi(&t->e, 13u, 0, R3, R2, 1u);
+            pjt_putr(t, ff54.rm, 2u, R3);
+            pjt_lazy(t, ff54.reg == 0u ? pj_k_inc[2] : pj_k_dec[2], R2, R3);
+            do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0);
+        }
+        if (ff54.reg == 4u || ff54.reg == 2u) {
+            /* The indirect near target is read BEFORE a CALL pushes the
+             * return IP, even for CALL [ESP/BP-relative memory]. */
+            if (ff54.mod == 3u) {
+                pjt_getr(t, R1, ff54.rm, 2u);
+            } else {
+#if BB_PJ_PM16_MOV_READ
+                if (!pjt_unified_ea16(t, ff54.raw, &seg54)) PJ16_FAIL();
+                pjt_c(t);
+                pj_mov(&t->e, R0, CREG);
+                pj_movw(&t->e, R2, 2u | (seg54 << 8u));
+                pjt_call(t, (const void *)b86_pj_pm16_read_ptr);
+                pj_dpi(&t->e, 13u, 1, PC, R0, 0u);
+                pjt_exit_stay(t, 0 /* EQ */, t->ip0, t->ninsn - 1u);
+                pjt_v54_read16(t);
+#else
+                PJ16_FAIL();
+#endif
+            }
+            if (ff54.reg == 2u) {
+#if BB_PJ_PM16_GS_STACK_V17
+                /* Preserve target across the AAPCS C stack guard call.
+                 * [sp+4] is the translator's dedicated scratch slot. */
+                pj_ldst(&t->e, PJ_STR, R1, SP, 4u);
+                pjt_v54_stack_check(t, 1);
+                pj_movw(&t->e, R1, PJ16_NEXT());
+                pjt_v54_store16(t);
+                pjt_v54_sp_step(t, 1);
+                pj_ldst(&t->e, PJ_LDR, R1, SP, 4u);
+#else
+                PJ16_FAIL();
+#endif
+            }
+            /* dyn=3 returns to the checked PM16 C dispatcher with the
+             * computed 16-bit target. PM32 j->dyn is NOT PM16-safe. */
+            pjt_exit(t, 0u, t->ninsn, 3);
+            do { BB_PM16_DIAG_INC(emit_ok); return 2; } while (0);
+        }
+#if BB_PJ_PM16_GS_STACK_V17
+        if (ff54.reg == 6u && ff54.mod == 3u) {
+            /* PUSH r/m16 register: read source BEFORE SP is changed;
+             * PUSH SP stores the original SP (286+ behavior). */
+            pjt_v54_stack_check(t, 1);
+            pjt_getr(t, R1, ff54.rm, 2u);
+            pjt_v54_store16(t);
+            pjt_v54_sp_step(t, 1);
+            /* Potential SMC stack store: never execute another stale block. */
+            pjt_exit(t, PJ16_NEXT(), t->ninsn, 2);
+            do { BB_PM16_DIAG_INC(emit_ok); return 2; } while (0);
+        }
+#endif
+        PJ16_FAIL();
+    }
+#if BB_PJ_PM16_GS_STACK_V17
+    /* PM16 near relative CALL: checked 2-byte SS store, then native SP
+     * commit and unlinked transfer to the calculated 16-bit target. */
+    if (op == 0xE8u) {
+        uint32_t disp54;
+        uint32_t target54;
+        if (!pjt_imm(t, 2u, &disp54)) PJ16_FAIL();
+        target54 = (PJ16_NEXT() + (uint32_t)(int32_t)(int16_t)disp54) & 0xFFFFu;
+        pjt_v54_stack_check(t, 1);
+        pj_movw(&t->e, R1, PJ16_NEXT());
+        pjt_v54_store16(t);
+        pjt_v54_sp_step(t, 1);
+#if B86_PJ_V56_STACK_CHAIN && B86_PJ_V55_PM16_DYN
+        /* V56: direct CALL can chain in the active PM16 CS context on
+         * an admitted cache hit. No flat32 table lookup is ever used. */
+        pj_movw(&t->e, R1, target54);
+        pjt_exit(t, 0u, t->ninsn, 3);
+#else
+        /* Keep static target unlinked: original v55 behavior. */
+        pjt_exit(t, target54, t->ninsn, 2);
+#endif
+        do { BB_PM16_DIAG_INC(emit_ok); return 2; } while (0);
+    }
+    /* PM16 near RET: checked SS read, then native SP commit. The return
+     * EIP remains in r1 and must take the PM16 checked dynamic exit. */
+    if (op == 0xC3u) {
+        pjt_v54_stack_check(t, 0);
+        pjt_v54_read16(t);
+        pj_ldst(&t->e, PJ_STR, R1, SP, 4u);
+        pjt_v54_sp_step(t, 0);
+        pj_ldst(&t->e, PJ_LDR, R1, SP, 4u);
+        pjt_exit(t, 0u, t->ninsn, 3);
+        do { BB_PM16_DIAG_INC(emit_ok); return 2; } while (0);
+    }
+#endif
+#endif /* V54 native PM16 control transfers */
     /* All control transfers return through the unlinked C dispatcher. */
     if (op == 0xEBu || op == 0xE9u) {
         if (op == 0xEBu) {
@@ -4809,7 +5786,14 @@ static B86_PJ_COLD int pjt_insn_pm16(PjT *t)
             if (!pjt_imm(t, 2u, &imm)) PJ16_FAIL();
             imm = (uint32_t)(int32_t)(int16_t)imm;
         }
+#if B86_PJ_V56_STACK_CHAIN && B86_PJ_V55_PM16_DYN
+        /* Relative near and short JMP now probe native PM16 context
+         * before returning to C, exactly like v55's computed transfers. */
+        pj_movw(&t->e, R1, (PJ16_NEXT() + imm) & 0xFFFFu);
+        pjt_exit(t, 0u, t->ninsn, 3);
+#else
         pjt_exit(t, (PJ16_NEXT() + imm) & 0xFFFFu, t->ninsn, 2);
+#endif
         do { BB_PM16_DIAG_INC(emit_ok); return 2; } while (0);
     }
     if (op >= 0x70u && op <= 0x7Fu) {
@@ -5014,6 +5998,17 @@ static int pj_v12_link_intact(const B86Pj *j, uint32_t so, uint32_t to)
     return pj_aud_bw(branch) == (uint32_t)(uintptr_t)(j->code + to);
 }
 #endif
+/* v48: one-pass verified native-link unchaining. Any malformed link
+ * returns failure to the *existing* v27 reconciliation full-flush, which
+ * retires the entire code cache before any further native execution.
+ * Each record is still bounds/live/code-shape/target checked BEFORE its
+ * individual 4-byte exit instruction is rewritten. */
+#ifndef B86_PJ_V48_UNLINKPASS
+#define B86_PJ_V48_UNLINKPASS 1
+#endif
+#if B86_PJ_V48_UNLINKPASS != 0 && B86_PJ_V48_UNLINKPASS != 1
+#error B86_PJ_V48_UNLINKPASS must be 0 or 1
+#endif
 #if B86_PJ_V31_LAZY_EPOCH
 /* A conservative epoch fence: no direct B.W connection can cross the
  * validation boundary. Decode each currently logged stub with the SAME
@@ -5024,6 +6019,21 @@ static B86_PJ_COLD int pj_v31_unlink_all(B86Pj *j)
     uint32_t i, *lk = pj_links(j);
     /* Corrupt metadata must never index beyond the bounded link log. */
     if (j->nlinks > B86_PJ_LINKS) return 0;
+#if B86_PJ_V48_UNLINKPASS
+    /* Validating and rewriting one link at a time avoids a second full
+     * scan of the PSRAM-resident link ledger. A later failed record forces
+     * a complete cache flush in b86_pj_v27_reconcile() before any PJ reentry;
+     * partially unlinked stubs therefore cannot execute after failure. */
+    for (i = 0u; i < j->nlinks; ++i) {
+        const uint32_t so = lk[2u * i], to = lk[2u * i + 1u];
+        uint8_t *stub;
+        if (so > UINT32_MAX - 13u ||
+            !pj_aud_live(j, so) || !pj_aud_live(j, so + 13u) ||
+            !pj_aud_live(j, to) || !pj_v12_link_intact(j, so, to))
+            return 0; /* caller full-flushes the *entire* PJ code cache */
+        stub = j->code + so;
+#else
+    /* Original two-phase control: validate all records, then rewrite all. */
     /* Preflight every record BEFORE modifying any executable code. */
     for (i = 0u; i < j->nlinks; ++i) {
         const uint32_t so = lk[2u * i], to = lk[2u * i + 1u];
@@ -5035,6 +6045,7 @@ static B86_PJ_COLD int pj_v31_unlink_all(B86Pj *j)
     for (i = 0u; i < j->nlinks; ++i) {
         const uint32_t so = lk[2u * i];
         uint8_t *stub = j->code + so;
+#endif
         stub[0] = 0x00u; stub[1] = 0xF0u;
         stub[2] = 0x00u; stub[3] = 0x90u;
         pj_patch_b(stub, pj_in_hot(j, so) ? j->hsh.exit_s : j->exit_s);
@@ -5788,6 +6799,12 @@ static B86_PJ_COLD void b86_pj_link(B86Cpu *c)
     const unsigned long gen = j->flushes + j->gen;
     uint32_t h = ((c->ip * 2654435761u) >> 16) & (B86_PJ_HASH - 1u), ent;
     c->pj_exit = 0u;
+#if B86_PJ_V45_DYN2
+    /* Linker uses precisely the same flat PM32 pair as native dyn and C.
+     * Its chosen entry is still found/validated through pj_v31_find(). */
+    if (j->tag[h] != (c->ip | 1u) && j->tag[h ^ 1u] == (c->ip | 1u)) h ^= 1u;
+    if (j->tag[h] != (c->ip | 1u) && j->tag[h] && !j->tag[h ^ 1u]) h ^= 1u;
+#endif
     if (j->flush_pending) return;
     if (!pj_in_hot(j, (uint32_t)(stub - j->code)) && (stub < j->code + j->shared_end || stub + 14u > j->code + j->cap)) return;
     if (j->nlinks >= B86_PJ_LINKS) return;            /* r71: log full: stop linking until the next eviction */
@@ -6137,7 +7154,20 @@ static B86_PM_HOT unsigned b86_pj_try(B86Cpu *c)
     uint32_t *const tagt = j->tag, *const entt = j->ent;
     h = ((c->ip * 2654435761u) >> 16) & (B86_PJ_HASH - 1u);
 #endif
+#if B86_PJ_V45_DYN2
+    /* Flat PM32 C and emitted native dynamic exits must resolve the same
+     * two slots. Never use this for PM16: it owns separate context tables.
+     * Epoch reconciliation still zeros both ways before any native reuse. */
+    if (!j->pm16_active && tagt[h] != (c->ip | 1u) &&
+        tagt[h ^ 1u] == (c->ip | 1u)) h ^= 1u;
+#endif
     if (tagt[h] != (c->ip | 1u)) {
+#if B86_PJ_V45_DYN2
+        /* Prefer an empty neighbor rather than evicting a live translation.
+         * A nonempty pair retains the original primary-victim policy.
+         * The second way has no permission to bypass lazy v31 validation. */
+        if (!j->pm16_active && tagt[h] && !tagt[h ^ 1u]) h ^= 1u;
+#endif
         ++j->profile_lookup_misses;
         if (((++bb5h_miss_clock) & 127u) == 0u) {
             ++bb5h_miss_samples;
