@@ -213,6 +213,27 @@
 #if B86_PJ_V67_NATIVE_BITSCAN != 0 && B86_PJ_V67_NATIVE_BITSCAN != 1
 #error B86_PJ_V67_NATIVE_BITSCAN must be 0 or 1
 #endif
+/* V79: PM32 F2/F3 REP MOVS/STOS all ECX counts, one checked store per
+ * dispatcher entry.  A store must exit before potentially invalidated
+ * translated code is run (paging + SMC).  At zero count, no guest read,
+ * write, index or arithmetic-flags change.  Exact v78 at macro=0. */
+#ifndef B86_PJ_V79_REP_STORE_STREAM
+#define B86_PJ_V79_REP_STORE_STREAM 1
+#endif
+#if B86_PJ_V79_REP_STORE_STREAM != 0 && B86_PJ_V79_REP_STORE_STREAM != 1
+#error B86_PJ_V79_REP_STORE_STREAM must be 0 or 1
+#endif
+/* V78: bounded native F2/F3 CMPS/SCAS comparisons.  Read-only guest
+ * memory accesses; store none, preserving native SMC constraints.  At
+ * most 4 comparisons per dispatcher entry.  A failed later checked read
+ * replays the remaining iteration from this EIP with prior progress intact.
+ * The macro=0 control is byte-identical v77 fixed-all preprocessing. */
+#ifndef B86_PJ_V78_REP_COMPARE
+#define B86_PJ_V78_REP_COMPARE 1
+#endif
+#if B86_PJ_V78_REP_COMPARE != 0 && B86_PJ_V78_REP_COMPARE != 1
+#error B86_PJ_V78_REP_COMPARE must be 0 or 1
+#endif
 /* V77: REP MOVS/STOS with exactly one element remaining. Reuse the
  * checked v72 non-REP read/write emission, commit ECX=0 only AFTER the
  * validated store and index updates, then exit unlinked for SMC safety.
@@ -3218,6 +3239,49 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
         pjt_exit(t, PJ_NEXT(), t->ninsn, 2); /* re-check flatness */
         return 2;
     case 0xA4: case 0xA5: case 0xAA: case 0xAB: case 0xAC: case 0xAD: {   /* string ops through a helper */
+#if B86_PJ_V79_REP_STORE_STREAM && B86_PJ_V72_STACK_STRING_BATCH
+    /* v79: native REP/REPNE MOVS and STOS, 32-bit address size, flat DS/ES.
+     * Admission is independent of runtime ECX: 0 skips *every* guest
+     * access and preserves FLAGS; nonzero executes one checked store.
+     * For non-final iteration ECX decrements and EIP remains at instruction
+     * start, then a mandatory unchained dispatcher exit provides interrupt
+     * fairness and prevents running stale SMC code.  The final iteration
+     * retires this instruction once at PJ_NEXT().  No conditional branch
+     * joins a C helper, so no stale R12/creg_ok incoming-edge assumption.
+     * Checked reads/writes precede any guest state updates: on denial,
+     * the existing memory trampoline reruns the whole still-uncommitted
+     * iteration in the interpreter.  SP+4 persists across trampolines. */
+    if ((op == 0xA4u || op == 0xA5u || op == 0xAAu || op == 0xABu) &&
+        (repz != 0 || repne != 0) && !(repz && repne) &&
+        !segpref && !es_override &&
+        (np == 2u || (np == 3u && o16 && (op & 1u)))) {
+        const unsigned ww79 = (op & 1u) ? w : 1u;
+        const int movs79 = op == 0xA4u || op == 0xA5u;
+        pj_dpi(&t->e, 13u, 1, PC, GR(1), 0u); /* CMP ECX,#0 */
+        pjt_exit_cond(t, 0 /* EQ: empty REP */, PJ_NEXT(), t->ninsn);
+        if (movs79) {
+            pj_mov(&t->e, R1, GR(6));          /* DS:[ESI] source */
+            pjt_mem(t, ww79, 0);               /* checked read */
+            pjt_ld(t, R2, R0, ww79);
+            pj_ldst(&t->e, PJ_STR, R2, SP, 4u); /* value survives write check */
+        }
+        pj_mov(&t->e, R1, GR(7));              /* ES:[EDI] destination */
+        pjt_mem(t, ww79, 1);                   /* checked write */
+        if (movs79) pj_ldst(&t->e, PJ_LDR, R2, SP, 4u);
+        else pjt_getr(t, R2, 0u, ww79);       /* STOS: AL / AX / EAX */
+        pjt_st(t, R2, R0, ww79);              /* first guest-visible store */
+        if (movs79) pjt_v72_string_step(t, 6u, ww79);
+        pjt_v72_string_step(t, 7u, ww79);
+        pj_dpi(&t->e, 13u, 0, GR(1), GR(1), 1u); /* ECX--, no x86 flag change */
+        pj_dpi(&t->e, 13u, 1, PC, GR(1), 0u); /* completed entire REP? */
+        pjt_exit_cond(t, 0 /* EQ: final element */, PJ_NEXT(), t->ninsn);
+        /* Mandatory SMC-safe exit after every store; the next dispatch
+         * refetches the original instruction if ECX is still nonzero. */
+        pjt_exit(t, t->ip0, t->ninsn - 1u, 2);
+        t->fuse_at = NULL;
+        return 2;
+    }
+#endif /* V79 checked REP store stream */
 #if B86_PJ_V77_REP_TAIL && B86_PJ_V72_STACK_STRING_BATCH
     /* F3 REP MOVSB/MOVSW/MOVSD and STOSB/STOSW/STOSD with ECX==1.
      * Runtime admission BEFORE any guest side effect. ECX==0 and ECX>1
@@ -3250,6 +3314,13 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
         pj_movw(&t->e, GR(1), 0u);                 /* ECX 1 -> 0 */
         pjt_exit(t, PJ_NEXT(), t->ninsn, 2);      /* unlinked SMC-safe exit */
         pjt_here(t, slow77);                       /* original helper for all others */
+        /* A runtime ECX!=1 branch bypasses the native memtramps and
+         * string_step(), so it also bypasses their pjt_c() call.  The
+         * translator's sequential creg_ok=1 belongs only to the fast
+         * branch; on this incoming edge R12 is NOT guaranteed to hold
+         * B86Cpu.  Force the original helper to emit LDR r12,[sp,#0]
+         * before STMIA r12,{r4-r11}, or it writes to a bogus pointer. */
+        t->creg_ok = 0;
         t->fuse_at = NULL;
     }
 #endif /* V77 native REP one-element string tail */
@@ -3398,6 +3469,59 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
      * progress and ZF termination; memory errors fall back without replaying
      * already completed comparisons. Host helpers use the live guest state. */
     case 0xA6: case 0xA7: case 0xAE: case 0xAF: {
+#if B86_PJ_V78_REP_COMPARE && B86_PJ_V73_STRING_COMPARE_REP_LODS
+        /* F2 REPNE / F3 REPE CMPSB/W/D and SCASB/W/D, address32 only.
+         * Every iteration independently checks its guest reads BEFORE
+         * updating the indices, counter or lazy arithmetic flags.  All
+         * exits are to dispatcher stubs (no conditional branch merge or
+         * R12 lifetime assumptions).  Four unrolled read-only iterations
+         * bound execution time, and incomplete repetitions reenter at
+         * the original EIP with no extra instruction retirement.
+         * For x86 REPNE, stop if comparison ZF=1; for REPE stop if ZF=0.
+         * Do not materialize flags if ECX starts at zero. */
+        if ((repne != 0 || repz != 0) && !(repne && repz) &&
+            !segpref && !es_override &&
+            (np == 2u || (np == 3u && o16 && (op & 1u)))) {
+            const unsigned ww78 = (op & 1u) ? w : 1u;
+            const int cmps78 = op == 0xA6u || op == 0xA7u;
+            unsigned round78;
+            pj_dpi(&t->e, 13u, 1, PC, GR(1), 0u); /* CMP ECX,#0 */
+            pjt_exit_cond(t, 0 /* EQ: REP with count zero */, PJ_NEXT(), t->ninsn);
+            for (round78 = 0u; round78 < 4u; ++round78) {
+                if (cmps78) {
+                    pj_mov(&t->e, R1, GR(6));       /* DS:[ESI] */
+                    pjt_mem(t, ww78, 0);
+                    pjt_ld(t, R2, R0, ww78);
+                    pj_ldst(&t->e, PJ_STR, R2, SP, 4u);
+                }
+                pj_mov(&t->e, R1, GR(7));           /* ES:[EDI] */
+                pjt_mem(t, ww78, 0);
+                pjt_ld(t, R0, R0, ww78);
+                if (cmps78) pj_ldst(&t->e, PJ_LDR, R1, SP, 4u);
+                else pjt_getr(t, R1, 0u, ww78);    /* AL/AX/EAX */
+                pjt_alu(t, 7u, ww78, R3, R1, R0); /* x86 SUB flags (lazy) */
+                if (cmps78) pjt_v72_string_step(t, 6u, ww78);
+                pjt_v72_string_step(t, 7u, ww78);
+                pj_dpi(&t->e, 13u, 0, GR(1), GR(1), 1u); /* ECX--, preserve ARM flags */
+                /* The lazy result is guaranteed committed before either
+                 * index step.  Never assume R0-R3 survive a lazy writer or
+                 * memory trampoline: reload the subtraction result. */
+                pjt_c(t);
+                pj_ldst(&t->e, PJ_LDR, R2, CREG,
+                        (unsigned)offsetof(B86Cpu, lz_res));
+                if (ww78 < 4u) pj_ubfx(&t->e, R2, R2, 0u, 8u * ww78);
+                pj_dpi(&t->e, 13u, 1, PC, R2, 0u); /* CMP result,#0 -> ZF */
+                pjt_exit_cond(t, repne ? 0 : 1, PJ_NEXT(), t->ninsn);
+                pj_dpi(&t->e, 13u, 1, PC, GR(1), 0u); /* CMP remaining ECX,#0 */
+                pjt_exit_cond(t, 0, PJ_NEXT(), t->ninsn);
+            }
+            /* A partially completed REP is still the same x86 instruction.
+             * Leaving the native block permits IRQs and interrupt fairness. */
+            pjt_exit(t, t->ip0, t->ninsn - 1u, 2);
+            t->fuse_at = NULL;
+            return 2;
+        }
+#endif /* V78 bounded native REP CMPS/SCAS */
         const unsigned ww = (op & 1u) ? w : 1u;
         if (!repne) PJ_FAIL();
         pjt_c(t);
