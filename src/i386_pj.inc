@@ -213,6 +213,72 @@
 #if B86_PJ_V67_NATIVE_BITSCAN != 0 && B86_PJ_V67_NATIVE_BITSCAN != 1
 #error B86_PJ_V67_NATIVE_BITSCAN must be 0 or 1
 #endif
+/* V77: REP MOVS/STOS with exactly one element remaining. Reuse the
+ * checked v72 non-REP read/write emission, commit ECX=0 only AFTER the
+ * validated store and index updates, then exit unlinked for SMC safety.
+ * All other REP counts remain on the original helper; mode 0 is the
+ * byte-identical v76 preprocessed translator. */
+#ifndef B86_PJ_V77_REP_TAIL
+#define B86_PJ_V77_REP_TAIL 1
+#endif
+#if B86_PJ_V77_REP_TAIL != 0 && B86_PJ_V77_REP_TAIL != 1
+#error B86_PJ_V77_REP_TAIL must be 0 or 1
+#endif
+/* V76: complete native EDX:EAX / r/m32 unsigned and signed DIV/IDIV.
+ * Keep V75 hardware UDIV/SDIV for the common sign-extension/zero-high
+ * dividends. An exact 32-round non-restoring-bit long division path handles
+ * all other 64-bit dividends whose quotient fits x86, entirely in Thumb-2.
+ * Checked divisor reads and #DE refusals precede ANY guest mutation.
+ * Mode zero is the byte-identical V75 preprocessed translator. */
+#ifndef B86_PJ_V76_DIV64_BATCH
+#define B86_PJ_V76_DIV64_BATCH 1
+#endif
+#if B86_PJ_V76_DIV64_BATCH != 0 && B86_PJ_V76_DIV64_BATCH != 1
+#error B86_PJ_V76_DIV64_BATCH must be 0 or 1
+#endif
+/* V75: native 8/16-bit DIV/IDIV and guarded 32-bit DIV/IDIV via
+ * Cortex-M33 hardware UDIV/SDIV. Memory sources use existing checked
+ * reads; zero divisors/quotient overflow replay in PM40 without changes.
+ * For 32-bit DIV, EDX must be zero; for IDIV it must be EAX's sign
+ * extension. Other 64-bit dividends stay with the checked C helper.
+ * Division leaves arithmetic flags unchanged as the original PJ helper.
+ * Mode 0 is the exact byte-for-byte v74 preprocessed translator. */
+#ifndef B86_PJ_V75_DIV_BATCH
+#define B86_PJ_V75_DIV_BATCH 1
+#endif
+#if B86_PJ_V75_DIV_BATCH != 0 && B86_PJ_V75_DIV_BATCH != 1
+#error B86_PJ_V75_DIV_BATCH must be 0 or 1
+#endif
+/* V74: CL-count SHL/SHR/SAR for 8/16-bit register and checked memory.
+ * Count==0 retains its register NOP behavior and checked-memory fallback;
+ * counts >= width fall back to the existing reference interpreter.
+ * Disabling this stage restores exactly the v73 preprocessed translator. */
+#ifndef B86_PJ_V74_NARROW_CL_SHIFT
+#define B86_PJ_V74_NARROW_CL_SHIFT 1
+#endif
+#if B86_PJ_V74_NARROW_CL_SHIFT != 0 && B86_PJ_V74_NARROW_CL_SHIFT != 1
+#error B86_PJ_V74_NARROW_CL_SHIFT must be 0 or 1
+#endif
+/* V73: native non-REP CMPS/SCAS + bounded, restartable REP LODS.
+ * Checked reads precede guest register/flag mutation; a partial REP
+ * iteration resumes with architectural ECX/ESI/EAX already committed.
+ * Disabling this macro restores the exact v72 translator. */
+#ifndef B86_PJ_V73_STRING_COMPARE_REP_LODS
+#define B86_PJ_V73_STRING_COMPARE_REP_LODS 1
+#endif
+#if B86_PJ_V73_STRING_COMPARE_REP_LODS != 0 && B86_PJ_V73_STRING_COMPARE_REP_LODS != 1
+#error B86_PJ_V73_STRING_COMPARE_REP_LODS must be 0 or 1
+#endif
+/* V72: native PM32 non-REP MOVS/STOS plus ENTER level0 and 66 LEAVE.
+ * Guest faults are checked before any architectural register commit;
+ * every completed write leaves through the existing SMC-safe exit.
+ * Off mode restores the byte-exact v71 translator after preprocessing. */
+#ifndef B86_PJ_V72_STACK_STRING_BATCH
+#define B86_PJ_V72_STACK_STRING_BATCH 1
+#endif
+#if B86_PJ_V72_STACK_STRING_BATCH != 0 && B86_PJ_V72_STACK_STRING_BATCH != 1
+#error B86_PJ_V72_STACK_STRING_BATCH must be 0 or 1
+#endif
 /* V71: narrow PM32 long-multiply batch: F6 /4,/5 (8-bit),
  * F7 /4,/5 (66h 16-bit), 69/6B 16-bit, 0F AF 16-bit.
  * Uses Thumb-2 UMULL/SMULL and the shared lazy SZPC flag writer.
@@ -1951,6 +2017,92 @@ static int pjt_v69_shiftd(PjT *t, const PjM *m, unsigned w,
 }
 #endif /* V69 common SHLD/SHRD batch */
 
+#if B86_PJ_V74_NARROW_CL_SHIFT
+/* V74: Emit a narrow-width register/memory CL shift. A return of 1 means
+ * translated, a return of 2 is a terminal native store, 0 refuses the
+ * instruction without admitting any new guest-side effects. */
+static int pjt_v74_shift_cl(PjT *t, const PjM *m, unsigned ww,
+                            unsigned next_ip)
+{
+    const unsigned bits = 8u * ww;
+    const unsigned sub = m->reg;
+    PjOp o;
+    uint8_t *skip = NULL, *one;
+    if ((ww != 1u && ww != 2u) ||
+        (sub != 4u && sub != 5u && sub != 7u)) return 0;
+    /* Count is read BEFORE any checked pointer, lazy flag or register write.
+     * No guest state changes on zero/over-width count. A memory zero-count
+     * must replay through the existing interpreter for its memory semantics. */
+    pjt_get8(t, R0, 1u);              /* CL */
+    pj_dpi(&t->e, 0u, 1, R0, R0, 31u); /* ANDS count, #31 */
+    if (m->mod == 3u) skip = pjt_bfwd(t, 0 /* EQ: register no-op */);
+    else pjt_exit_stay(t, 0 /* EQ: checked memory fallback */, t->ip0,
+                        t->ninsn - 1u);
+    pj_dpi(&t->e, 13u, 1, PC, R0, bits); /* CMP count, operand bit width */
+    pjt_exit_stay(t, 2 /* HS: unsupported count, replay in interpreter */,
+                  t->ip0, t->ninsn - 1u);
+    /* At this point 1 <= count < bits; the checked address or writable
+     * pointer must succeed before any EFLAGS or guest operand mutation. */
+    pjt_rm_load(t, m, ww, 1, R1, &o);
+    pjt_get8(t, R0, 1u);             /* read CL again after memory helper */
+    pj_dpi(&t->e, 0u, 0, R0, R0, 31u);
+    pj_dpi(&t->e, 13u, 0, R2, R0, 1u); /* count-1 */
+    if (sub == 4u) { /* SHL */
+        pje32(&t->e, 0xFA01u, 0xF000u | (R2 << 8) | R2);
+        pj_shift(&t->e, R2, R2, 1u, bits - 1u);
+        pj_dpi(&t->e, 0u, 0, R2, R2, 1u); /* isolate outgoing CF */
+        pje32(&t->e, 0xFA01u, 0xF000u | (R1 << 8) | R0);
+        pj_ubfx(&t->e, R1, R1, 0u, bits);
+        pj_ubfx(&t->e, R3, R1, bits - 1u, 1u);
+        pj_dpr(&t->e, 4u, 0, R3, R3, R2, 0u, 0u);
+    } else if (sub == 5u) { /* SHR */
+        pje32(&t->e, 0xFA21u, 0xF000u | (R2 << 8) | R2);
+        pj_dpi(&t->e, 0u, 0, R2, R2, 1u);
+        pj_ubfx(&t->e, R3, R1, bits - 1u, 1u);
+        pje32(&t->e, 0xFA21u, 0xF000u | (R1 << 8) | R0);
+    } else { /* SAR */
+        pj_ext(&t->e, ww == 1u ? 0xFA4Fu : 0xFA0Fu, R1, R1);
+        pje32(&t->e, 0xFA41u, 0xF000u | (R2 << 8) | R2);
+        pj_dpi(&t->e, 0u, 0, R2, R2, 1u);
+        pj_movw(&t->e, R3, 0u);  /* OF=0 as the existing interpreter */
+        pje32(&t->e, 0xFA41u, 0xF000u | (R1 << 8) | R0);
+    }
+    pj_ubfx(&t->e, R1, R1, 0u, bits); /* narrow lazy SZP must see width */
+    pj_dpr(&t->e, 2u, 0, R2, R2, R3, 0u, 11u); /* CF | OF<<11 */
+    pjt_c(t);
+    pj_movw(&t->e, LR, pj_k_szpc[ww]);
+    pj_ldst(&t->e, PJ_STR, LR, CREG, (unsigned)offsetof(B86Cpu, lz_kind));
+    pj_ldst(&t->e, PJ_STR, R1, CREG, (unsigned)offsetof(B86Cpu, lz_res));
+    pj_ldst(&t->e, PJ_STR, R2, CREG, (unsigned)offsetof(B86Cpu, lz_b));
+    pj_movw(&t->e, LR, LZ_NONE);
+    pj_ldst(&t->e, PJ_STR, LR, CREG, (unsigned)offsetof(B86Cpu, lz_ikind));
+    /* Match p40_shift: AF is undefined, OF undefined when count>1. */
+    pj_ldst(&t->e, PJ_LDR, R3, CREG,
+            (unsigned)offsetof(B86Cpu, pm40_undef));
+    pj_dpi(&t->e, 2u, 0, R3, R3, B86_AF);
+    pjt_get8(t, R0, 1u);
+    pj_dpi(&t->e, 0u, 0, R0, R0, 31u);
+    pj_dpi(&t->e, 13u, 1, PC, R0, 1u);
+    one = pjt_bfwd(t, 0 /* EQ, count==1 */);
+    pj_dpi(&t->e, 2u, 0, R3, R3, B86_OF);
+    pjt_here(t, one);
+    pj_ldst(&t->e, PJ_STR, R3, CREG,
+            (unsigned)offsetof(B86Cpu, pm40_undef));
+    pjt_rm_store(t, &o, ww, R1);
+    if (m->mod != 3u) {
+        /* Checked native memory writes can invalidate the current code. */
+        pjt_exit(t, next_ip, t->ninsn, 2);
+        return 2;
+    }
+    pjt_here(t, skip); /* register CL=0: skip all flag/operand mutation */
+    t->creg_ok = 0;
+    t->last_kind = -1;
+    t->ikind_clear = 0;
+    t->fuse_at = NULL;
+    return 1;
+}
+#endif /* V74 narrow CL-shift emitter */
+
 /* shifts SHL/SHR/SAR by an immediate count n (1..31) on value in R1 (w bits). */
 static int pjt_shift(PjT *t, unsigned kind, unsigned w, unsigned n)
 {
@@ -2249,8 +2401,116 @@ static void pjt_v71_mul_overflow(PjT *t, unsigned w, int is_signed)
 }
 #endif /* V71 narrow multiply helpers */
 
+#if B86_PJ_V72_STACK_STRING_BATCH
+/* Non-REP string index update. B86_DF is never a lazy arithmetic flag,
+ * so no flag materialization or C helper is required. ARM conditions
+ * are local and do not affect the guest flags. */
+static void pjt_v72_string_step(PjT *t, unsigned reg, unsigned width)
+{
+    uint8_t *back, *end;
+    pjt_c(t);
+    pj_ldst(&t->e, PJ_LDR, R2, CREG, (unsigned)offsetof(B86Cpu, flags));
+    pj_dpi(&t->e, 0u, 1, R2, R2, B86_DF);
+    back = pjt_bfwd(t, 1 /* NE: backward */);
+    pjt_addimm(t, GR(reg), GR(reg), width);
+    end = pjt_bfwd(t, -1);
+    pjt_here(t, back);
+    pjt_addimm(t, GR(reg), GR(reg), 0u - width);
+    pjt_here(t, end);
+    t->fuse_at = NULL;
+}
+#endif /* V72 string-index emitter */
+
 /* Translate one instruction at t->b[t->pos]. Returns 1 = continue block,
  * 2 = block ended (exits emitted), 0 = not supported (block ends before it). */
+#if B86_PJ_V76_DIV64_BATCH
+/* V76: exact unsigned long division for 64/32 input with <32-bit quotient.
+ * At entry R0=EAX, R2=nonzero divisor, GR(2)=EDX. Guest r4..r11,
+ * flags, lazy records, and r12 are untouched until both overflow checks.
+ * R3 low 6 bits are the loop counter; bits 6/7 remember divisor/dividend
+ * sign. The loop uses ARM C from LSLS/ADCS to represent remainder bit 32.
+ * It needs no function calls or guest-memory accesses once entered.
+ * This emitter is reached only if V75's fast SDIV/UDIV eligibility fails. */
+static void pjt_v76_div64(PjT *t, int is_signed)
+{
+    uint8_t *nonnegative, *normalized, *carry_sub, *no_sub;
+    uint8_t *nonneg_divisor, *nonneg_remainder, *small_q;
+    uint8_t *quotient_nonnegative;
+    uint8_t *loop;
+    pj_mov(&t->e, R1, GR(2)); /* uncommitted high dividend */
+    pj_movw(&t->e, R3, 32u);   /* 32 quotient bits */
+    if (is_signed) {
+        pj_dpi(&t->e, 13u, 1, PC, R1, 0u); /* CMP EDX, 0 */
+        nonnegative = pjt_bfwd(t, 5 /* PL: dividend >= 0 */);
+        /* Negate both words: -EDX:EAX = (~EDX):(0-EAX) plus carry.
+         * RSBS sets C iff low word was zero; SBC 0,hi consumes it. */
+        pj_movw(&t->e, R3, 0u);
+        pj_dpi(&t->e, 14u, 1, R0, R0, 0u); /* RSBS low, low, #0 */
+        pj_dpr(&t->e, 11u, 0, R1, R3, R1, 0u, 0u); /* SBC high, #0, high */
+        pj_movw(&t->e, R3, 160u); /* count 32 + dividend-negative bit 128 */
+        normalized = pjt_bfwd(t, -1);
+        pjt_here(t, nonnegative);
+        pjt_here(t, normalized);
+        pj_dpi(&t->e, 13u, 1, PC, R2, 0u); /* signed divisor */
+        nonneg_divisor = pjt_bfwd(t, 5 /* PL */);
+        pj_dpi(&t->e, 2u, 0, R3, R3, 64u); /* divisor-negative bit 64 */
+        pj_dpi(&t->e, 14u, 0, R2, R2, 0u); /* unsigned magnitude */
+        pjt_here(t, nonneg_divisor);
+    }
+    /* A 32-bit quotient is representable iff high magnitude < divisor.
+     * This is a necessary condition even for signed INT32_MIN quotient.
+     * A refusal replays original instruction to deliver x86 #DE. */
+    pj_dpr(&t->e, 13u, 1, PC, R1, R2, 0u, 0u);
+    pjt_exit_stay(t, 2 /* HS: quotient wider than 32 bits */, t->ip0,
+                  t->ninsn - 1u);
+    loop = t->e.p;
+    /* Shift R1:R0 left one bit. ADCS consumes R0's outgoing carry and
+     * sets C to the 33rd remainder bit. This C must be sampled before CMP. */
+    pje16(&t->e, 0x0040u); /* LSLS r0,r0,#1 */
+    pje16(&t->e, 0x4149u); /* ADCS r1,r1: C is bit 32 */
+    carry_sub = pjt_bfwd(t, 2 /* CS: full remainder >= 2^32 */);
+    pj_dpr(&t->e, 13u, 1, PC, R1, R2, 0u, 0u); /* CMP remainder,divisor */
+    no_sub = pjt_bfwd(t, 3 /* CC: partial remainder < divisor */);
+    pjt_here(t, carry_sub);
+    pj_dpr(&t->e, 13u, 0, R1, R1, R2, 0u, 0u); /* SUB rem,rem,divisor */
+    pj_dpi(&t->e, 2u, 0, R0, R0, 1u);           /* ORR quotient bit */
+    pjt_here(t, no_sub);
+    pj_dpi(&t->e, 13u, 1, R3, R3, 1u); /* SUBS counter -- */
+    pj_dpi(&t->e, 0u, 1, PC, R3, 63u); /* TST counter low six bits */
+    pj_patch_b(pj_b(&t->e, 1 /* NE */), loop);
+    if (is_signed) {
+        /* Signed remainder has sign of original dividend. */
+        pj_dpi(&t->e, 0u, 1, PC, R3, 128u); /* TST dividend sign */
+        nonneg_remainder = pjt_bfwd(t, 0 /* EQ */);
+        pj_dpi(&t->e, 14u, 0, R1, R1, 0u); /* NEG remainder */
+        pjt_here(t, nonneg_remainder);
+        /* Low bit of ((signs>>6) xor (signs>>7)) is quotient sign. */
+        pj_shift(&t->e, R3, R3, 1u, 6u);
+        pj_dpr(&t->e, 4u, 0, R3, R3, R3, 1u, 1u);
+        /* Positive quotient cannot set bit 31. Negative quotient may be
+         * exactly -2^31 (magnitude 0x80000000) but no greater. */
+        pj_dpi(&t->e, 0u, 1, PC, R0, 0x80000000u);
+        small_q = pjt_bfwd(t, 0 /* EQ: quotient magnitude <= INT_MAX */);
+        pj_dpi(&t->e, 0u, 1, PC, R3, 1u);
+        pjt_exit_stay(t, 0 /* EQ: positive overflow */, t->ip0,
+                      t->ninsn - 1u);
+        pj_imm32(&t->e, R2, 0x7FFFFFFFu);
+        pj_dpr(&t->e, 0u, 1, PC, R0, R2, 0u, 0u); /* TST lower 31 bits */
+        pjt_exit_stay(t, 1 /* NE: negative overflow */, t->ip0,
+                      t->ninsn - 1u);
+        pjt_here(t, small_q);
+        pj_dpi(&t->e, 0u, 1, PC, R3, 1u);
+        quotient_nonnegative = pjt_bfwd(t, 0 /* EQ */);
+        pj_dpi(&t->e, 14u, 0, R0, R0, 0u); /* NEG quotient */
+        pjt_here(t, quotient_nonnegative);
+    }
+    /* No exception can occur after this point. One atomic guest commit. */
+    pjt_putr(t, 2u, 4u, R1); /* EDX=remainder */
+    pjt_putr(t, 0u, 4u, R0); /* EAX=quotient */
+    t->fuse_at = NULL; /* generated CMP/TST clobbered ARM NZCV */
+}
+#endif /* V76 native full 64/32 division emitter */
+
 static B86_PJ_COLD int pjt_insn(PjT *t)
 {
     PjM m;
@@ -2311,8 +2571,14 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
     /* r71: F2 on MOVS/STOS behaves exactly like F3 (Watcom's memcpy at
      * 100DFC98 uses F2 A5 / F2 A4); only CMPS/SCAS care which one it is. */
     if (repne && (op == 0xA4u || op == 0xA5u || op == 0xAAu || op == 0xABu)) repne = 0u;
+#if B86_PJ_V73_STRING_COMPARE_REP_LODS
+    if (repz && op != 0xA4u && op != 0xA5u && op != 0xAAu && op != 0xABu &&
+        !(repne && (op == 0xA6u || op == 0xA7u || op == 0xAEu || op == 0xAFu)) &&
+        !(op == 0xACu || op == 0xADu)) PJ_FAIL();
+#else
     if (repz && op != 0xA4u && op != 0xA5u && op != 0xAAu && op != 0xABu &&
         !(repne && (op == 0xA6u || op == 0xA7u || op == 0xAEu || op == 0xAFu))) PJ_FAIL();
+#endif /* V73 REP LODS prefix admission */
     /* In contrast to MOVS/STOS, REPNE CMPS/SCAS uses the default DS and ES
      * segments. Segment overrides must remain on the interpreter path. */
     if (repne && segpref) PJ_FAIL();
@@ -2952,6 +3218,112 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
         pjt_exit(t, PJ_NEXT(), t->ninsn, 2); /* re-check flatness */
         return 2;
     case 0xA4: case 0xA5: case 0xAA: case 0xAB: case 0xAC: case 0xAD: {   /* string ops through a helper */
+#if B86_PJ_V77_REP_TAIL && B86_PJ_V72_STACK_STRING_BATCH
+    /* F3 REP MOVSB/MOVSW/MOVSD and STOSB/STOSW/STOSD with ECX==1.
+     * Runtime admission BEFORE any guest side effect. ECX==0 and ECX>1
+     * fall through to the original checked C helper, unchanged.
+     * Full flat ES admission is enforced by the existing block guard.
+     * Source DS and destination ES are flat, with no 67/address override.
+     * The read and write checks precede memory/register changes. After
+     * the store, move the index(es), zero ECX, and exit for SMC safety. */
+    if ((op == 0xA4u || op == 0xA5u || op == 0xAAu || op == 0xABu) &&
+        repz && !repne && !segpref && !es_override &&
+        (np == 2u || (np == 3u && o16 && (op & 1u)))) {
+        const unsigned ww77 = (op & 1u) ? w : 1u;
+        const int movs77 = op == 0xA4u || op == 0xA5u;
+        uint8_t *slow77;
+        pj_dpi(&t->e, 13u, 1, PC, GR(1), 1u); /* CMP ECX, #1 */
+        slow77 = pjt_bfwd(t, 1 /* NE: existing helper */);
+        if (movs77) {
+            pj_mov(&t->e, R1, GR(6));              /* ESI DS source */
+            pjt_mem(t, ww77, 0);                   /* checked read */
+            pjt_ld(t, R2, R0, ww77);
+            pj_ldst(&t->e, PJ_STR, R2, SP, 4u);    /* preserve value */
+        }
+        pj_mov(&t->e, R1, GR(7));                  /* EDI ES destination */
+        pjt_mem(t, ww77, 1);                       /* checked write */
+        if (movs77) pj_ldst(&t->e, PJ_LDR, R2, SP, 4u);
+        else pjt_getr(t, R2, 0u, ww77);           /* STOS AL/AX/EAX */
+        pjt_st(t, R2, R0, ww77);                   /* first guest-visible write */
+        if (movs77) pjt_v72_string_step(t, 6u, ww77);
+        pjt_v72_string_step(t, 7u, ww77);
+        pj_movw(&t->e, GR(1), 0u);                 /* ECX 1 -> 0 */
+        pjt_exit(t, PJ_NEXT(), t->ninsn, 2);      /* unlinked SMC-safe exit */
+        pjt_here(t, slow77);                       /* original helper for all others */
+        t->fuse_at = NULL;
+    }
+#endif /* V77 native REP one-element string tail */
+#if B86_PJ_V73_STRING_COMPARE_REP_LODS
+    /* REP/F3 or REPNE/F2 LODSB/W/D in flat PM32 mode. Reads only, so
+     * no SMC exits or memory-write side effects. All checked reads happen
+     * before destination/index/count updates; on failure the existing
+     * trampoline replays the remaining ECX iterations from this EIP.
+     * Bound each translated run to 16 elements for interrupt fairness.
+     * SP+4 is caller-owned scratch, even across a memory trampoline.
+     * A count of zero must not read memory or touch EAX/flags. */
+    if ((op == 0xACu || op == 0xADu) && repz && !segpref &&
+        !es_override && (np == 2u || (op == 0xADu && np == 3u && o16)) &&
+        (w == 2u || w == 4u)) {
+        const unsigned ww73 = op == 0xACu ? 1u : w;
+        uint8_t *loop73, *empty73, *again73, *exhausted73;
+        pj_movw(&t->e, R2, 16u);
+        pj_ldst(&t->e, PJ_STR, R2, SP, 4u);
+        loop73 = t->e.p;
+        pj_dpi(&t->e, 13u, 1, PC, GR(1), 0u); /* CMP ECX,#0 */
+        empty73 = pjt_bfwd(t, 0);             /* no remaining items */
+        pj_mov(&t->e, R1, GR(6));
+        pjt_mem(t, ww73, 0);                 /* checked DS:[ESI] */
+        pjt_ld(t, R1, R0, ww73);
+        pjt_putr(t, 0u, ww73, R1);          /* AL/AX/EAX <- value */
+        pjt_v72_string_step(t, 6u, ww73);   /* ESI += DF ? -ww : +ww */
+        pj_dpi(&t->e, 13u, 0, GR(1), GR(1), 1u); /* ECX--, x86 flags untouched */
+        pj_ldst(&t->e, PJ_LDR, R2, SP, 4u);
+        pj_dpi(&t->e, 13u, 0, R2, R2, 1u);
+        pj_ldst(&t->e, PJ_STR, R2, SP, 4u);
+        pj_dpi(&t->e, 13u, 1, PC, R2, 0u); /* bounded chunk finished? */
+        again73 = pj_b(&t->e, 1);           /* BNE loop */
+        pj_patch_b(again73, loop73);
+        pj_dpi(&t->e, 13u, 1, PC, GR(1), 0u);
+        exhausted73 = pjt_bfwd(t, 0);      /* exact multiple of 16 completed */
+        /* 16 elements done, ECX still nonzero: leave with SAME guest IP,
+         * 0 retirement for this in-progress instruction. Unchained exit
+         * allows the dispatcher to service pending interrupts. */
+        pjt_exit(t, t->ip0, t->ninsn - 1u, 2);
+        pjt_here(t, empty73);
+        pjt_here(t, exhausted73);
+        t->fuse_at = NULL;                 /* generated CMPs clobber ARM NZCV */
+        return 1;                          /* finished REP retires once */
+    }
+#endif /* V73 native bounded REP LODS */
+#if B86_PJ_V72_STACK_STRING_BATCH
+    /* Native non-REP MOVSB/MOVSW/MOVSD and STOSB/STOSW/STOSD.
+     * The pre-switch ES runtime guard ensures ES is flat and writable.
+     * Source DS and destination ES have zero bases in this admission.
+     * Both accesses are checked before ANY guest register/write change.
+     * [SP+4] is the caller-owned scratch across the second memtramp.
+     * The store may invalidate code, so always exit unlinked afterward. */
+    if ((op == 0xA4u || op == 0xA5u || op == 0xAAu || op == 0xABu) &&
+        !repz && !repne && !segpref && !es_override &&
+        (np == 1u || (np == 2u && o16 && (op & 1u)))) {
+        const unsigned ww72 = (op & 1u) ? w : 1u;
+        const int movs72 = op == 0xA4u || op == 0xA5u;
+        if (movs72) {
+            pj_mov(&t->e, R1, GR(6));           /* ESI: flat DS */
+            pjt_mem(t, ww72, 0);              /* checked source read */
+            pjt_ld(t, R2, R0, ww72);
+            pj_ldst(&t->e, PJ_STR, R2, SP, 4u); /* save across write trampoline */
+        }
+        pj_mov(&t->e, R1, GR(7));               /* EDI: runtime-flat ES */
+        pjt_mem(t, ww72, 1);                  /* checked destination write */
+        if (movs72) pj_ldst(&t->e, PJ_LDR, R2, SP, 4u);
+        else pjt_getr(t, R2, 0u, ww72);       /* STOS: AL/AX/EAX */
+        pjt_st(t, R2, R0, ww72);              /* first guest-visible side effect */
+        if (movs72) pjt_v72_string_step(t, 6u, ww72);
+        pjt_v72_string_step(t, 7u, ww72);
+        pjt_exit(t, PJ_NEXT(), t->ninsn, 2); /* SMC-safe dispatcher boundary */
+        return 2;
+    }
+#endif /* V72 non-REP native string stores */
 #if B86_PJ_V59_PM32_LODS_XLAT
     /* Non-REP LODSB/LODSW/LODSD: AL/AX/EAX <- DS:[ESI], then ESI
      * advances by +/-operand width according to DF.  No arithmetic flags
@@ -2992,6 +3364,36 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
         pj_dpi(&t->e, 13u, 1, PC, R0, 0u);
         pjt_exit_stay(t, 0 /* EQ */, t->ip0, t->ninsn - 1u);
         return 1; }
+#if B86_PJ_V73_STRING_COMPARE_REP_LODS
+    /* Native unprefixed CMPSB/W/D and SCASB/W/D. DS and ES must be flat;
+     * the shared ES guard runs before these opcodes. Validate BOTH CMPS
+     * reads before updating either index or x86 arithmetic flags.
+     * CMPS computes DS:[ESI] - ES:[EDI]. SCAS computes AL/AX/EAX - ES:[EDI].
+     * SP+4 saves the first CMPS operand across the second mem trampoline.
+     * The standard SUB lazy writer implements CF/PF/AF/ZF/SF/OF. */
+    if (!repz && !repne && !segpref && !es_override &&
+        (np == 1u || (np == 2u && o16))) {
+        const unsigned ww73 = (op & 1u) ? w : 1u;
+        if (op == 0xA6u || op == 0xA7u || op == 0xAEu || op == 0xAFu) {
+            const int cmps73 = op == 0xA6u || op == 0xA7u;
+            if (cmps73) {
+                pj_mov(&t->e, R1, GR(6));
+                pjt_mem(t, ww73, 0);         /* checked DS source read */
+                pjt_ld(t, R2, R0, ww73);
+                pj_ldst(&t->e, PJ_STR, R2, SP, 4u);
+            }
+            pj_mov(&t->e, R1, GR(7));
+            pjt_mem(t, ww73, 0);             /* checked ES destination read */
+            pjt_ld(t, R0, R0, ww73);
+            if (cmps73) pj_ldst(&t->e, PJ_LDR, R1, SP, 4u);
+            else pjt_getr(t, R1, 0u, ww73);
+            pjt_alu(t, 7u, ww73, R3, R1, R0);
+            if (cmps73) pjt_v72_string_step(t, 6u, ww73);
+            pjt_v72_string_step(t, 7u, ww73);
+            return 1;                      /* same native block; no guest store */
+        }
+    }
+#endif /* V73 native CMPS SCAS */
     /* F2 CMPSB/W/D and SCASB/W/D: comparison loop with exact register
      * progress and ZF termination; memory errors fall back without replaying
      * already completed comparisons. Host helpers use the live guest state. */
@@ -3371,7 +3773,32 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
         if (!pjt_shift(t, m.reg, ww, n)) PJ_FAIL();
         pjt_rm_store(t, &o, ww, R1);
         return 1; }
+#if B86_PJ_V74_NARROW_CL_SHIFT
+    /* V74: D2 byte and 66 D3 word SHL/SHR/SAR, CL. These forms were
+     * interpreter-only. The memory paths retain checked write+SMC exit. */
+    case 0xD2: {
+        if (np != 1u || o16 || segpref || es_override || repz || repne ||
+            !pjt_modrm(t, &m) || (m.reg != 4u && m.reg != 5u && m.reg != 7u))
+            PJ_FAIL();
+        {
+            const int r = pjt_v74_shift_cl(t, &m, 1u, PJ_NEXT());
+            if (!r) PJ_FAIL();
+            return r;
+        }
+    }
+#endif /* V74 native D2 byte CL shifts */
     case 0xD3: {                                     /* SHL/SHR/SAR r/m32, CL */
+#if B86_PJ_V74_NARROW_CL_SHIFT
+        if (o16 && np == 2u && !segpref && !es_override && !repz && !repne) {
+            if (!pjt_modrm(t, &m) ||
+                (m.reg != 4u && m.reg != 5u && m.reg != 7u)) PJ_FAIL();
+            {
+                const int r = pjt_v74_shift_cl(t, &m, 2u, PJ_NEXT());
+                if (!r) PJ_FAIL();
+                return r;
+            }
+        }
+#endif /* V74 native D3 word CL shifts */
         uint8_t *skip;
         if (o16 || !pjt_modrm(t, &m) || (m.reg != 4u && m.reg != 5u && m.reg != 7u)) PJ_FAIL();
         pjt_rm_load(t, &m, 4u, 1, R1, &o);
@@ -3450,7 +3877,41 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
         pj_imm32(&t->e, R1, imm);
         pjt_st(t, R1, R0, ww);
         return 1; }
+#if B86_PJ_V72_STACK_STRING_BATCH
+    /* 80386 ENTER imm16,0: only level zero; higher nesting retains the
+     * original checked interpreter. SS.B=1 is the flat PM32 entry contract.
+     * The old EBP is not committed to the stack until write validation. */
+    case 0xC8: {
+        uint32_t alloc72, level72;
+        if (!((np == 1u && !o16) || (np == 2u && o16)) ||
+            segpref || repz || repne ||
+            !pjt_imm(t, 2u, &alloc72) || !pjt_u8(t, &level72) ||
+            (level72 & 31u) != 0u) PJ_FAIL();
+        pj_dpi(&t->e, 13u, 0, R1, GR(4), w); /* new ESP - before commit */
+        pjt_mem(t, w, 1);                     /* checked SS write */
+        pjt_getr(t, R2, 5u, w);             /* old EBP/BP */
+        pjt_st(t, R2, R0, w);
+        pj_dpi(&t->e, 13u, 0, GR(4), GR(4), w);
+        pjt_putr(t, 5u, w, GR(4));         /* EBP or BP <- frame offset */
+        pjt_addimm(t, GR(4), GR(4), 0u - alloc72);
+        pjt_exit(t, PJ_NEXT(), t->ninsn, 2); /* checked store can invalidate */
+        return 2;
+    }
+#endif /* V72 ENTER level zero */
     case 0xC9:                                       /* LEAVE */
+#if B86_PJ_V72_STACK_STRING_BATCH
+        /* 66 LEAVE: SS.B=1, so read [full EBP], then ESP=EBP+2.
+         * Only BP low 16 bits are overwritten; no flags are touched.
+         * A failed checked read leaves EBP and ESP both unchanged. */
+        if (o16 && np == 2u && !segpref && !repz && !repne) {
+            pj_mov(&t->e, R1, GR(5));
+            pjt_mem(t, 2u, 0);
+            pjt_ld(t, R1, R0, 2u);
+            pj_dpi(&t->e, 8u, 0, GR(4), GR(5), 2u);
+            pjt_putr(t, 5u, 2u, R1);
+            return 1;
+        }
+#endif /* V72 16-bit LEAVE */
         if (o16) PJ_FAIL();
         pj_mov(&t->e, R1, GR(5));
         pjt_mem(t, 4u, 0);
@@ -3560,6 +4021,119 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
             return 1;
         }
         if (m.reg >= 6u) {                            /* DIV / IDIV: helper, #DE left to the interpreter */
+#if B86_PJ_V75_DIV_BATCH
+            /* V75: both checked-memory and register divisors. The hardware
+             * divider handles only a single 32-bit dividend, so the full
+             * 64/32 case deliberately uses the exact original helper.
+             * All runtime refusals occur before guest-register writes. */
+            if (!segpref && !es_override && !repz && !repne &&
+                ((ww == 1u && !o16 && np == 1u) ||
+                 (ww == 2u && o16 && np == 2u) ||
+                 (ww == 4u && !o16 && np == 1u))) {
+                const int is_signed75 = m.reg == 7u;
+                const unsigned bits75 = ww * 8u;
+                uint8_t *allowed75;
+                pjt_rm_load(t, &m, ww, 0, R2, &o);
+                if (is_signed75 && ww == 1u)
+                    pj_ext(&t->e, 0xFA4Fu, R2, R2); /* SXTB divisor */
+                if (is_signed75 && ww == 2u)
+                    pj_ext(&t->e, 0xFA0Fu, R2, R2); /* SXTH divisor */
+                /* Divide by zero: replay original instruction to deliver
+                 * architectural #DE, without any committed guest change. */
+                pj_dpi(&t->e, 13u, 1, PC, R2, 0u);
+                pjt_exit_stay(t, 0 /* EQ */, t->ip0, t->ninsn - 1u);
+#if B86_PJ_V76_DIV64_BATCH
+                /* Full native 64/32 DIV/IDIV only on nontrivial high half.
+                 * Runtime branch skips this loop for V75's fast UDIV/SDIV
+                 * path; both successful arms join after the V75 stores. */
+                uint8_t *fast76 = NULL, *done76 = NULL;
+                if (ww == 4u) {
+                    pj_mov(&t->e, R0, GR(0));
+                    if (is_signed75) {
+                        pj_shift(&t->e, R1, R0, 2u, 31u);
+                        pj_dpr(&t->e, 13u, 1, PC, R1, GR(2), 0u, 0u);
+                    } else {
+                        pj_dpi(&t->e, 13u, 1, PC, GR(2), 0u);
+                    }
+                    fast76 = pjt_bfwd(t, 0 /* EQ: V75 hardware path */);
+                    pjt_v76_div64(t, is_signed75);
+                    done76 = pjt_bfwd(t, -1 /* after common V75 commit */);
+                    pjt_here(t, fast76);
+                }
+#endif /* V76 runtime full dividend route */
+                if (ww == 1u) {
+                    pjt_getr(t, R0, 0u, 2u);  /* dividend AX */
+                    if (is_signed75) pj_ext(&t->e, 0xFA0Fu, R0, R0);
+                } else if (ww == 2u) {
+                    pjt_getr(t, R0, 0u, 2u);  /* dividend DX:AX */
+                    pjt_getr(t, R1, 2u, 2u);
+                    pj_shift(&t->e, R1, R1, 0u, 16u);
+                    pj_dpr(&t->e, 2u, 0, R0, R0, R1, 0u, 0u);
+                } else {
+                    pj_mov(&t->e, R0, GR(0));  /* low 32 of EDX:EAX */
+                    if (is_signed75) {
+                        pj_shift(&t->e, R1, R0, 2u, 31u);
+                        pj_dpr(&t->e, 13u, 1, PC, R1, GR(2), 0u, 0u);
+                    } else {
+                        pj_dpi(&t->e, 13u, 1, PC, GR(2), 0u);
+                    }
+                    pjt_exit_stay(t, 1 /* NE: nontrivial 64-bit dividend */,
+                                  t->ip0, t->ninsn - 1u);
+                    if (is_signed75) {
+                        /* SDIV INT32_MIN / -1 exceeds signed 32-bit range.
+                         * Detect before the hardware SDIV instruction. */
+                        pj_imm32(&t->e, R1, 0xFFFFFFFFu);
+                        pj_dpr(&t->e, 13u, 1, PC, R2, R1, 0u, 0u);
+                        allowed75 = pjt_bfwd(t, 1 /* NE */);
+                        pj_imm32(&t->e, R1, 0x80000000u);
+                        pj_dpr(&t->e, 13u, 1, PC, R0, R1, 0u, 0u);
+                        pjt_exit_stay(t, 0 /* EQ */, t->ip0,
+                                      t->ninsn - 1u);
+                        pjt_here(t, allowed75);
+                    }
+                }
+                /* UD/SDIV r3,r0,r2. The Cortex-M33 encoding is verified
+                 * against LLVM's target assembler by the offline tests. */
+                pje32(&t->e, (is_signed75 ? 0xFB90u : 0xFBB0u) | R0,
+                      (0xFu << 12) | (R3 << 8) | (0xFu << 4) | R2);
+                if (ww < 4u) {
+                    /* Quotient must fit *exactly* in the destination width.
+                     * No truncating quotient is ever committed. */
+                    if (is_signed75) {
+                        pj_ext(&t->e, ww == 1u ? 0xFA4Fu : 0xFA0Fu,
+                               R1, R3);
+                        pj_dpr(&t->e, 13u, 1, PC, R1, R3, 0u, 0u);
+                    } else {
+                        pj_shift(&t->e, R1, R3, 1u, bits75);
+                        pj_dpi(&t->e, 13u, 1, PC, R1, 0u);
+                    }
+                    pjt_exit_stay(t, 1 /* NE: quotient overflow -> #DE */,
+                                  t->ip0, t->ninsn - 1u);
+                }
+                /* remainder = dividend - quotient * divisor, exact in
+                 * two's-complement 32-bit arithmetic for admitted cases. */
+                pje32(&t->e, 0xFB00u | R3,
+                      (0xFu << 12) | (R1 << 8) | R2); /* MUL r1,r3,r2 */
+                pj_dpr(&t->e, 13u, 0, R1, R0, R1, 0u, 0u);
+                if (ww == 1u) {
+                    pj_ubfx(&t->e, R3, R3, 0u, 8u);
+                    pj_bfi(&t->e, R3, R1, 8u, 8u); /* AH=rem, AL=quot */
+                    pjt_putr(t, 0u, 2u, R3);
+                } else if (ww == 2u) {
+                    pjt_putr(t, 2u, 2u, R1); /* DX=rem */
+                    pjt_putr(t, 0u, 2u, R3); /* AX=quot */
+                } else {
+                    pjt_putr(t, 2u, 4u, R1); /* EDX=rem */
+                    pjt_putr(t, 0u, 4u, R3); /* EAX=quot */
+                }
+#if B86_PJ_V76_DIV64_BATCH
+                if (done76) pjt_here(t, done76);
+#endif /* V76 join native full and hardware fast paths */
+                /* DIV flags are undefined; the old helper doesn't touch
+                 * the lazy flag record, so neither does this native path. */
+                return 1; /* continue the native block; no C division */
+            }
+#endif /* V75 native DIV/IDIV coverage batch */
             pjt_rm_load(t, &m, ww, 0, R2, &o);
             if (ww == 1u) { pj_ext(&t->e, 0xFA1Fu, R0, GR(0)); pj_movw(&t->e, R1, 0u); }   /* AX */
             else { pj_mov(&t->e, R0, GR(0)); pj_mov(&t->e, R1, GR(2)); }
