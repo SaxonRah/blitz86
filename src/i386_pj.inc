@@ -113,7 +113,144 @@
 #if B86_PJ_V57_PM32_COVERAGE != 0 && B86_PJ_V57_PM32_COVERAGE != 1
 #error B86_PJ_V57_PM32_COVERAGE must be 0 or 1
 #endif
+/* V58: complete PM32 8F /0 memory-destination POP with architecturally
+ * correct post-pop ESP-based effective address and two checked accesses.
+ * No guest register is committed until both checks succeed. On a refused
+ * access, the unchanged original interpreter reexecutes the instruction.
+ * Control mode 0 is exact preprocessed v57. */
+#ifndef B86_PJ_V58_PM32_POPMEM
+#define B86_PJ_V58_PM32_POPMEM 1
+#endif
+#if B86_PJ_V58_PM32_POPMEM != 0 && B86_PJ_V58_PM32_POPMEM != 1
+#error B86_PJ_V58_PM32_POPMEM must be 0 or 1
+#endif
+/* V59: native PM32 XLAT (D7) and non-REP LODS (AC/AD).  All source reads
+ * pass through the existing checked guest-memory trampoline.  Arithmetic
+ * flags are untouched; DF is always in c->flags, not the lazy ALU record.
+ * 0 selects exact preprocessed v58, including the original string helper. */
+#ifndef B86_PJ_V59_PM32_LODS_XLAT
+#define B86_PJ_V59_PM32_LODS_XLAT 1
+#endif
+#if B86_PJ_V59_PM32_LODS_XLAT != 0 && B86_PJ_V59_PM32_LODS_XLAT != 1
+#error B86_PJ_V59_PM32_LODS_XLAT must be 0 or 1
+#endif
+/* V60: fully native ROL/ROR/RCL/RCR, effective count 1, PM32 register
+ * operands.  The common already-materialized EFLAGS path never calls C.
+ * Lazy flags are first reconciled by the existing exact helper when needed.
+ * No memory forms or other counts change; mode 0 is byte-exact v59. */
+#ifndef B86_PJ_V60_ROTATE_REG1
+#define B86_PJ_V60_ROTATE_REG1 1
+#endif
+#if B86_PJ_V60_ROTATE_REG1 != 0 && B86_PJ_V60_ROTATE_REG1 != 1
+#error B86_PJ_V60_ROTATE_REG1 must be 0 or 1
+#endif
+/* V61: constant-count PM32 register rotates in Thumb-2. Counts 2..31
+ * and zero-count NOP, including 9/17-bit carry ring semantics. The old
+ * v60 translator is byte-exact when V61=0. */
+#ifndef B86_PJ_V61_ROTATE_IMM
+#define B86_PJ_V61_ROTATE_IMM 1
+#endif
+#if B86_PJ_V61_ROTATE_IMM != 0 && B86_PJ_V61_ROTATE_IMM != 1
+#error B86_PJ_V61_ROTATE_IMM must be 0 or 1
+#endif
+/* V62: dynamic CL-count ROL/ROR/RCL/RCR on PM32 register operands.
+ * Emit a bounded (at most 31 steps) Thumb-2 rotate loop. Zero count is
+ * invisible to guest flags and registers. No new C execution helper. */
+#ifndef B86_PJ_V62_ROTATE_CL
+#define B86_PJ_V62_ROTATE_CL 1
+#endif
+#if B86_PJ_V62_ROTATE_CL != 0 && B86_PJ_V62_ROTATE_CL != 1
+#error B86_PJ_V62_ROTATE_CL must be 0 or 1
+#endif
+/* V63: PM32 memory ROL/ROR/RCL/RCR with a nonzero immediate count.
+ * Native computation with the established checked write trampoline,
+ * followed by an unconditional unlinked exit for possible SMC writes.
+ * Zero-count and unsupported memory forms preserve original dispatch. */
+#ifndef B86_PJ_V63_ROTATE_MEMIMM
+#define B86_PJ_V63_ROTATE_MEMIMM 1
+#endif
+#if B86_PJ_V63_ROTATE_MEMIMM != 0 && B86_PJ_V63_ROTATE_MEMIMM != 1
+#error B86_PJ_V63_ROTATE_MEMIMM must be 0 or 1
+#endif
+/* V64: D2/D3 PM32 memory ROL/ROR/RCL/RCR, dynamic CL count.
+ * Masked CL=0 replays through the interpreter before touching memory or
+ * materializing flags, retaining original fault semantics. Nonzero counts
+ * rotate entirely in Thumb-2 using the existing checked write trampoline;
+ * writes end with an unlinked SMC-safe exit. */
+#ifndef B86_PJ_V64_ROTATE_MEMCL
+#define B86_PJ_V64_ROTATE_MEMCL 1
+#endif
+#if B86_PJ_V64_ROTATE_MEMCL != 0 && B86_PJ_V64_ROTATE_MEMCL != 1
+#error B86_PJ_V64_ROTATE_MEMCL must be 0 or 1
+#endif
 
+/* V65: PM32 0F A3/AB/B3/BB and 0F BA /4..7 register forms:
+ * native BT/BTS/BTR/BTC with 16/32-bit operands.  The memory bit-string
+ * forms can address other words (including negative signed bit indices),
+ * so they intentionally stay on the checked interpreter path. */
+#ifndef B86_PJ_V65_NATIVE_BITREG
+#define B86_PJ_V65_NATIVE_BITREG 1
+#endif
+#if B86_PJ_V65_NATIVE_BITREG != 0 && B86_PJ_V65_NATIVE_BITREG != 1
+#error B86_PJ_V65_NATIVE_BITREG must be 0 or 1
+#endif
+/* V66: PM32 memory bit-string BT/BTS/BTR/BTC, register and immediate
+ * indices. Register bit offsets are SIGNED across 16/32-bit words.
+ * Only the flat32 contract is admitted. Checked native memory trampolines
+ * preserve read/write fault behavior; writes exit for SMC invalidation. */
+#ifndef B86_PJ_V66_NATIVE_BITMEM
+#define B86_PJ_V66_NATIVE_BITMEM 1
+#endif
+#if B86_PJ_V66_NATIVE_BITMEM != 0 && B86_PJ_V66_NATIVE_BITMEM != 1
+#error B86_PJ_V66_NATIVE_BITMEM must be 0 or 1
+#endif
+/* V67: PM32 BSF/BSR 16/32-bit register and checked memory sources.
+ * The zero-source path writes ZF but never the destination register;
+ * RBIT+CLZ/CLZ cover nonzero sources directly in Thumb-2. */
+#ifndef B86_PJ_V67_NATIVE_BITSCAN
+#define B86_PJ_V67_NATIVE_BITSCAN 1
+#endif
+#if B86_PJ_V67_NATIVE_BITSCAN != 0 && B86_PJ_V67_NATIVE_BITSCAN != 1
+#error B86_PJ_V67_NATIVE_BITSCAN must be 0 or 1
+#endif
+/* V71: narrow PM32 long-multiply batch: F6 /4,/5 (8-bit),
+ * F7 /4,/5 (66h 16-bit), 69/6B 16-bit, 0F AF 16-bit.
+ * Uses Thumb-2 UMULL/SMULL and the shared lazy SZPC flag writer.
+ * Zero restores byte-exact preprocessed v70 without changing old paths. */
+#ifndef B86_PJ_V71_MULWIDTH_BATCH
+#define B86_PJ_V71_MULWIDTH_BATCH 1
+#endif
+#if B86_PJ_V71_MULWIDTH_BATCH != 0 && B86_PJ_V71_MULWIDTH_BATCH != 1
+#error B86_PJ_V71_MULWIDTH_BATCH must be 0 or 1
+#endif
+/* V70: Native flag/stack batch: CLC/STC/CMC, SAHF/LAHF and PUSHF/D+POPF/D.
+ * All paths retain the PM32 descriptor/fault checks; a pending lazy-flag
+ * producer is materialized by the existing helper only if actually needed. */
+#ifndef B86_PJ_V70_FLAG_BATCH
+#define B86_PJ_V70_FLAG_BATCH 1
+#endif
+#if B86_PJ_V70_FLAG_BATCH != 0 && B86_PJ_V70_FLAG_BATCH != 1
+#error B86_PJ_V70_FLAG_BATCH must be 0 or 1
+#endif
+/* V69: One shared Thumb-2 SHLD/SHRD emitter for 16/32-bit register and
+ * memory destinations, both immediate and CL counts. The caller preserves
+ * legacy zero/undefined behavior; every checked memory write exits for SMC. */
+#ifndef B86_PJ_V69_SHIFTD_BATCH
+#define B86_PJ_V69_SHIFTD_BATCH 1
+#endif
+#if B86_PJ_V69_SHIFTD_BATCH != 0 && B86_PJ_V69_SHIFTD_BATCH != 1
+#error B86_PJ_V69_SHIFTD_BATCH must be 0 or 1
+#endif
+/* V68: PM32 SHLD/SHRD r32,r32,imm8 (0F A4/AC). For the 32-bit
+ * register destination and defined masked counts 1..31, emit the result,
+ * CF/PF/ZF/SF and (count 1) OF directly in Thumb-2. The original C helper
+ * handles other widths, CL counts and memory destinations. */
+#ifndef B86_PJ_V68_SHIFTD_IMM_REG
+#define B86_PJ_V68_SHIFTD_IMM_REG 1
+#endif
+#if B86_PJ_V68_SHIFTD_IMM_REG != 0 && B86_PJ_V68_SHIFTD_IMM_REG != 1
+#error B86_PJ_V68_SHIFTD_IMM_REG must be 0 or 1
+#endif
 /* V45: two-way native dynamic lookup using the existing flat PM32 table.
  * A miss probes the neighboring slot before returning to C. No new state,
  * guest-memory bypass, or epoch-validation shortcut. PM16 is unchanged. */
@@ -1689,6 +1826,131 @@ static void pjt_rm_store(PjT *t, const PjOp *o, unsigned w, int sreg)
     pj_ldst(&t->e, PJ_LDR, R0, SP, 4u);
     pjt_st(t, sreg, R0, w);
 }
+#if B86_PJ_V69_SHIFTD_BATCH
+/* V69 common runtime emitter. Admission: count in 1..bits on EVERY taken
+ * path; 32-bit CL counts masked to 1..31. For 16-bit CL >16, dispatch the
+ * original instruction WITHOUT committing guest state. When count is zero,
+ * register destinations are a true no-op; memory destinations return to the
+ * existing checked fallback, preserving zero-count memory fault semantics.
+ *
+ * Live registers on the loop: R1=dst, R2=src, R3=remaining,
+ * LR=most recently shifted-out bit (CF). [sp+16] holds original MSB.
+ * All writes to guest data/flags occur only AFTER the checked input read.
+ */
+static int pjt_v69_shiftd(PjT *t, const PjM *m, unsigned w,
+                           unsigned left, int use_cl, unsigned imm,
+                           uint32_t next_ip)
+{
+    PjOp loc;
+    uint8_t *skip_zero = NULL, *ready, *loop, *zf_set, *not_one = NULL;
+    const unsigned bits = w * 8u;
+    if (use_cl) {
+        pj_ubfx(&t->e, R3, GR(1), 0u, 5u);
+        pj_dpi(&t->e, 13u, 1, PC, R3, 0u);
+        if (m->mod == 3u) skip_zero = pjt_bfwd(t, 0 /* EQ */);
+        else pjt_exit_stay(t, 0 /* EQ: memory zero-count fallback */,
+                           t->ip0, t->ninsn - 1u);
+        if (w == 2u) {
+            pj_dpi(&t->e, 13u, 1, PC, R3, 16u);
+            pjt_exit_stay(t, 8 /* HI: undefined 16-bit count */,
+                           t->ip0, t->ninsn - 1u);
+        }
+    }
+    /* FIRST validate the read AND the write pointer. A refused guest
+     * memory access must not materialize lazy flags; it falls back without
+     * changing any B86Cpu state, matching the v68 helper path ordering. */
+    pjt_rm_load(t, m, w, 1, R1, &loc);
+    pj_ldst(&t->e, PJ_STR, R1, SP, 16u); /* preserve fetched destination */
+    /* Only after all checks succeed, commit preceding lazy flags. */
+    pjt_c(t);
+    pj_ldst(&t->e, PJ_LDR, R2, CREG, (unsigned)offsetof(B86Cpu,lz_kind));
+    pj_ldst(&t->e, PJ_LDR, R0, CREG, (unsigned)offsetof(B86Cpu,lz_ikind));
+    pj_dpr(&t->e, 2u, 1, R2, R2, R0, 0u, 0u);
+    ready = pjt_bfwd(t, 0 /* EQ */);
+    pj_mov(&t->e, R0, CREG);
+    pjt_call(t, (const void *)b86_flags_materialize);
+    pjt_c(t);
+    pjt_here(t, ready);
+    pj_ldst(&t->e, PJ_LDR, R1, SP, 16u);
+    pjt_getr(t, R2, m->reg, w);
+    if (w == 2u) {
+        pj_ubfx(&t->e, R1, R1, 0u, 16u);
+        pj_ubfx(&t->e, R2, R2, 0u, 16u);
+    }
+    if (use_cl) pj_ubfx(&t->e, R3, GR(1), 0u, 5u);
+    else pj_movw(&t->e, R3, imm);
+    pj_ubfx(&t->e, R0, R1, bits - 1u, 1u);
+    pj_ldst(&t->e, PJ_STR, R0, SP, 16u);
+    loop = t->e.p;
+    if (left) {
+        pj_ubfx(&t->e, LR, R1, bits - 1u, 1u);
+        pj_shift(&t->e, R1, R1, 0u, 1u);
+        pj_ubfx(&t->e, R0, R2, bits - 1u, 1u);
+        pj_dpr(&t->e, 2u, 0, R1, R1, R0, 0u, 0u);
+        pj_shift(&t->e, R2, R2, 0u, 1u);
+    } else {
+        pj_ubfx(&t->e, LR, R1, 0u, 1u);
+        pj_shift(&t->e, R1, R1, 1u, 1u);
+        pj_ubfx(&t->e, R0, R2, 0u, 1u);
+        pj_shift(&t->e, R0, R0, 0u, bits - 1u);
+        pj_dpr(&t->e, 2u, 0, R1, R1, R0, 0u, 0u);
+        pj_shift(&t->e, R2, R2, 1u, 1u);
+    }
+    pj_dpi(&t->e, 13u, 1, R3, R3, 1u); /* SUBS remaining */
+    pj_patch_b(pj_b(&t->e, 1 /* NE */), loop);
+    if (w == 2u) pj_ubfx(&t->e, R1, R1, 0u, 16u);
+    pj_ldst(&t->e, PJ_LDR, R2, CREG, (unsigned)offsetof(B86Cpu,flags));
+    pj_movw(&t->e, R0, B86_CF | B86_PF | B86_ZF | B86_SF);
+    pj_dpr(&t->e, 1u, 0, R2, R2, R0, 0u, 0u); /* BIC four defined flags */
+    pj_dpr(&t->e, 2u, 0, R2, R2, LR, 0u, 0u); /* ORR carry */
+    if (use_cl) {
+        pj_ubfx(&t->e, R3, GR(1), 0u, 5u);
+        pj_dpi(&t->e, 13u, 1, PC, R3, 1u);
+        not_one = pjt_bfwd(t, 1 /* NE: old OF must survive */);
+    }
+    if (use_cl || imm == 1u) {
+        pj_dpi(&t->e, 1u, 0, R2, R2, B86_OF);
+        pj_ubfx(&t->e, R0, R1, bits - 1u, 1u);
+        if (left) pj_dpr(&t->e, 4u, 0, R0, R0, LR, 0u, 0u);
+        else {
+            pj_ldst(&t->e, PJ_LDR, R3, SP, 16u);
+            pj_dpr(&t->e, 4u, 0, R0, R0, R3, 0u, 0u);
+        }
+        pj_shift(&t->e, R0, R0, 0u, 11u);
+        pj_dpr(&t->e, 2u, 0, R2, R2, R0, 0u, 0u);
+    }
+    if (not_one) pjt_here(t, not_one);
+    pj_ubfx(&t->e, R0, R1, bits - 1u, 1u);
+    pj_shift(&t->e, R0, R0, 0u, 7u);
+    pj_dpr(&t->e, 2u, 0, R2, R2, R0, 0u, 0u);
+    pj_dpi(&t->e, 13u, 1, PC, R1, 0u);
+    zf_set = pjt_bfwd(t, 1 /* NE */);
+    pj_dpi(&t->e, 2u, 0, R2, R2, B86_ZF);
+    pjt_here(t, zf_set);
+    /* Even low-byte parity, as used by the old helper. */
+    pj_dpi(&t->e, 0u, 0, R0, R1, 255u);
+    pj_shift(&t->e, R3, R0, 1u, 4u);
+    pj_dpr(&t->e, 4u, 0, R0, R0, R3, 0u, 0u);
+    pj_shift(&t->e, R3, R0, 1u, 2u);
+    pj_dpr(&t->e, 4u, 0, R0, R0, R3, 0u, 0u);
+    pj_shift(&t->e, R3, R0, 1u, 1u);
+    pj_dpr(&t->e, 4u, 0, R0, R0, R3, 0u, 0u);
+    pj_dpi(&t->e, 0u, 0, R0, R0, 1u);
+    pj_dpi(&t->e, 4u, 0, R0, R0, 1u);
+    pj_shift(&t->e, R0, R0, 0u, 2u);
+    pj_dpr(&t->e, 2u, 0, R2, R2, R0, 0u, 0u);
+    pj_ldst(&t->e, PJ_STR, R2, CREG, (unsigned)offsetof(B86Cpu,flags));
+    pjt_rm_store(t, &loc, w, R1);
+    t->last_kind = -1; t->ikind_clear = 1; t->fuse_at = NULL;
+    if (loc.mem) {
+        pjt_exit(t, next_ip, t->ninsn, 2); /* preserve SMC invalidation */
+        return 2;
+    }
+    if (skip_zero) pjt_here(t, skip_zero);
+    return 1;
+}
+#endif /* V69 common SHLD/SHRD batch */
+
 /* shifts SHL/SHR/SAR by an immediate count n (1..31) on value in R1 (w bits). */
 static int pjt_shift(PjT *t, unsigned kind, unsigned w, unsigned n)
 {
@@ -1917,6 +2179,76 @@ static void pjt_v53_es_write_guard(PjT *t, unsigned width)
 }
 #endif /* B86_PJ_V53_NATIVE_SEGMEM */
 
+#if B86_PJ_V70_FLAG_BATCH
+/* V70 flag materialization on demand. The emitted branch has a true native
+ * fast path with no C call when both laziness records are empty. On a slow
+ * path the existing exact flag materializer handles all arithmetic flags.
+ * Architectural consumers then operate on B86Cpu.flags, never ARM NZCV. */
+static void pjt_v70_flags_if_lazy(PjT *t)
+{
+    uint8_t *ready;
+    pjt_c(t);
+    pj_ldst(&t->e, PJ_LDR, R2, CREG, (unsigned)offsetof(B86Cpu, lz_kind));
+    pj_ldst(&t->e, PJ_LDR, R3, CREG, (unsigned)offsetof(B86Cpu, lz_ikind));
+    pj_dpr(&t->e, 2u, 1, R2, R2, R3, 0u, 0u); /* ORRS: flags pending? */
+    ready = pjt_bfwd(t, 0 /* EQ: no prior lazy flags */);
+    pj_mov(&t->e, R0, CREG);
+    pjt_call(t, (const void *)b86_flags_materialize);
+    pjt_c(t);
+    pjt_here(t, ready);
+    t->last_kind = -1; t->ikind_clear = 1; t->fuse_at = NULL;
+}
+#endif /* V70 lazy-flag guard */
+
+#if B86_PJ_V71_MULWIDTH_BATCH
+/* Shared exact lazy SZPC writer for one-/two-/three-operand multiply.
+ * R0 = zero-extended low product (width 1/2), R2 = 0 or B86_CF|B86_OF.
+ * Operands and flags were calculated entirely by generated Thumb-2.
+ * This mirrors the PM40 multiplication lazy result, including all four
+ * architecturally undefined SF/ZF/AF/PF verification bits. */
+static void pjt_v71_mul_flags(PjT *t, unsigned w)
+{
+    pjt_c(t);
+    pj_movw(&t->e, LR, pj_k_szpc[w]);
+    pj_ldst(&t->e, PJ_STR, LR, CREG,
+            (unsigned)offsetof(B86Cpu, lz_kind));
+    pj_ldst(&t->e, PJ_STR, R0, CREG,
+            (unsigned)offsetof(B86Cpu, lz_res));
+    pj_ldst(&t->e, PJ_STR, R2, CREG,
+            (unsigned)offsetof(B86Cpu, lz_b));
+    pj_movw(&t->e, LR, LZ_NONE);
+    pj_ldst(&t->e, PJ_STR, LR, CREG,
+            (unsigned)offsetof(B86Cpu, lz_ikind));
+    pj_ldst(&t->e, PJ_LDR, LR, CREG,
+            (unsigned)offsetof(B86Cpu, pm40_undef));
+    pj_dpi(&t->e, 2u, 0, LR, LR,
+           B86_SF | B86_ZF | B86_AF | B86_PF);
+    pj_ldst(&t->e, PJ_STR, LR, CREG,
+            (unsigned)offsetof(B86Cpu, pm40_undef));
+    t->last_kind = (int)pj_k_szpc[w];
+    t->ikind_clear = 1;
+    t->fuse_at = NULL;
+}
+/* R3 is the complete 8x8/16x16 product.  The true product always fits in
+ * signed/unsigned 32 bits.  CF=OF when its low w bytes do not represent it.
+ * Keep R3 unmodified: callers use it to write AX or DX:AX. R0/R2 volatile. */
+static void pjt_v71_mul_overflow(PjT *t, unsigned w, int is_signed)
+{
+    uint8_t *fits;
+    if (is_signed) {
+        pj_ext(&t->e, w == 1u ? 0xFA4Fu : 0xFA0Fu, R0, R3);
+        pj_dpr(&t->e, 13u, 1, PC, R0, R3, 0u, 0u);
+    } else {
+        pj_shift(&t->e, R0, R3, 1u, w * 8u);
+        pj_dpi(&t->e, 13u, 1, PC, R0, 0u);
+    }
+    pj_movw(&t->e, R2, 0u);
+    fits = pjt_bfwd(t, 0 /* EQ: product fits in destination */);
+    pj_movw(&t->e, R2, B86_CF | B86_OF);
+    pjt_here(t, fits);
+}
+#endif /* V71 narrow multiply helpers */
+
 /* Translate one instruction at t->b[t->pos]. Returns 1 = continue block,
  * 2 = block ended (exits emitted), 0 = not supported (block ends before it). */
 static B86_PJ_COLD int pjt_insn(PjT *t)
@@ -2010,6 +2342,206 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
         }
         return 1;
     }
+#if B86_PJ_V64_ROTATE_MEMCL
+    /* V64: PM32 D2/D3 memory ROL/ROR/RCL/RCR with dynamic CL.
+     * The 0-count path goes to the checked interpreter BEFORE the memt call;
+     * other counts never use the rotate C helper. Segment/prefix combinations
+     * outside the established flat DS, address32 fast-path still fall back. */
+    if ((op == 0xD2u || op == 0xD3u) &&
+        !segpref && !repz && !repne &&
+        (op == 0xD2u ? (np == 1u && !o16) :
+         (np == 1u || (np == 2u && o16))) &&
+        t->pos < t->n &&
+        (t->b[t->pos] & 0xC0u) != 0xC0u &&
+        ((t->b[t->pos] >> 3u) & 7u) <= 3u) {
+        const unsigned ww64 = op == 0xD2u ? 1u : w;
+        const unsigned bits64 = ww64 * 8u;
+        const unsigned sub64 = (t->b[t->pos] >> 3u) & 7u;
+        uint8_t *ready64, *loop64, *again64, *one64;
+        if (ww64 != 1u && ww64 != 2u && ww64 != 4u) PJ_FAIL();
+        if (!pjt_modrm(t, &m) || m.mod == 3u || m.reg != sub64) PJ_FAIL();
+        /* EIP, flags, guest registers and guest memory are still unchanged.
+         * Re-run CL=0 in the exact checked interpreter, including any
+         * implementation-defined memory fault behavior for zero rotates. */
+        pjt_c(t);
+        pjt_get8(t, R3, 1u);
+        pj_dpi(&t->e, 0u, 1, R3, R3, 31u); /* ANDS masked CL, #31 */
+        pjt_exit_stay(t, 0 /* EQ: count==0 */, t->ip0, t->ninsn - 1u);
+        /* A nonzero-count rotate is read/modify/write, and obtains a
+         * writable checked pointer before ANY operand or flag mutation.
+         * The checked pointer is saved in [SP+4] for the store. */
+        pjt_rm_load(t, &m, ww64, 1, R1, &o);
+        pjt_c(t);
+        pj_ldst(&t->e, PJ_LDR, R2, CREG,
+                (unsigned)offsetof(B86Cpu, lz_kind));
+        pj_ldst(&t->e, PJ_LDR, R3, CREG,
+                (unsigned)offsetof(B86Cpu, lz_ikind));
+        pj_dpr(&t->e, 2u, 1, R2, R2, R3, 0u, 0u); /* ORRS lazy kinds */
+        ready64 = pjt_bfwd(t, 0 /* EQ: flags already materialized */);
+        pj_mov(&t->e, R0, CREG);
+        pjt_call(t, (const void *)b86_flags_materialize);
+        pjt_c(t);
+        pjt_here(t, ready64);
+        pj_ldst(&t->e, PJ_LDR, R0, CREG,
+                (unsigned)offsetof(B86Cpu, flags));
+        pj_ldst(&t->e, PJ_LDR, R1, SP, 4u);
+        pjt_ld(t, R1, R1, ww64); /* reload memory operand after optional C */
+        pjt_get8(t, R3, 1u);
+        pj_dpi(&t->e, 0u, 0, R3, R3, 31u); /* nonzero bounded count, 1..31 */
+        pj_dpi(&t->e, 0u, 0, R2, R0, B86_CF);
+        loop64 = t->e.p;
+        if (sub64 == 0u || sub64 == 2u) { /* ROL/RCL */
+            pj_ubfx(&t->e, LR, R1, bits64 - 1u, 1u); /* outgoing CF */
+            pj_shift(&t->e, R1, R1, 0u, 1u);
+            pj_dpr(&t->e, 2u, 0, R1, R1,
+                   sub64 == 0u ? LR : R2, 0u, 0u);
+            pj_mov(&t->e, R2, LR);
+        } else { /* ROR/RCR */
+            pj_dpi(&t->e, 0u, 0, LR, R1, 1u);
+            pj_shift(&t->e, R1, R1, 1u, 1u);
+            if (sub64 == 1u)
+                pj_shift(&t->e, R2, LR, 0u, bits64 - 1u);
+            else
+                pj_shift(&t->e, R2, R2, 0u, bits64 - 1u);
+            pj_dpr(&t->e, 2u, 0, R1, R1, R2, 0u, 0u);
+            pj_mov(&t->e, R2, LR);
+        }
+        if (ww64 < 4u) pj_ubfx(&t->e, R1, R1, 0u, bits64);
+        pj_dpi(&t->e, 13u, 1, R3, R3, 1u); /* SUBS remaining,#1 */
+        again64 = pj_b(&t->e, 1);         /* BNE back to loop */
+        pj_patch_b(again64, loop64);
+        /* Preserve non-CF/OF x86 flags and compute deterministic OF like
+         * the old helper. OF is architecturally undefined for count>1. */
+        pj_ubfx(&t->e, R3, R1, bits64 - 1u, 1u);
+        if (sub64 == 0u || sub64 == 2u)
+            pj_dpr(&t->e, 4u, 0, R3, R3, R2, 0u, 0u);
+        else {
+            pj_ubfx(&t->e, LR, R1, bits64 - 2u, 1u);
+            pj_dpr(&t->e, 4u, 0, R3, R3, LR, 0u, 0u);
+        }
+        pj_shift(&t->e, R3, R3, 0u, 11u);
+        pj_dpr(&t->e, 2u, 0, R2, R2, R3, 0u, 0u);
+        if (!pj_dpi(&t->e, 1u, 0, R0, R0, B86_CF | B86_OF)) {
+            pj_movw(&t->e, LR, B86_CF | B86_OF);
+            pj_dpr(&t->e, 1u, 0, R0, R0, LR, 0u, 0u);
+        }
+        pj_dpr(&t->e, 2u, 0, R0, R0, R2, 0u, 0u);
+        pj_ldst(&t->e, PJ_STR, R0, CREG,
+                (unsigned)offsetof(B86Cpu, flags));
+        /* If the masked original CL != 1, record architecturally
+         * undefined OF just as in the existing rotate helper. */
+        pjt_get8(t, R3, 1u);
+        pj_dpi(&t->e, 0u, 0, R3, R3, 31u);
+        pj_dpi(&t->e, 13u, 1, PC, R3, 1u); /* CMP count,#1 */
+        one64 = pjt_bfwd(t, 0 /* EQ: exactly one */);
+        pj_ldst(&t->e, PJ_LDR, R3, CREG,
+                (unsigned)offsetof(B86Cpu, pm40_undef));
+        pj_dpi(&t->e, 2u, 0, R3, R3, B86_OF);
+        pj_ldst(&t->e, PJ_STR, R3, CREG,
+                (unsigned)offsetof(B86Cpu, pm40_undef));
+        pjt_here(t, one64);
+        pjt_rm_store(t, &o, ww64, R1);
+        pjt_exit(t, PJ_NEXT(), t->ninsn, 2); /* unlinked SMC-safe exit */
+        t->last_kind = -1;
+        t->ikind_clear = 1;
+        t->fuse_at = NULL;
+        return 2;
+    }
+#endif /* V64 native memory CL rotations */
+#if B86_PJ_V62_ROTATE_CL
+    /* D2/D3: rotate r8/r16/r32 by CL. A bounded Thumb-2 loop executes all
+     * masked counts 1..31, with no interpreter and no rotate C helper.
+     * Unlike the old helper path, count zero skips lazy-flag materialization.
+     * Keep the original D3 native SHL/SHR/SAR path for subops 4/5/7. */
+    if (op == 0xD2u || op == 0xD3u) {
+        const unsigned ww62 = op == 0xD2u ? 1u : w;
+        const int prefix62 = op == 0xD2u ? np == 1u :
+            (np == 1u || (np == 2u && o16));
+        if (prefix62 && t->pos < t->n &&
+            (t->b[t->pos] & 0xC0u) == 0xC0u &&
+            ((t->b[t->pos] >> 3u) & 7u) <= 3u &&
+            (ww62 == 1u || ww62 == 2u || ww62 == 4u)) {
+            const unsigned mod62 = t->b[t->pos];
+            const unsigned sub62 = (mod62 >> 3u) & 7u;
+            const unsigned rm62 = mod62 & 7u;
+            const unsigned bits62 = ww62 * 8u;
+            uint8_t *zero62, *ready62, *loop62, *again62, *one62;
+            t->pos += 1u;
+            /* r12 must remain live along both runtime paths, including CL=0. */
+            pjt_c(t);
+            pjt_get8(t, R3, 1u);             /* original CL (never mutated until commit) */
+            pj_dpi(&t->e, 0u, 1, R3, R3, 31u); /* ANDS count, #31 */
+            zero62 = pjt_bfwd(t, 0);          /* count==0: no guest change */
+            pj_ldst(&t->e, PJ_LDR, R2, CREG, (unsigned)offsetof(B86Cpu, lz_kind));
+            pj_ldst(&t->e, PJ_LDR, R3, CREG, (unsigned)offsetof(B86Cpu, lz_ikind));
+            pj_dpr(&t->e, 2u, 1, R2, R2, R3, 0u, 0u); /* ORRS lazy kinds */
+            ready62 = pjt_bfwd(t, 0);        /* already materialized */
+            pj_mov(&t->e, R0, CREG);
+            pjt_call(t, (const void *)b86_flags_materialize);
+            pjt_c(t);
+            pjt_here(t, ready62);
+            pj_ldst(&t->e, PJ_LDR, R0, CREG, (unsigned)offsetof(B86Cpu, flags));
+            pjt_getr(t, R1, rm62, ww62);
+            pjt_get8(t, R3, 1u);            /* restore count after optional C call */
+            pj_dpi(&t->e, 0u, 0, R3, R3, 31u);
+            pj_dpi(&t->e, 0u, 0, R2, R0, B86_CF); /* carry for first iteration */
+            loop62 = t->e.p;
+            if (sub62 == 0u || sub62 == 2u) {
+                pj_ubfx(&t->e, LR, R1, bits62 - 1u, 1u); /* outgoing CF */
+                pj_shift(&t->e, R1, R1, 0u, 1u);          /* LSL value,#1 */
+                pj_dpr(&t->e, 2u, 0, R1, R1,
+                       sub62 == 0u ? LR : R2, 0u, 0u);
+                pj_mov(&t->e, R2, LR);                    /* new CF */
+            } else {
+                pj_dpi(&t->e, 0u, 0, LR, R1, 1u);        /* outgoing bit0 */
+                pj_shift(&t->e, R1, R1, 1u, 1u);          /* LSR value,#1 */
+                if (sub62 == 1u) pj_shift(&t->e, R2, LR, 0u, bits62 - 1u);
+                else pj_shift(&t->e, R2, R2, 0u, bits62 - 1u);
+                pj_dpr(&t->e, 2u, 0, R1, R1, R2, 0u, 0u);
+                pj_mov(&t->e, R2, LR);                    /* new CF */
+            }
+            if (ww62 < 4u) pj_ubfx(&t->e, R1, R1, 0u, bits62);
+            pj_dpi(&t->e, 13u, 1, R3, R3, 1u);          /* SUBS remaining,#1 */
+            again62 = pj_b(&t->e, 1);                    /* BNE rotate loop */
+            pj_patch_b(again62, loop62);
+            /* Match old rotate helper: write CF and its deterministic OF,
+             * while preserving SF/ZF/PF/AF and all other guest flags. */
+            pj_ubfx(&t->e, R3, R1, bits62 - 1u, 1u);
+            if (sub62 == 0u || sub62 == 2u)
+                pj_dpr(&t->e, 4u, 0, R3, R3, R2, 0u, 0u);
+            else {
+                pj_ubfx(&t->e, LR, R1, bits62 - 2u, 1u);
+                pj_dpr(&t->e, 4u, 0, R3, R3, LR, 0u, 0u);
+            }
+            pj_shift(&t->e, R3, R3, 0u, 11u);
+            pj_dpr(&t->e, 2u, 0, R2, R2, R3, 0u, 0u);
+            if (!pj_dpi(&t->e, 1u, 0, R0, R0, B86_CF | B86_OF)) {
+                pj_movw(&t->e, LR, B86_CF | B86_OF);
+                pj_dpr(&t->e, 1u, 0, R0, R0, LR, 0u, 0u);
+            }
+            pj_dpr(&t->e, 2u, 0, R0, R0, R2, 0u, 0u);
+            pj_ldst(&t->e, PJ_STR, R0, CREG, (unsigned)offsetof(B86Cpu, flags));
+            /* Only counts other than one make OF architecturally undefined. */
+            pjt_get8(t, R3, 1u);
+            pj_dpi(&t->e, 0u, 0, R3, R3, 31u);
+            pj_dpi(&t->e, 13u, 1, PC, R3, 1u);   /* CMP masked CL,#1 */
+            one62 = pjt_bfwd(t, 0);             /* 1: don't set undefined-OF */
+            pj_ldst(&t->e, PJ_LDR, R3, CREG, (unsigned)offsetof(B86Cpu, pm40_undef));
+            pj_dpi(&t->e, 2u, 0, R3, R3, B86_OF);
+            pj_ldst(&t->e, PJ_STR, R3, CREG, (unsigned)offsetof(B86Cpu, pm40_undef));
+            pjt_here(t, one62);
+            pjt_putr(t, rm62, ww62, R1);       /* commit only after rotate completes */
+            pjt_here(t, zero62);
+            /* A zero-count runtime path may retain earlier lazy INC flags;
+             * do NOT assert the lazy-inc state is clear at this join. */
+            t->last_kind = -1;
+            t->ikind_clear = 0;
+            t->fuse_at = NULL;
+            return 1;                          /* continue translated native block */
+        }
+        if (op == 0xD2u) PJ_FAIL();            /* remaining D2 forms unchanged */
+    }
+#endif /* V62 native CL-count rotations */
     switch (op) {
     case 0x40: case 0x41: case 0x42: case 0x43: case 0x44: case 0x45: case 0x46: case 0x47:
     case 0x48: case 0x49: case 0x4A: case 0x4B: case 0x4C: case 0x4D: case 0x4E: case 0x4F:
@@ -2048,6 +2580,27 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
         pj_dpi(&t->e, 13u, 0, GR(4), GR(4), w);
         return 1;
     case 0x69: case 0x6B: {                          /* IMUL r, r/m, imm */
+#if B86_PJ_V71_MULWIDTH_BATCH
+        /* 66 69 /r iw and 66 6B /r ib: signed 16-bit IMUL.
+         * Source memory must be checked before touching registers/flags. */
+        if (w == 2u && o16 && np == 2u && !segpref && !repz && !repne) {
+            if (!pjt_modrm(t, &m)) PJ_FAIL();
+            pjt_rm_load(t, &m, 2u, 0, R1, &o);
+            if (op == 0x6Bu) {
+                if (!pjt_u8(t, &imm)) PJ_FAIL();
+                imm = (uint32_t)(int32_t)(int8_t)imm;
+            } else if (!pjt_imm(t, 2u, &imm)) PJ_FAIL();
+            pj_ext(&t->e, 0xFA0Fu, R1, R1);       /* SXTH src */
+            pj_imm32(&t->e, R0, (uint32_t)(int32_t)(int16_t)imm);
+            pje32(&t->e, 0xFB80u | R0,
+                  (R3 << 12) | (R2 << 8) | R1); /* SMULL R3:R2 */
+            pjt_v71_mul_overflow(t, 2u, 1);
+            pjt_putr(t, m.reg, 2u, R3);          /* only dest low half */
+            pjt_getr(t, R0, m.reg, 2u);
+            pjt_v71_mul_flags(t, 2u);
+            return 1;
+        }
+#endif /* V71 16-bit IMUL 69/6B */
         if (!pjt_modrm(t, &m)) PJ_FAIL();
         pjt_rm_load(t, &m, w, 0, R1, &o);
         if (op == 0x6Bu) { if (!pjt_u8(t, &imm)) PJ_FAIL(); imm = (uint32_t)(int32_t)(int8_t)imm; }
@@ -2079,7 +2632,54 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
         pjt_getr(t, R0, m.reg, ww);
         pjt_alu(t, 4u, ww, R3, R1, R0);
         return 1; }
-#if B86_PJ_V57_PM32_COVERAGE
+#if B86_PJ_V58_PM32_POPMEM
+    /* PM32 8F /0 memory destination, including 66-prefixed 16-bit POP.
+     * 80386 ordering: read [SS:old ESP], increment ESP, THEN evaluate
+     * the destination EA. Only SIB(base=ESP) depends on that increment.
+     * Compute EA with old ESP and adjust its R1 offset by width before
+     * validating the destination. ESP and memory stay unchanged on either
+     * failed access; the memtramp falls back to the interpreter at ip0.
+     * [SP+16] and [SP+4] are caller-owned scratch across memtramp calls.
+     * End after the store to avoid executing stale code after a write. */
+    case 0x8F: {
+        const unsigned mrpos = t->pos;
+        unsigned espbase;
+        if (!((np == 1u && !o16) || (np == 2u && o16)) ||
+            segpref || repz || repne || mrpos >= t->n ||
+            (t->b[mrpos] & 0x38u) != 0u) PJ_FAIL();
+        if ((t->b[mrpos] & 0xC0u) == 0xC0u) {
+            if (!pjt_modrm(t, &m) || m.mod != 3u || m.reg != 0u) PJ_FAIL();
+            pj_mov(&t->e, R1, GR(4));
+            pjt_mem(t, w, 0);
+            pj_dpi(&t->e, 8u, 0, GR(4), GR(4), w);
+            if (w == 4u) pj_ldst(&t->e, PJ_LDR, GR(m.rm), R0, 0u);
+            else { pjt_ld(t, R1, R0, 2u); pjt_putr(t, m.rm, 2u, R1); }
+            return 1;
+        }
+        /* Read the SIB base before the decoder advances its input. */
+        espbase = ((t->b[mrpos] & 7u) == 4u &&
+                   mrpos + 1u < t->n &&
+                   (t->b[mrpos + 1u] & 7u) == 4u);
+        if (!pjt_modrm(t, &m) || m.mod == 3u || m.reg != 0u) PJ_FAIL();
+        /* R1 = EA calculated with OLD ESP; preserve across stack read. */
+        pj_ldst(&t->e, PJ_STR, R1, SP, 16u);
+        pj_mov(&t->e, R1, GR(4));
+        pjt_mem(t, w, 0);
+        pjt_ld(t, R2, R0, w);
+        pj_ldst(&t->e, PJ_STR, R2, SP, 4u);
+        pj_ldst(&t->e, PJ_LDR, R1, SP, 16u);
+        if (espbase) pjt_addimm(t, R1, R1, w);
+        /* The checked WRITE resolves the final destination before any
+         * architectural state changes; failure remains replayable. */
+        pjt_mem(t, w, 1);
+        pj_ldst(&t->e, PJ_LDR, R2, SP, 4u);
+        pjt_st(t, R2, R0, w);
+        pj_dpi(&t->e, 8u, 0, GR(4), GR(4), w);
+        pjt_exit(t, PJ_NEXT(), t->ninsn, 2);
+        return 2;
+    }
+#endif /* B86_PJ_V58_PM32_POPMEM */
+#if B86_PJ_V57_PM32_COVERAGE && !B86_PJ_V58_PM32_POPMEM
     /* 8F /0 with mod=11: POP r16/r32. Reuse the existing PM32 checked
      * stack read, then increment ESP before writing the destination.
      * This order is essential for POP ESP and 66 POP SP. 8F memory forms
@@ -2192,6 +2792,22 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
         }
         return 1; }
     case 0xF5: case 0xF8: case 0xF9: case 0xFC: case 0xFD:
+#if B86_PJ_V70_FLAG_BATCH
+        /* Native CF updates; the materialized fast path performs NO C call.
+         * A prior lazy producer is still correctly committed before CF is
+         * overwritten, preserving SF/ZF/AF/PF/OF and the verifier state. */
+        if ((op == 0xF5u || op == 0xF8u || op == 0xF9u) &&
+            np == 1u && !o16 && !segpref && !repz && !repne) {
+            pjt_v70_flags_if_lazy(t);
+            pj_ldst(&t->e, PJ_LDR, R1, CREG,
+                    (unsigned)offsetof(B86Cpu, flags));
+            pj_dpi(&t->e, op == 0xF5u ? 4u : op == 0xF8u ? 1u : 2u,
+                   0, R1, R1, B86_CF);      /* EOR / BIC / ORR */
+            pj_ldst(&t->e, PJ_STR, R1, CREG,
+                    (unsigned)offsetof(B86Cpu, flags));
+            return 1;
+        }
+#endif /* V70 native carry flags */
 #if B86_PJ_V50_NATIVE_COVERAGE
         if (op == 0xFCu || op == 0xFDu) {
             /* CLD/STD change ONLY DF, which is never covered by lazy arithmetic
@@ -2210,6 +2826,92 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
         pjt_call(t, (const void *)b86_pj_flagop);
         t->last_kind = -1; t->ikind_clear = 1;      /* flags now materialized, lazy records cleared */
         return 1;
+#if B86_PJ_V70_FLAG_BATCH
+    /* V70 LAHF and SAHF: copy the FIVE status bits and fixed bit 1 exactly
+     * as PM20, without a C flag-transfer helper and without ending a block.
+     * LAHF does not change EFLAGS; SAHF preserves OF, DF, IF, IOPL and the
+     * remaining high bits. Pending earlier flags must be materialized first. */
+    case 0x9E: case 0x9F:
+        if (np != 1u || o16 || segpref || repz || repne) PJ_FAIL();
+        pjt_v70_flags_if_lazy(t);
+        pj_ldst(&t->e, PJ_LDR, R1, CREG, (unsigned)offsetof(B86Cpu, flags));
+        if (op == 0x9Fu) {                         /* LAHF -> AH */
+            pj_dpi(&t->e, 0u, 0, R1, R1, 0xD5u);
+            pj_dpi(&t->e, 2u, 0, R1, R1, 2u);
+            pjt_put8(t, 4u, R1);                   /* preserves AL, EAX[31:16] */
+        } else {                                    /* SAHF: AH -> status flags */
+            pj_dpi(&t->e, 1u, 0, R1, R1, 0xD5u); /* BIC old five bits */
+            pj_ubfx(&t->e, R2, GR(0), 8u, 8u);
+            pj_dpi(&t->e, 0u, 0, R2, R2, 0xD5u);
+            pj_dpr(&t->e, 2u, 0, R1, R1, R2, 0u, 0u);
+            pj_dpi(&t->e, 2u, 0, R1, R1, 2u);
+            pj_ldst(&t->e, PJ_STR, R1, CREG, (unsigned)offsetof(B86Cpu, flags));
+        }
+        return 1;
+    /* V70 PUSHF/PUSHFD: PM20 requires RF=VM=0 on the saved 32-bit image.
+     * Validate the writable SS:[ESP-width] FIRST. If denied, no lazy flags,
+     * register or memory state changes; checked C fallback retries it.
+     * A successful store exits to preserve the existing SMC invalidation. */
+    case 0x9C:
+        if (!((np == 1u && !o16) || (np == 2u && o16)) ||
+            segpref || repz || repne) PJ_FAIL();
+        pj_dpi(&t->e, 13u, 0, R1, GR(4), w); /* new stack offset, not committed */
+        pjt_mem(t, w, 1);                    /* checked write pointer or exit */
+        pj_ldst(&t->e, PJ_STR, R0, SP, 4u); /* preserve across materialization */
+        pjt_v70_flags_if_lazy(t);
+        pj_ldst(&t->e, PJ_LDR, R1, CREG, (unsigned)offsetof(B86Cpu, flags));
+        if (w == 4u) {
+            pj_imm32(&t->e, R2, ~(uint32_t)0x30000u);
+            pj_dpr(&t->e, 0u, 0, R1, R1, R2, 0u, 0u); /* RF,VM omitted */
+        }
+        pj_dpi(&t->e, 2u, 0, R1, R1, 2u);
+        pj_ldst(&t->e, PJ_LDR, R0, SP, 4u);
+        pjt_st(t, R1, R0, w);
+        pj_dpi(&t->e, 13u, 0, GR(4), GR(4), w);
+        pjt_exit(t, PJ_NEXT(), t->ninsn, 2);
+        return 2;
+    /* V70 POPF/POPFD: the flat protected-mode entry already implies CPL0,
+     * 32-bit SS and VM=0. Read from the checked stack without committing
+     * ESP, and reject an attempt to enter VM86 before any side effects.
+     * Commit IF/IOPL/TF and other privileged bits only on the fully checked
+     * path, then return to the dispatcher to re-check execution state. */
+    case 0x9D: {
+        uint8_t *acceptable;
+        if (!((np == 1u && !o16) || (np == 2u && o16)) ||
+            segpref || repz || repne) PJ_FAIL();
+        pj_mov(&t->e, R1, GR(4));
+        pjt_mem(t, w, 0);                    /* fault before any guest change */
+        pjt_ld(t, R1, R0, w);
+        pj_ldst(&t->e, PJ_STR, R1, SP, 4u);
+        if (w == 4u) {
+            pj_ubfx(&t->e, R2, R1, 17u, 1u); /* VM86 is unsupported */
+            pj_dpi(&t->e, 13u, 1, PC, R2, 0u);
+            pjt_exit_stay(t, 1 /* NE: retry checked interpreter */,
+                           t->ip0, t->ninsn - 1u);
+        }
+        pjt_v70_flags_if_lazy(t);
+        pj_ldst(&t->e, PJ_LDR, R1, SP, 4u);
+        pj_ldst(&t->e, PJ_LDR, R2, CREG,
+                (unsigned)offsetof(B86Cpu, flags));
+        if (w == 2u) {
+            pj_ubfx(&t->e, R1, R1, 0u, 16u);
+            pj_ubfx(&t->e, R2, R2, 16u, 16u);
+            pj_shift(&t->e, R2, R2, 0u, 16u);
+            pj_dpr(&t->e, 2u, 0, R1, R1, R2, 0u, 0u);
+        } else {                              /* POPFD preserves prior RF */
+            pj_imm32(&t->e, R3, 0x10000u);
+            pj_dpr(&t->e, 0u, 0, R2, R2, R3, 0u, 0u);
+            pj_dpr(&t->e, 1u, 0, R1, R1, R3, 0u, 0u);
+            pj_dpr(&t->e, 2u, 0, R1, R1, R2, 0u, 0u);
+        }
+        pj_dpi(&t->e, 2u, 0, R1, R1, 2u);
+        pj_ldst(&t->e, PJ_STR, R1, CREG,
+                (unsigned)offsetof(B86Cpu, flags));
+        pj_dpi(&t->e, 8u, 0, GR(4), GR(4), w);
+        pjt_exit(t, PJ_NEXT(), t->ninsn, 2);
+        return 2;
+    }
+#endif /* V70 LAHF/SAHF/PUSHF/POPF */
     case 0x91: case 0x92: case 0x93: case 0x94: case 0x95: case 0x96: case 0x97:   /* XCHG eAX, r */
         pjt_getr(t, R1, 0u, w); pjt_getr(t, R2, op & 7u, w);
         pjt_putr(t, 0u, w, R2); pjt_putr(t, op & 7u, w, R1);
@@ -2250,6 +2952,33 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
         pjt_exit(t, PJ_NEXT(), t->ninsn, 2); /* re-check flatness */
         return 2;
     case 0xA4: case 0xA5: case 0xAA: case 0xAB: case 0xAC: case 0xAD: {   /* string ops through a helper */
+#if B86_PJ_V59_PM32_LODS_XLAT
+    /* Non-REP LODSB/LODSW/LODSD: AL/AX/EAX <- DS:[ESI], then ESI
+     * advances by +/-operand width according to DF.  No arithmetic flags
+     * change.  Read refusal must occur before touching EAX or ESI.
+     * The DS-flat PM32 entry contract already guards non-flat segments;
+     * segment, REP, and address-size prefixes retain the original path. */
+    if ((op == 0xACu || op == 0xADu) && !repz && !repne &&
+        !segpref && !es_override &&
+        (np == 1u || (op == 0xADu && np == 2u && o16))) {
+        const unsigned ww = op == 0xACu ? 1u : w;
+        uint8_t *backward, *done;
+        pj_mov(&t->e, R1, GR(6));                /* ESI (address-size 32) */
+        pjt_mem(t, ww, 0);                       /* checked read, no commit on fail */
+        pjt_ld(t, R1, R0, ww);
+        pjt_putr(t, 0u, ww, R1);                 /* AL / AX / EAX */
+        pjt_c(t);
+        pj_ldst(&t->e, PJ_LDR, R2, CREG, (unsigned)offsetof(B86Cpu, flags));
+        pj_dpi(&t->e, 0u, 1, R2, R2, B86_DF);  /* ANDS sets ARM flags only */
+        backward = pjt_bfwd(t, 1 /* NE: DF=1 */);
+        pjt_addimm(t, GR(6), GR(6), ww);         /* DF=0 */
+        done = pjt_bfwd(t, -1);
+        pjt_here(t, backward);
+        pjt_addimm(t, GR(6), GR(6), 0u - ww);   /* DF=1 */
+        pjt_here(t, done);
+        return 1;                                /* continuous Thumb-2 */
+    }
+#endif /* V59 native non-REP LODS */
         const unsigned ww = (op & 1u) ? w : 1u;
         if (repz && op >= 0xACu) PJ_FAIL();
         pjt_c(t);
@@ -2315,7 +3044,307 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
         if (w == 4u) pj_imm32(&t->e, GR(op & 7u), imm);
         else { pj_movw(&t->e, R1, imm); pjt_putr(t, op & 7u, 2u, R1); }
         return 1;
+#if B86_PJ_V59_PM32_LODS_XLAT
+    /* XLATB: AL = DS:[EBX + zero_extend(AL)].  Flat-DS + address32 only.
+     * No implicit segment state, flags, or guest memory writes are changed;
+     * a rejected memory access goes to the existing interpreter unchanged. */
+    case 0xD7:
+        if (np != 1u || o16 || segpref || repz || repne) PJ_FAIL();
+        pjt_get8(t, R2, 0u);                      /* unsigned old AL */
+        pj_dpr(&t->e, 8u, 0, R1, GR(3), R2, 0u, 0u); /* EBX + AL */
+        pjt_mem(t, 1u, 0);                       /* checked DS:linear read */
+        pjt_ld(t, R1, R0, 1u);
+        pjt_put8(t, 0u, R1);                      /* only AL changes */
+        return 1;                                /* continue native block */
+#endif /* V59 XLAT */
     case 0xC0: case 0xC1: case 0xD0: case 0xD1: {
+#if B86_PJ_V63_ROTATE_MEMIMM
+        /* V63: memory-destination immediate-count ROL/ROR/RCL/RCR.
+         * Restricted to the original 32-bit addressing/flat DS contract.
+         * No guest side effects until the checked write pointer succeeds.
+         * The trampoline already checks paging, access width and SMC.
+         * The memory value and C flags are then committed, followed by an
+         * unconditional unlinked exit so invalidated code cannot continue. */
+        if (!segpref && !repz && !repne &&
+            ((np == 1u && !o16) || (np == 2u && o16 && (op & 1u))) &&
+            t->pos < t->n && (t->b[t->pos] & 0xC0u) != 0xC0u &&
+            ((t->b[t->pos] >> 3u) & 7u) <= 3u) {
+            const unsigned ww63 = (op & 1u) ? w : 1u;
+            const unsigned bits63 = 8u * ww63;
+            const unsigned sub63 = (t->b[t->pos] >> 3u) & 7u;
+            unsigned count63 = 1u;
+            uint8_t *ready63, *loop63, *again63;
+            if (ww63 != 1u && ww63 != 2u && ww63 != 4u) PJ_FAIL();
+            if (!pjt_modrm(t, &m) || m.mod == 3u || m.reg != sub63) PJ_FAIL();
+            if (op == 0xC0u || op == 0xC1u) {
+                uint32_t imm63;
+                if (!pjt_u8(t, &imm63)) PJ_FAIL();
+                count63 = imm63 & 31u;
+            }
+            /* Retain the prior interpreter path for memory count zero:
+             * even an apparent NOP may have a memory-fault side effect. */
+            if (count63 == 0u) PJ_FAIL();
+            pjt_rm_load(t, &m, ww63, 1, R1, &o);
+            /* The shared memt call must complete before flags or memory
+             * changes. Its checked pointer is saved at [SP+4]. */
+            pjt_c(t);
+            pj_ldst(&t->e, PJ_LDR, R2, CREG,
+                    (unsigned)offsetof(B86Cpu, lz_kind));
+            pj_ldst(&t->e, PJ_LDR, R3, CREG,
+                    (unsigned)offsetof(B86Cpu, lz_ikind));
+            pj_dpr(&t->e, 2u, 1, R2, R2, R3, 0u, 0u); /* ORRS */
+            ready63 = pjt_bfwd(t, 0 /* EQ: previous flags already materialized */);
+            pj_mov(&t->e, R0, CREG);
+            pjt_call(t, (const void *)b86_flags_materialize);
+            pjt_c(t);
+            pjt_here(t, ready63);
+            pj_ldst(&t->e, PJ_LDR, R0, CREG,
+                    (unsigned)offsetof(B86Cpu, flags));
+            pj_ldst(&t->e, PJ_LDR, R1, SP, 4u);
+            pjt_ld(t, R1, R1, ww63);       /* original value, reloaded after C */
+            pj_movw(&t->e, R3, count63);   /* bounded runtime count 1..31 */
+            pj_dpi(&t->e, 0u, 0, R2, R0, B86_CF);
+            loop63 = t->e.p;
+            if (sub63 == 0u || sub63 == 2u) {
+                pj_ubfx(&t->e, LR, R1, bits63 - 1u, 1u);
+                pj_shift(&t->e, R1, R1, 0u, 1u);
+                pj_dpr(&t->e, 2u, 0, R1, R1,
+                       sub63 == 0u ? LR : R2, 0u, 0u);
+                pj_mov(&t->e, R2, LR);
+            } else {
+                pj_dpi(&t->e, 0u, 0, LR, R1, 1u);
+                pj_shift(&t->e, R1, R1, 1u, 1u);
+                if (sub63 == 1u)
+                    pj_shift(&t->e, R2, LR, 0u, bits63 - 1u);
+                else
+                    pj_shift(&t->e, R2, R2, 0u, bits63 - 1u);
+                pj_dpr(&t->e, 2u, 0, R1, R1, R2, 0u, 0u);
+                pj_mov(&t->e, R2, LR);
+            }
+            if (ww63 < 4u) pj_ubfx(&t->e, R1, R1, 0u, bits63);
+            pj_dpi(&t->e, 13u, 1, R3, R3, 1u); /* SUBS remaining,#1 */
+            again63 = pj_b(&t->e, 1);            /* BNE loop */
+            pj_patch_b(again63, loop63);
+            /* Match the old rotate C helper's deterministic CF/OF even for
+             * counts >1, where OF is architecturally undefined. */
+            pj_ubfx(&t->e, R3, R1, bits63 - 1u, 1u);
+            if (sub63 == 0u || sub63 == 2u)
+                pj_dpr(&t->e, 4u, 0, R3, R3, R2, 0u, 0u);
+            else {
+                pj_ubfx(&t->e, LR, R1, bits63 - 2u, 1u);
+                pj_dpr(&t->e, 4u, 0, R3, R3, LR, 0u, 0u);
+            }
+            pj_shift(&t->e, R3, R3, 0u, 11u);
+            pj_dpr(&t->e, 2u, 0, R2, R2, R3, 0u, 0u);
+            if (!pj_dpi(&t->e, 1u, 0, R0, R0, B86_CF | B86_OF)) {
+                pj_movw(&t->e, LR, B86_CF | B86_OF);
+                pj_dpr(&t->e, 1u, 0, R0, R0, LR, 0u, 0u);
+            }
+            pj_dpr(&t->e, 2u, 0, R0, R0, R2, 0u, 0u);
+            pj_ldst(&t->e, PJ_STR, R0, CREG,
+                    (unsigned)offsetof(B86Cpu, flags));
+            if (count63 != 1u) {
+                pj_ldst(&t->e, PJ_LDR, R3, CREG,
+                        (unsigned)offsetof(B86Cpu, pm40_undef));
+                pj_dpi(&t->e, 2u, 0, R3, R3, B86_OF);
+                pj_ldst(&t->e, PJ_STR, R3, CREG,
+                        (unsigned)offsetof(B86Cpu, pm40_undef));
+            }
+            pjt_rm_store(t, &o, ww63, R1);
+            pjt_exit(t, PJ_NEXT(), t->ninsn, 2); /* unlinked SMC-safe exit */
+            t->last_kind = -1;
+            t->ikind_clear = 1;
+            t->fuse_at = NULL;
+            return 2;
+        }
+#endif /* V63 native memory immediate rotates */
+#if B86_PJ_V60_ROTATE_REG1
+    { /* New path scoped to avoid shadowing original rotate locals. */
+    /* PM32 ROL/ROR/RCL/RCR r8/r16/r32, masked count==1.  The register
+     * ModRM is peeked without running the EA decoder.  Failed admission
+     * leaves t->pos untouched and executes the unchanged v59 path. */
+        const unsigned ww = (op & 1u) ? w : 1u;
+        const int allowed_prefix = (op & 1u) ?
+            (np == 1u || (np == 2u && o16)) : (np == 1u);
+        if (allowed_prefix && t->pos < t->n &&
+            (t->b[t->pos] & 0xC0u) == 0xC0u &&
+            ((t->b[t->pos] >> 3u) & 7u) <= 3u &&
+            (ww == 1u || ww == 2u || ww == 4u)) {
+            const unsigned raw = t->b[t->pos];
+            const unsigned sub = (raw >> 3u) & 7u;
+            const unsigned rm = raw & 7u;
+            const unsigned bits = ww * 8u;
+            const int immediate = op == 0xC0u || op == 0xC1u;
+            const unsigned count = immediate && t->pos + 1u < t->n ?
+                (t->b[t->pos + 1u] & 31u) : (!immediate ? 1u : 0u);
+            if (count == 1u) {
+                uint8_t *flags_ready;
+                t->pos += immediate ? 2u : 1u;
+                /* Reconcile earlier ADD/INC/etc lazy records, but only when
+                 * either lazy kind is nonzero.  This is the sole conditional
+                 * C call on this native instruction path.  It occurs before
+                 * ANY guest GPR or EFLAGS mutation. */
+                pjt_c(t);
+                pj_ldst(&t->e, PJ_LDR, R2, CREG, (unsigned)offsetof(B86Cpu, lz_kind));
+                pj_ldst(&t->e, PJ_LDR, R3, CREG, (unsigned)offsetof(B86Cpu, lz_ikind));
+                pj_dpr(&t->e, 2u, 1, R2, R2, R3, 0u, 0u); /* ORRS / test either */
+                flags_ready = pjt_bfwd(t, 0 /* EQ: no lazy flags */);
+                pj_mov(&t->e, R0, CREG);
+                pjt_call(t, (const void *)b86_flags_materialize);
+                pjt_c(t);
+                pjt_here(t, flags_ready);
+                /* All other x86 arithmetic flags must be preserved. */
+                pj_ldst(&t->e, PJ_LDR, R0, CREG, (unsigned)offsetof(B86Cpu, flags));
+                pj_dpi(&t->e, 0u, 0, R3, R0, B86_CF); /* previous CF: 0/1 */
+                pjt_getr(t, R1, rm, ww);
+                if (sub == 0u || sub == 2u) { /* ROL / RCL */
+                    pj_ubfx(&t->e, R2, R1, bits - 1u, 1u); /* outgoing CF */
+                    pj_shift(&t->e, R1, R1, 0u, 1u);
+                    pj_dpr(&t->e, 2u, 0, R1, R1, sub == 0u ? R2 : R3, 0u, 0u);
+                    if (ww < 4u) pj_ubfx(&t->e, R1, R1, 0u, bits);
+                    pj_ubfx(&t->e, R3, R1, bits - 1u, 1u);
+                    pj_dpr(&t->e, 4u, 0, R3, R3, R2, 0u, 0u); /* OF */
+                } else { /* ROR / RCR */
+                    pj_dpi(&t->e, 0u, 0, R2, R1, 1u);  /* outgoing CF */
+                    pj_shift(&t->e, R1, R1, 1u, 1u);
+                    pj_shift(&t->e, R3, sub == 1u ? R2 : R3, 0u, bits - 1u);
+                    pj_dpr(&t->e, 2u, 0, R1, R1, R3, 0u, 0u);
+                    pj_ubfx(&t->e, R3, R1, bits - 1u, 1u);
+                    pj_ubfx(&t->e, LR, R1, bits - 2u, 1u);
+                    pj_dpr(&t->e, 4u, 0, R3, R3, LR, 0u, 0u); /* OF */
+                }
+                /* Merge only CF/OF into materialized EFLAGS. */
+                pj_shift(&t->e, R3, R3, 0u, 11u);
+                pj_dpr(&t->e, 2u, 0, R2, R2, R3, 0u, 0u);
+                if (!pj_dpi(&t->e, 1u, 0, R0, R0, (B86_CF | B86_OF))) {
+                    pj_movw(&t->e, LR, (B86_CF | B86_OF));
+                    pj_dpr(&t->e, 1u, 0, R0, R0, LR, 0u, 0u);
+                }
+                pj_dpr(&t->e, 2u, 0, R0, R0, R2, 0u, 0u);
+                pj_ldst(&t->e, PJ_STR, R0, CREG, (unsigned)offsetof(B86Cpu, flags));
+                pjt_putr(t, rm, ww, R1);
+                t->last_kind = -1;
+                t->ikind_clear = 1;
+                t->fuse_at = NULL;
+                return 1; /* continue same native block, no interpreter */
+            }
+        }
+        /* All non-admitted encodings run the exact original rotate path. */
+    }
+#endif /* V60 PM32 native register rotates */
+#if B86_PJ_V61_ROTATE_IMM
+    {   /* C0/C1 rotate r8/r16/r32 by immediate: all masked 0..31 counts.
+         * V60 already owns count 1; only zero and 2..31 reach this code.
+         * No parser state is changed for a non-admitted instruction. */
+        const unsigned ww61 = (op & 1u) ? w : 1u;
+        const int pref61 = (op & 1u) ?
+            (np == 1u || (np == 2u && o16)) : (np == 1u);
+        if ((op == 0xC0u || op == 0xC1u) && pref61 &&
+            t->pos + 1u < t->n &&
+            (t->b[t->pos] & 0xC0u) == 0xC0u &&
+            ((t->b[t->pos] >> 3u) & 7u) <= 3u &&
+            (ww61 == 1u || ww61 == 2u || ww61 == 4u)) {
+            const unsigned mod61 = t->b[t->pos];
+            const unsigned sub61 = (mod61 >> 3u) & 7u;
+            const unsigned rm61 = mod61 & 7u;
+            const unsigned bits61 = ww61 * 8u;
+            const unsigned count61 = t->b[t->pos + 1u] & 31u;
+            if (count61 == 0u) { /* Architectural NOP: NO flag materialization. */
+                t->pos += 2u;
+                return 1;
+            }
+            if (count61 >= 2u) {
+                const unsigned ring61 = bits61 + 1u;
+                const unsigned steps61 = (sub61 <= 1u) ?
+                    (count61 % bits61) : (count61 % ring61);
+                uint8_t *ready61;
+                t->pos += 2u;
+                /* Resolve prior lazy arithmetic flags before updating CF/OF;
+                 * no helper call for already materialized flags. */
+                pjt_c(t);
+                pj_ldst(&t->e, PJ_LDR, R2, CREG,
+                        (unsigned)offsetof(B86Cpu, lz_kind));
+                pj_ldst(&t->e, PJ_LDR, R3, CREG,
+                        (unsigned)offsetof(B86Cpu, lz_ikind));
+                pj_dpr(&t->e, 2u, 1, R2, R2, R3, 0u, 0u);
+                ready61 = pjt_bfwd(t, 0 /* EQ */);
+                pj_mov(&t->e, R0, CREG);
+                pjt_call(t, (const void *)b86_flags_materialize);
+                pjt_c(t);
+                pjt_here(t, ready61);
+                pj_ldst(&t->e, PJ_LDR, R0, CREG,
+                        (unsigned)offsetof(B86Cpu, flags));
+                pjt_getr(t, R1, rm61, ww61);
+                if (sub61 == 0u || sub61 == 1u) { /* ROL/ROR */
+                    if (steps61) {
+                        if (sub61 == 0u) {
+                            pj_shift(&t->e, LR, R1, 0u, steps61);
+                            pj_shift(&t->e, R1, R1, 1u, bits61 - steps61);
+                        } else {
+                            pj_shift(&t->e, LR, R1, 1u, steps61);
+                            pj_shift(&t->e, R1, R1, 0u, bits61 - steps61);
+                        }
+                        pj_dpr(&t->e, 2u, 0, R1, R1, LR, 0u, 0u);
+                        if (ww61 < 4u)
+                            pj_ubfx(&t->e, R1, R1, 0u, bits61);
+                    }
+                    if (sub61 == 0u)
+                        pj_dpi(&t->e, 0u, 0, R2, R1, 1u); /* CF=bit0 */
+                    else pj_ubfx(&t->e, R2, R1, bits61 - 1u, 1u);
+                } else { /* RCL/RCR: rotate the (operand:CF) 9/17/33-bit ring */
+                    pj_dpi(&t->e, 0u, 0, R3, R0, B86_CF); /* old carry */
+                    if (steps61) {
+                        if (sub61 == 2u) { /* RCL: new CF from old bit(bits-steps) */
+                            pj_ubfx(&t->e, R2, R1, bits61 - steps61, 1u);
+                            pj_shift(&t->e, LR, R1, 0u, steps61);
+                            pj_shift(&t->e, R1, R1, 1u, ring61 - steps61);
+                            pj_dpr(&t->e, 2u, 0, R1, R1, LR, 0u, 0u);
+                            pj_shift(&t->e, LR, R3, 0u, steps61 - 1u);
+                        } else { /* RCR: new CF from old bit(steps-1) */
+                            pj_ubfx(&t->e, R2, R1, steps61 - 1u, 1u);
+                            pj_shift(&t->e, LR, R1, 0u, ring61 - steps61);
+                            pj_shift(&t->e, R1, R1, 1u, steps61);
+                            pj_dpr(&t->e, 2u, 0, R1, R1, LR, 0u, 0u);
+                            pj_shift(&t->e, LR, R3, 0u, bits61 - steps61);
+                        }
+                        pj_dpr(&t->e, 2u, 0, R1, R1, LR, 0u, 0u);
+                        if (ww61 < 4u)
+                            pj_ubfx(&t->e, R1, R1, 0u, bits61);
+                    } else pj_mov(&t->e, R2, R3); /* Full ring cycle. */
+                }
+                /* Compute the same OF value as b86_pj_c1_rotate even
+                 * when count>1 (OF is architecturally undefined there). */
+                pj_ubfx(&t->e, R3, R1, bits61 - 1u, 1u);
+                if (sub61 == 0u || sub61 == 2u)
+                    pj_dpr(&t->e, 4u, 0, R3, R3, R2, 0u, 0u);
+                else {
+                    pj_ubfx(&t->e, LR, R1, bits61 - 2u, 1u);
+                    pj_dpr(&t->e, 4u, 0, R3, R3, LR, 0u, 0u);
+                }
+                pj_shift(&t->e, R3, R3, 0u, 11u);
+                pj_dpr(&t->e, 2u, 0, R2, R2, R3, 0u, 0u);
+                if (!pj_dpi(&t->e, 1u, 0, R0, R0, B86_CF | B86_OF)) {
+                    pj_movw(&t->e, LR, B86_CF | B86_OF);
+                    pj_dpr(&t->e, 1u, 0, R0, R0, LR, 0u, 0u);
+                }
+                pj_dpr(&t->e, 2u, 0, R0, R0, R2, 0u, 0u);
+                pj_ldst(&t->e, PJ_STR, R0, CREG,
+                        (unsigned)offsetof(B86Cpu, flags));
+                /* As in the C helper, OF after count>1 is undefined. */
+                pj_ldst(&t->e, PJ_LDR, R3, CREG,
+                        (unsigned)offsetof(B86Cpu, pm40_undef));
+                pj_dpi(&t->e, 2u, 0, R3, R3, B86_OF);
+                pj_ldst(&t->e, PJ_STR, R3, CREG,
+                        (unsigned)offsetof(B86Cpu, pm40_undef));
+                pjt_putr(t, rm61, ww61, R1);
+                t->last_kind = -1;
+                t->ikind_clear = 1;
+                t->fuse_at = NULL;
+                return 1; /* Continue same native block. */
+            }
+        }
+    }
+#endif /* V61 native immediate rotates */
         const unsigned ww = (op & 1u) ? w : 1u;
         unsigned n;
         if (!pjt_modrm(t, &m) || (m.reg > 3u && m.reg != 4u && m.reg != 5u && m.reg != 7u)) PJ_FAIL();
@@ -2482,6 +3511,39 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
         return 2;
     case 0xF6: case 0xF7: {
         const unsigned ww = op == 0xF6u ? 1u : w;
+#if B86_PJ_V71_MULWIDTH_BATCH
+        /* F6 /4,/5 (8-bit) and 66 F7 /4,/5 (16-bit): AX or DX:AX.
+         * The src read is checked before registers or flags are changed;
+         * signed operations sign-extend each operand before SMULL. */
+        if ((ww == 1u && np == 1u && !o16 ||
+             ww == 2u && np == 2u && o16) &&
+            !segpref && !repz && !repne && t->pos < t->n &&
+            (((t->b[t->pos] >> 3u) & 7u) == 4u ||
+             ((t->b[t->pos] >> 3u) & 7u) == 5u)) {
+            unsigned sub;
+            if (!pjt_modrm(t, &m)) PJ_FAIL();
+            sub = m.reg;
+            pjt_rm_load(t, &m, ww, 0, R1, &o);
+            pjt_getr(t, R0, 0u, ww);
+            if (sub == 5u) {
+                pj_ext(&t->e, ww == 1u ? 0xFA4Fu : 0xFA0Fu, R0, R0);
+                pj_ext(&t->e, ww == 1u ? 0xFA4Fu : 0xFA0Fu, R1, R1);
+            }
+            pje32(&t->e, (sub == 5u ? 0xFB80u : 0xFBA0u) | R0,
+                  (R3 << 12) | (R2 << 8) | R1); /* SMULL/UMULL R3:R2 */
+            pjt_v71_mul_overflow(t, ww, sub == 5u);
+            if (ww == 1u) {
+                pjt_putr(t, 0u, 2u, R3);       /* AX = full 16-bit product */
+            } else {
+                pj_ubfx(&t->e, R0, R3, 16u, 16u);
+                pjt_putr(t, 2u, 2u, R0);       /* DX = high 16 */
+                pjt_putr(t, 0u, 2u, R3);       /* AX = low 16 */
+            }
+            pjt_getr(t, R0, 0u, ww);           /* low result for lazy SZPC */
+            pjt_v71_mul_flags(t, ww);
+            return 1;
+        }
+#endif /* V71 F6/F7 narrow MUL/IMUL */
         if (!pjt_modrm(t, &m)) PJ_FAIL();
         if (m.reg == 0u) {                            /* TEST r/m, imm */
             pjt_rm_load(t, &m, ww, 0, R1, &o);
@@ -2568,6 +3630,252 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
         PJ_FAIL(); }
     case 0x0F:
         if (!pjt_u8(t, &op2)) PJ_FAIL();
+#if B86_PJ_V67_NATIVE_BITSCAN
+        /* V67: BSF/BSR on r/m16 or r/m32, register or checked-memory
+         * source. Only the default flat 32-bit addressing contract and
+         * an optional 66 operand-size override are admitted. The source
+         * is loaded BEFORE any x86 flag/register mutation; denied memory
+         * reads replay via the existing checked interpreter exit.
+         * Only ZF is architecturally defined; undefined-flag tracking
+         * matches the 386 contract and never invents other flag values. */
+        if ((op2 == 0xBCu || op2 == 0xBDu) &&
+            !segpref && !repz && !repne &&
+            (np == 1u || (np == 2u && o16)) &&
+            (w == 2u || w == 4u)) {
+            uint8_t *ready67, *zero67, *done67;
+            if (!pjt_modrm(t, &m)) PJ_FAIL();
+            pjt_rm_load(t, &m, w, 0, R1, &o);
+            /* A conditional call to the existing lazy-flags helper may
+             * clobber r0-r3; preserve the checked source exactly once. */
+            pj_ldst(&t->e, PJ_STR, R1, SP, 16u);
+            pjt_c(t);
+            pj_ldst(&t->e, PJ_LDR, R2, CREG,
+                    (unsigned)offsetof(B86Cpu, lz_kind));
+            pj_ldst(&t->e, PJ_LDR, R3, CREG,
+                    (unsigned)offsetof(B86Cpu, lz_ikind));
+            pj_dpr(&t->e, 2u, 1, R2, R2, R3, 0u, 0u);
+            ready67 = pjt_bfwd(t, 0 /* EQ: flags materialized */);
+            pj_mov(&t->e, R0, CREG);
+            pjt_call(t, (const void *)b86_flags_materialize);
+            pjt_c(t);
+            pjt_here(t, ready67);
+            pj_ldst(&t->e, PJ_LDR, R1, SP, 16u);
+            pj_ldst(&t->e, PJ_LDR, R0, CREG,
+                    (unsigned)offsetof(B86Cpu, flags));
+            pj_dpi(&t->e, 13u, 1, PC, R1, 0u); /* CMP source, #0 */
+            zero67 = pjt_bfwd(t, 0 /* EQ: destination UNCHANGED */);
+            pj_dpi(&t->e, 1u, 0, R0, R0, B86_ZF); /* BIC ZF */
+            if (op2 == 0xBCu) {
+                /* RBIT.W r2,r1; CLZ.W r2,r2: index of least set bit. */
+                pje32(&t->e, 0xFA90u | R1,
+                      0xF0A0u | (R2 << 8) | R1);
+                pje32(&t->e, 0xFAB0u | R2,
+                      0xF080u | (R2 << 8) | R2);
+            } else {
+                /* CLZ.W r2,r1; index = 31 - leading zero count. */
+                pje32(&t->e, 0xFAB0u | R1,
+                      0xF080u | (R2 << 8) | R1);
+                pj_movw(&t->e, R3, 31u);
+                pj_dpr(&t->e, 13u, 0, R2, R3, R2, 0u, 0u);
+            }
+            pjt_putr(t, m.reg, w, R2);
+            done67 = pjt_bfwd(t, -1);
+            pjt_here(t, zero67);
+            pj_dpi(&t->e, 2u, 0, R0, R0, B86_ZF); /* ORR ZF */
+            pjt_here(t, done67);
+            pj_ldst(&t->e, PJ_STR, R0, CREG,
+                    (unsigned)offsetof(B86Cpu, flags));
+            pj_ldst(&t->e, PJ_LDR, R2, CREG,
+                    (unsigned)offsetof(B86Cpu, pm40_undef));
+            /* ZF becomes defined even if an earlier instruction marked
+             * it undefined; the remaining arithmetic bits are undefined. */
+            pj_dpi(&t->e, 1u, 0, R2, R2, B86_ZF);
+            pj_imm32(&t->e, LR,
+                     B86_CF | B86_OF | B86_SF | B86_AF | B86_PF);
+            pj_dpr(&t->e, 2u, 0, R2, R2, LR, 0u, 0u);
+            pj_ldst(&t->e, PJ_STR, R2, CREG,
+                    (unsigned)offsetof(B86Cpu, pm40_undef));
+            t->last_kind = -1;
+            t->ikind_clear = 1;
+            t->fuse_at = NULL;
+            return 1; /* continue same translated block */
+        }
+#endif /* V67 native PM32 BSF/BSR */
+#if B86_PJ_V65_NATIVE_BITREG
+        /* V65: BT/BTS/BTR/BTC, register-only, 0F A3/AB/B3/BB and
+         * 0F BA /4..7 immediate-index forms. No linear memory, paging,
+         * or segment bypass: ALL memory destinations use original fallback.
+         * The bit index is masked to 15/31 for register operands, unlike
+         * memory bit strings where signed offsets select another word.
+         * Flags may be lazy from earlier x86 ALU instructions: materialize
+         * them BEFORE touching the destination or CF. */
+        if ((op2 == 0xA3u || op2 == 0xABu || op2 == 0xB3u ||
+             op2 == 0xBBu || op2 == 0xBAu) &&
+            !segpref && !repz && !repne &&
+            (np == 1u || (np == 2u && o16)) &&
+            (w == 2u || w == 4u) && t->pos < t->n &&
+            (t->b[t->pos] & 0xC0u) == 0xC0u &&
+            (op2 != 0xBAu ||
+             (((t->b[t->pos] >> 3u) & 7u) >= 4u))) {
+            const unsigned kind65 = op2 == 0xBAu ?
+                (((t->b[t->pos] >> 3u) & 7u) - 4u) :
+                (op2 == 0xA3u ? 0u : op2 == 0xABu ? 1u :
+                 op2 == 0xB3u ? 2u : 3u);
+            uint8_t *ready65;
+            if (!pjt_modrm(t, &m) || m.mod != 3u) PJ_FAIL();
+            if (op2 == 0xBAu && !pjt_u8(t, &imm)) PJ_FAIL();
+            pjt_c(t);
+            pj_ldst(&t->e, PJ_LDR, R2, CREG,
+                    (unsigned)offsetof(B86Cpu, lz_kind));
+            pj_ldst(&t->e, PJ_LDR, R3, CREG,
+                    (unsigned)offsetof(B86Cpu, lz_ikind));
+            pj_dpr(&t->e, 2u, 1, R2, R2, R3, 0u, 0u);
+            ready65 = pjt_bfwd(t, 0 /* EQ: no pending lazy flags */);
+            pj_mov(&t->e, R0, CREG);
+            pjt_call(t, (const void *)b86_flags_materialize);
+            pjt_c(t);
+            pjt_here(t, ready65);
+            pj_ldst(&t->e, PJ_LDR, R0, CREG,
+                    (unsigned)offsetof(B86Cpu, flags));
+            pjt_getr(t, R1, m.rm, w);       /* pre-instruction bit string */
+            if (op2 == 0xBAu) pj_movw(&t->e, R2, imm & (w * 8u - 1u));
+            else pjt_getr(t, R2, m.reg, w);
+            pj_dpi(&t->e, 0u, 0, R2, R2, w * 8u - 1u); /* AND index, 15/31 */
+            /* LSR.W r3,r1,r2 then AND #1: CF from OLD destination bit.
+             * This 32-bit Thumb-2 encoding was checked with armv8-m clang. */
+            pje32(&t->e, 0xFA21u, 0xF000u | (R3 << 8) | R2);
+            pj_dpi(&t->e, 0u, 0, R3, R3, 1u);
+            if (kind65 != 0u) {
+                /* LSL.W lr,lr,r2 yields 1 << bit index. */
+                pj_movw(&t->e, LR, 1u);
+                pje32(&t->e, 0xFA00u | LR, 0xF000u | (LR << 8) | R2);
+                if (kind65 == 1u)       /* BTS: set */
+                    pj_dpr(&t->e, 2u, 0, R1, R1, LR, 0u, 0u);
+                else if (kind65 == 2u)  /* BTR: clear */
+                    pj_dpr(&t->e, 1u, 0, R1, R1, LR, 0u, 0u);
+                else                    /* BTC: complement */
+                    pj_dpr(&t->e, 4u, 0, R1, R1, LR, 0u, 0u);
+                pjt_putr(t, m.rm, w, R1);
+            }
+            /* CF is the only defined result flag, as in i386_pm40.inc.
+             * Keep existing values of other flags and mirror its undefined
+             * bits so verification and deferred flag consumers agree. */
+            pj_dpi(&t->e, 1u, 0, R0, R0, B86_CF); /* BIC prior CF */
+            pj_dpr(&t->e, 2u, 0, R0, R0, R3, 0u, 0u);
+            pj_ldst(&t->e, PJ_STR, R0, CREG,
+                    (unsigned)offsetof(B86Cpu, flags));
+            pj_ldst(&t->e, PJ_LDR, R2, CREG,
+                    (unsigned)offsetof(B86Cpu, pm40_undef));
+            pj_imm32(&t->e, LR,
+                     B86_OF | B86_SF | B86_ZF | B86_AF | B86_PF);
+            pj_dpr(&t->e, 2u, 0, R2, R2, LR, 0u, 0u);
+            pj_ldst(&t->e, PJ_STR, R2, CREG,
+                    (unsigned)offsetof(B86Cpu, pm40_undef));
+            t->last_kind = -1;
+            t->ikind_clear = 1;
+            t->fuse_at = NULL;
+            return 1; /* continue native block, no interpreter on hit */
+        }
+#endif /* V65 native register bit operations */
+#if B86_PJ_V66_NATIVE_BITMEM
+        /* V66: native PM32 memory bit strings.  Unlike ModRM.mod=3,
+         * register-sourced indices are SIGNED: bit -1 selects the high
+         * bit of the preceding word.  The effective linear address R1
+         * is adjusted before the existing checked memory trampoline.
+         * No guest state is modified until the read/write pointer passes
+         * paging, segment/flat-mode, MMIO and SMC admission. */
+        if ((op2 == 0xA3u || op2 == 0xABu || op2 == 0xB3u ||
+             op2 == 0xBBu || op2 == 0xBAu) &&
+            !segpref && !repz && !repne &&
+            (np == 1u || (np == 2u && o16)) &&
+            (w == 2u || w == 4u) && t->pos < t->n &&
+            (t->b[t->pos] & 0xC0u) != 0xC0u &&
+            (op2 != 0xBAu ||
+             (((t->b[t->pos] >> 3u) & 7u) >= 4u))) {
+            const unsigned kind66 = op2 == 0xBAu ?
+                (((t->b[t->pos] >> 3u) & 7u) - 4u) :
+                (op2 == 0xA3u ? 0u : op2 == 0xABu ? 1u :
+                 op2 == 0xB3u ? 2u : 3u);
+            const unsigned bitshift66 = w == 4u ? 5u : 4u;
+            uint8_t *ready66;
+            if (!pjt_modrm(t, &m) || m.mod == 3u) PJ_FAIL();
+            if (op2 == 0xBAu && !pjt_u8(t, &imm)) PJ_FAIL();
+            if (op2 != 0xBAu) {
+                /* Reg index is signed 32-bit or sign-extended 16-bit.
+                 * ASR rounds negative values toward -infinity as required:
+                 * -1 => previous word, bit 31 or 15.  The add wraps 32-bit. */
+                pjt_getr(t, R2, m.reg, w);
+                if (w == 2u) pj_ext(&t->e, 0xFA0Fu, R2, R2); /* SXTH */
+                pj_shift(&t->e, R2, R2, 2u, bitshift66); /* ASR */
+                pj_dpr(&t->e, 8u, 0, R1, R1, R2, 0u,
+                       w == 4u ? 2u : 1u); /* ADD addr,wordindex*width */
+            }
+            /* Checked read for BT; checked writable pointer for the
+             * three modifiers.  The translator saves the host pointer
+             * and the value exactly once: the optional flags helper may
+             * clobber scratch registers, but must never duplicate an MMIO
+             * read or turn a denied write into a partial instruction. */
+            pjt_mem(t, w, kind66 != 0u);
+            pj_ldst(&t->e, PJ_STR, R0, SP, 4u); /* checked host pointer */
+            pjt_ld(t, R1, R0, w);
+            pj_ldst(&t->e, PJ_STR, R1, SP, 16u); /* original operand */
+            pjt_c(t);
+            pj_ldst(&t->e, PJ_LDR, R2, CREG,
+                    (unsigned)offsetof(B86Cpu, lz_kind));
+            pj_ldst(&t->e, PJ_LDR, R3, CREG,
+                    (unsigned)offsetof(B86Cpu, lz_ikind));
+            pj_dpr(&t->e, 2u, 1, R2, R2, R3, 0u, 0u);
+            ready66 = pjt_bfwd(t, 0 /* EQ: flags already materialized */);
+            pj_mov(&t->e, R0, CREG);
+            pjt_call(t, (const void *)b86_flags_materialize);
+            pjt_c(t);
+            pjt_here(t, ready66);
+            pj_ldst(&t->e, PJ_LDR, R0, CREG,
+                    (unsigned)offsetof(B86Cpu, flags));
+            pj_ldst(&t->e, PJ_LDR, R1, SP, 16u);
+            if (op2 == 0xBAu) pj_movw(&t->e, R2, imm & (w * 8u - 1u));
+            else pjt_getr(t, R2, m.reg, w);
+            pj_dpi(&t->e, 0u, 0, R2, R2, w * 8u - 1u); /* low bit index */
+            pje32(&t->e, 0xFA21u, 0xF000u | (R3 << 8) | R2); /* LSR.W R3,R1,R2 */
+            pj_dpi(&t->e, 0u, 0, R3, R3, 1u);          /* old selected bit */
+            if (kind66 != 0u) {
+                pj_movw(&t->e, LR, 1u);
+                pje32(&t->e, 0xFA00u | LR,
+                      0xF000u | (LR << 8) | R2);        /* LSL.W LR,LR,R2 */
+                if (kind66 == 1u)       /* BTS */
+                    pj_dpr(&t->e, 2u, 0, R1, R1, LR, 0u, 0u);
+                else if (kind66 == 2u)  /* BTR */
+                    pj_dpr(&t->e, 1u, 0, R1, R1, LR, 0u, 0u);
+                else                    /* BTC */
+                    pj_dpr(&t->e, 4u, 0, R1, R1, LR, 0u, 0u);
+                pj_ldst(&t->e, PJ_STR, R1, SP, 16u);
+            }
+            /* BT family defines only CF; preserve unrelated FLAGS and
+             * match the PM40 interpreter's architecturally-undefined bits. */
+            pj_dpi(&t->e, 1u, 0, R0, R0, B86_CF);
+            pj_dpr(&t->e, 2u, 0, R0, R0, R3, 0u, 0u);
+            pj_ldst(&t->e, PJ_STR, R0, CREG,
+                    (unsigned)offsetof(B86Cpu, flags));
+            pj_ldst(&t->e, PJ_LDR, R2, CREG,
+                    (unsigned)offsetof(B86Cpu, pm40_undef));
+            pj_imm32(&t->e, LR,
+                     B86_OF | B86_SF | B86_ZF | B86_AF | B86_PF);
+            pj_dpr(&t->e, 2u, 0, R2, R2, LR, 0u, 0u);
+            pj_ldst(&t->e, PJ_STR, R2, CREG,
+                    (unsigned)offsetof(B86Cpu, pm40_undef));
+            t->last_kind = -1;
+            t->ikind_clear = 1;
+            t->fuse_at = NULL;
+            if (kind66 != 0u) {
+                pj_ldst(&t->e, PJ_LDR, R0, SP, 4u);
+                pj_ldst(&t->e, PJ_LDR, R1, SP, 16u);
+                pjt_st(t, R1, R0, w);
+                pjt_exit(t, PJ_NEXT(), t->ninsn, 2); /* unlinked SMC-safe exit */
+                return 2;
+            }
+            return 1; /* read-only BT continues in the native block */
+        }
+#endif /* V66 native memory bit-string operations */
         /* BB_PJ_SHIFTD_GS_X87_V1: native SHLD/SHRD r/m16/32,r,imm8.
          * Read the immediate before emitting any memory access, so a count
          * of zero is a true no-op and the PM27-undefined 16-bit range stays
@@ -2581,6 +3889,95 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
             n = c8 & 31u;
             if (n > 8u * w) PJ_FAIL();
             if (!n) return 1;
+#if B86_PJ_V69_SHIFTD_BATCH
+            /* Covers register and writable-memory destinations, 16/32-bit,
+             * immediate counts 1..bits, without result/flag C helpers. */
+            if (!repne && !segpref && (np == 1u || (np == 2u && o16)) &&
+                (w == 2u || w == 4u))
+                return pjt_v69_shiftd(t, &m, w, op2 == 0xA4u, 0, n, PJ_NEXT());
+#endif
+#if B86_PJ_V68_SHIFTD_IMM_REG
+            /* PM32 0F A4/AC: 32-bit register SHLD/SHRD with a known
+             * nonzero count. Only a fully decoded register destination
+             * is eligible; no guest memory or segment state is touched.
+             * Materialize any preceding lazy flags once, BEFORE modifying
+             * the output register. Preserve AF, old OF for n>1, and all
+             * non-arithmetic flag bits exactly like b86_pj_shiftd_imm. */
+            if (w == 4u && m.mod == 3u && !o16 && !segpref &&
+                !repne && np == 1u && n <= 31u) {
+                uint8_t *ready68, *nonzero68;
+                pjt_c(t);
+                pj_ldst(&t->e, PJ_LDR, R2, CREG,
+                        (unsigned)offsetof(B86Cpu, lz_kind));
+                pj_ldst(&t->e, PJ_LDR, R3, CREG,
+                        (unsigned)offsetof(B86Cpu, lz_ikind));
+                pj_dpr(&t->e, 2u, 1, R2, R2, R3, 0u, 0u);
+                ready68 = pjt_bfwd(t, 0 /* EQ: flags already materialized */);
+                pj_mov(&t->e, R0, CREG);
+                pjt_call(t, (const void *)b86_flags_materialize);
+                pjt_c(t);
+                pjt_here(t, ready68);
+                pjt_getr(t, R1, m.rm, 4u);       /* original destination */
+                pjt_getr(t, R2, m.reg, 4u);      /* original source */
+                if (op2 == 0xA4u) {
+                    pj_shift(&t->e, R3, R1, 0u, n);
+                    pj_shift(&t->e, LR, R2, 1u, 32u - n);
+                } else {
+                    pj_shift(&t->e, R3, R1, 1u, n);
+                    pj_shift(&t->e, LR, R2, 0u, 32u - n);
+                }
+                pj_dpr(&t->e, 2u, 0, R3, R3, LR, 0u, 0u);
+                /* Shifted-out bit of the ORIGINAL destination -> CF. */
+                pj_ubfx(&t->e, R2, R1,
+                        op2 == 0xA4u ? 32u - n : n - 1u, 1u);
+                pj_ldst(&t->e, PJ_LDR, R0, CREG,
+                        (unsigned)offsetof(B86Cpu, flags));
+                pj_movw(&t->e, LR, B86_CF | B86_PF | B86_ZF | B86_SF |
+                                  (n == 1u ? B86_OF : 0u));
+                pj_dpr(&t->e, 1u, 0, R0, R0, LR, 0u, 0u);
+                pj_dpr(&t->e, 2u, 0, R0, R0, R2, 0u, 0u); /* CF */
+                if (n == 1u) {
+                    if (op2 == 0xA4u) {
+                        pj_ubfx(&t->e, LR, R3, 31u, 1u);
+                        pj_dpr(&t->e, 4u, 0, LR, LR, R2, 0u, 0u);
+                    } else {
+                        pj_ubfx(&t->e, LR, R1, 31u, 1u);
+                        pj_ubfx(&t->e, R1, R3, 31u, 1u);
+                        pj_dpr(&t->e, 4u, 0, LR, LR, R1, 0u, 0u);
+                    }
+                    pj_shift(&t->e, LR, LR, 0u, 11u);
+                    pj_dpr(&t->e, 2u, 0, R0, R0, LR, 0u, 0u);
+                }
+                /* SF = result[31]; ZF = result==0. */
+                pj_ubfx(&t->e, LR, R3, 31u, 1u);
+                pj_shift(&t->e, LR, LR, 0u, 7u);
+                pj_dpr(&t->e, 2u, 0, R0, R0, LR, 0u, 0u);
+                pj_dpi(&t->e, 13u, 1, PC, R3, 0u);
+                nonzero68 = pjt_bfwd(t, 1 /* NE */);
+                pj_dpi(&t->e, 2u, 0, R0, R0, B86_ZF);
+                pjt_here(t, nonzero68);
+                /* Even parity of the low result byte, using only native
+                 * EOR and shifts. AF is deliberately left unchanged. */
+                pj_dpi(&t->e, 0u, 0, R1, R3, 255u);
+                pj_shift(&t->e, LR, R1, 1u, 4u);
+                pj_dpr(&t->e, 4u, 0, R1, R1, LR, 0u, 0u);
+                pj_shift(&t->e, LR, R1, 1u, 2u);
+                pj_dpr(&t->e, 4u, 0, R1, R1, LR, 0u, 0u);
+                pj_shift(&t->e, LR, R1, 1u, 1u);
+                pj_dpr(&t->e, 4u, 0, R1, R1, LR, 0u, 0u);
+                pj_dpi(&t->e, 0u, 0, R1, R1, 1u);
+                pj_dpi(&t->e, 4u, 0, R1, R1, 1u); /* invert odd parity */
+                pj_shift(&t->e, R1, R1, 0u, 2u);
+                pj_dpr(&t->e, 2u, 0, R0, R0, R1, 0u, 0u);
+                pj_ldst(&t->e, PJ_STR, R0, CREG,
+                        (unsigned)offsetof(B86Cpu, flags));
+                pjt_putr(t, m.rm, 4u, R3);
+                t->last_kind = -1;
+                t->ikind_clear = 1;
+                t->fuse_at = NULL;
+                return 1; /* next x86 instruction in SAME native block */
+            }
+#endif /* V68 native PM32 register SHLD/SHRD immediate */
             pjt_rm_load(t, &m, w, 1, R1, &sh);
             pjt_getr(t, R2, m.reg, w);
             pjt_c(t);
@@ -2616,6 +4013,16 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
          * a masked zero count is a no-op. */
         if (op2 == 0xA5u || op2 == 0xADu) {
             PjOp sh;
+#if B86_PJ_V69_SHIFTD_BATCH
+            /* The CL forms support PM32 register and memory targets, in
+             * both widths. CL=0 register is a true no-op; memory is checked
+             * by the existing fallback. 16-bit CL>16 retains the fallback. */
+            if (!repz && !segpref && (np == 1u || (np == 2u && o16))) {
+                if (!pjt_modrm(t, &m)) PJ_FAIL();
+                return pjt_v69_shiftd(t, &m, w, op2 == 0xA5u,
+                                      1, 0u, PJ_NEXT());
+            }
+#endif
             if (repz || o16 || !pjt_modrm(t, &m) || m.mod != 3u) PJ_FAIL();
             pjt_rm_load(t, &m, 4u, 1, R1, &sh);
             pjt_getr(t, R2, m.reg, 4u);
@@ -2677,6 +4084,24 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
             pjt_rm_store(t, &o, 1u, R1);
             return 1;
         }
+#if B86_PJ_V71_MULWIDTH_BATCH
+        /* 66 0F AF: 16-bit IMUL r16,r/m16 with full signed overflow. */
+        if (op2 == 0xAFu && w == 2u && o16 && np == 2u &&
+            !segpref && !repz && !repne) {
+            if (!pjt_modrm(t, &m)) PJ_FAIL();
+            pjt_rm_load(t, &m, 2u, 0, R1, &o);
+            pjt_getr(t, R0, m.reg, 2u);
+            pj_ext(&t->e, 0xFA0Fu, R0, R0);
+            pj_ext(&t->e, 0xFA0Fu, R1, R1);
+            pje32(&t->e, 0xFB80u | R0,
+                  (R3 << 12) | (R2 << 8) | R1); /* SMULL */
+            pjt_v71_mul_overflow(t, 2u, 1);
+            pjt_putr(t, m.reg, 2u, R3);
+            pjt_getr(t, R0, m.reg, 2u);
+            pjt_v71_mul_flags(t, 2u);
+            return 1;
+        }
+#endif /* V71 16-bit two-operand IMUL */
         if (op2 == 0xAFu) {                           /* IMUL r, r/m */
             if (o16 || !pjt_modrm(t, &m)) PJ_FAIL();
             pjt_rm_load(t, &m, 4u, 0, R1, &o);
