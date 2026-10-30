@@ -213,6 +213,60 @@
 #if B86_PJ_V67_NATIVE_BITSCAN != 0 && B86_PJ_V67_NATIVE_BITSCAN != 1
 #error B86_PJ_V67_NATIVE_BITSCAN must be 0 or 1
 #endif
+/* V80c: F2 SCAS with ECX > 1 returns to the already hardware-working
+ * checked REPNE C helper. Only ECX == 1 enters the native single-comparison
+ * path, which completes without restarting an unmapped guest EIP. */
+#ifndef B86_PJ_V80C_SCAS_COMPLETION_GUARD
+#define B86_PJ_V80C_SCAS_COMPLETION_GUARD 1
+#endif
+#if B86_PJ_V80C_SCAS_COMPLETION_GUARD != 0 && B86_PJ_V80C_SCAS_COMPLETION_GUARD != 1
+#error V80c SCAS guard macro invalid
+#endif
+/* V80b: hardware-bisect of F2 REPNE CMPS vs SCAS, while retaining
+ * the working v80 two-store F3 chunk. F2-disabled cases use the
+ * original checked C REPNE helper, not an interpreter-unsupported exit.
+ * Byte-exact original v80 is preserved when the family gates are 1/1/7
+ * and the budget is 4u.  The F3 comparison behavior is unchanged. */
+#ifndef B86_PJ_V80B_F2_CMPS
+#define B86_PJ_V80B_F2_CMPS 0
+#endif
+#ifndef B86_PJ_V80B_F2_SCAS
+#define B86_PJ_V80B_F2_SCAS 1
+#endif
+#ifndef B86_PJ_V80B_SCAS_WIDTH_MASK
+#define B86_PJ_V80B_SCAS_WIDTH_MASK 7
+#endif
+#ifndef B86_PJ_V80B_COMPARE_BUDGET
+#define B86_PJ_V80B_COMPARE_BUDGET 1u
+#endif
+#if (B86_PJ_V80B_F2_CMPS != 0 && B86_PJ_V80B_F2_CMPS != 1) || \
+    (B86_PJ_V80B_F2_SCAS != 0 && B86_PJ_V80B_F2_SCAS != 1) || \
+    (B86_PJ_V80B_SCAS_WIDTH_MASK < 0 || B86_PJ_V80B_SCAS_WIDTH_MASK > 7) || \
+    (B86_PJ_V80B_COMPARE_BUDGET != 1u && B86_PJ_V80B_COMPARE_BUDGET != 4u)
+#error V80b macros invalid
+#endif
+/* V80: hardware-working v79 control when all knobs are zero/default=1.
+ * F2 is represented by (repz=1,repne=1) by the shared decoder;
+ * v78/v79 previously excluded it from the native admission. F2 and F3
+ * must remain distinct in REP compare termination, but are equivalent
+ * for REP MOVS/STOS. Optional two-element store chunk checks pj_stop
+ * after the first completed store and before any subsequent guest access.
+ * This is NOT an unchecked block copy: each element has exact memory
+ * trampolines, progress and interrupt/SMC exit opportunities. */
+#ifndef B86_PJ_V80_F2_STORES
+#define B86_PJ_V80_F2_STORES 1
+#endif
+#ifndef B86_PJ_V80_F2_COMPARES
+#define B86_PJ_V80_F2_COMPARES 1
+#endif
+#ifndef B86_PJ_V80_STORE_BUDGET
+#define B86_PJ_V80_STORE_BUDGET 2
+#endif
+#if (B86_PJ_V80_F2_STORES != 0 && B86_PJ_V80_F2_STORES != 1) || \
+    (B86_PJ_V80_F2_COMPARES != 0 && B86_PJ_V80_F2_COMPARES != 1) || \
+    (B86_PJ_V80_STORE_BUDGET != 1 && B86_PJ_V80_STORE_BUDGET != 2)
+#error V80 macros must use F2_STORES=0/1 F2_COMPARES=0/1 STORE_BUDGET=1/2
+#endif
 /* V79: PM32 F2/F3 REP MOVS/STOS all ECX counts, one checked store per
  * dispatcher entry.  A store must exit before potentially invalidated
  * translated code is run (paging + SMC).  At zero count, no guest read,
@@ -3252,13 +3306,24 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
      * the existing memory trampoline reruns the whole still-uncommitted
      * iteration in the interpreter.  SP+4 persists across trampolines. */
     if ((op == 0xA4u || op == 0xA5u || op == 0xAAu || op == 0xABu) &&
+#if B86_PJ_V80_F2_STORES
+        (repz != 0) && /* F3=(1,0), F2=(1,1) in parser */
+#else
         (repz != 0 || repne != 0) && !(repz && repne) &&
+#endif
         !segpref && !es_override &&
         (np == 2u || (np == 3u && o16 && (op & 1u)))) {
         const unsigned ww79 = (op & 1u) ? w : 1u;
         const int movs79 = op == 0xA4u || op == 0xA5u;
         pj_dpi(&t->e, 13u, 1, PC, GR(1), 0u); /* CMP ECX,#0 */
         pjt_exit_cond(t, 0 /* EQ: empty REP */, PJ_NEXT(), t->ninsn);
+#if B86_PJ_V80_STORE_BUDGET == 2
+        /* Translation-time unroll: two complete individually checked stores.
+         * A failure of iteration two leaves iteration one's guest state
+         * committed, allowing exact interpreter restart at original EIP. */
+        { unsigned round80;
+          for (round80 = 0u; round80 < 2u; ++round80) {
+#endif
         if (movs79) {
             pj_mov(&t->e, R1, GR(6));          /* DS:[ESI] source */
             pjt_mem(t, ww79, 0);               /* checked read */
@@ -3275,6 +3340,22 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
         pj_dpi(&t->e, 13u, 0, GR(1), GR(1), 1u); /* ECX--, no x86 flag change */
         pj_dpi(&t->e, 13u, 1, PC, GR(1), 0u); /* completed entire REP? */
         pjt_exit_cond(t, 0 /* EQ: final element */, PJ_NEXT(), t->ninsn);
+#if B86_PJ_V80_STORE_BUDGET == 2
+        if (round80 == 0u) {
+            /* b86_pj_note_store() kills overlapping translated blocks and
+             * sets c->pj_stop.  Stop AFTER committing this iteration but
+             * BEFORE fetching/storing another element. No helper merge;
+             * pjt_c() establishes R12 on this runtime incoming edge. */
+            pjt_c(t);
+            pj_ldst(&t->e, PJ_LDRB, R0, CREG,
+                    (unsigned)offsetof(B86Cpu, pj_stop));
+            pj_dpi(&t->e, 13u, 1, PC, R0, 0u);
+            pjt_exit_stay(t, 1 /* NE: SMC invalidated code */,
+                          t->ip0, t->ninsn - 1u);
+        }
+          } /* round80 */
+        }
+#endif
         /* Mandatory SMC-safe exit after every store; the next dispatch
          * refetches the original instruction if ECX is still nonzero. */
         pjt_exit(t, t->ip0, t->ninsn - 1u, 2);
@@ -3479,15 +3560,44 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
          * the original EIP with no extra instruction retirement.
          * For x86 REPNE, stop if comparison ZF=1; for REPE stop if ZF=0.
          * Do not materialize flags if ECX starts at zero. */
+#if B86_PJ_V80_F2_COMPARES
+#if (B86_PJ_V80B_F2_CMPS == 1) && (B86_PJ_V80B_F2_SCAS == 1) && (B86_PJ_V80B_SCAS_WIDTH_MASK == 7)
+        if ((repz != 0) && /* F2=(repz=1,repne=1), F3=(1,0) */
+#else
+        /* F2 has repz=1,repne=1.  A refused F2 native family must fall
+         * through to the already-checked REPNE C helper, NOT PJ_FAIL().
+         * F3=(1,0) is unchanged by this selective admission gate. */
+        if ((repz != 0) &&
+            (!repne || ((op == 0xA6u || op == 0xA7u)
+                 ? B86_PJ_V80B_F2_CMPS
+                 : (B86_PJ_V80B_F2_SCAS &&
+                   (B86_PJ_V80B_SCAS_WIDTH_MASK & ((op & 1u) ? w : 1u)) != 0u))) &&
+#endif
+#else
         if ((repne != 0 || repz != 0) && !(repne && repz) &&
+#endif
             !segpref && !es_override &&
             (np == 2u || (np == 3u && o16 && (op & 1u)))) {
             const unsigned ww78 = (op & 1u) ? w : 1u;
             const int cmps78 = op == 0xA6u || op == 0xA7u;
             unsigned round78;
+#if B86_PJ_V80C_SCAS_COMPLETION_GUARD
+            uint8_t *slow_scas80c = NULL;
+            /* A repeated native F2 SCAS with a large ECX can deopt after
+             * one comparison, then fail to refetch its original guest EIP
+             * in the current paging/mode transition. For ECX != 1, use
+             * the mature bounded checked C helper. This branch precedes
+             * all native SCAS memory reads and x86-visible modifications.
+             * As in v77's repaired branch merge, force a CPU-pointer reload
+             * before the helper saves the native guest registers. */
+            if (repne && !cmps78) {
+                pj_dpi(&t->e, 13u, 1, PC, GR(1), 1u); /* CMP ECX,#1 */
+                slow_scas80c = pjt_bfwd(t, 1 /* NE: helper if count != 1 */);
+            }
+#endif
             pj_dpi(&t->e, 13u, 1, PC, GR(1), 0u); /* CMP ECX,#0 */
             pjt_exit_cond(t, 0 /* EQ: REP with count zero */, PJ_NEXT(), t->ninsn);
-            for (round78 = 0u; round78 < 4u; ++round78) {
+            for (round78 = 0u; round78 < B86_PJ_V80B_COMPARE_BUDGET; ++round78) {
                 if (cmps78) {
                     pj_mov(&t->e, R1, GR(6));       /* DS:[ESI] */
                     pjt_mem(t, ww78, 0);
@@ -3518,6 +3628,29 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
             /* A partially completed REP is still the same x86 instruction.
              * Leaving the native block permits IRQs and interrupt fairness. */
             pjt_exit(t, t->ip0, t->ninsn - 1u, 2);
+#if B86_PJ_V80C_SCAS_COMPLETION_GUARD
+            if (slow_scas80c) {
+                pjt_here(t, slow_scas80c);
+                /* The conditional jump skips the fast path. Never reuse
+                 * compile-time R12 or lazy-state assumptions across it. */
+                t->creg_ok = 0;
+                t->last_kind = -1;
+                t->ikind_clear = 0;
+                t->fuse_at = NULL;
+                pjt_c(t); /* LDR.W r12,[sp,#0] before STMIA */
+                pje32(&t->e, 0xE880u | CREG, 0x0FF0u);
+                pj_mov(&t->e, R0, CREG);
+                pj_movw(&t->e, R1, op | (ww78 << 8));
+                pjt_call(t, (const void *)b86_pj_repne_cmp);
+                pj_ldst(&t->e, PJ_LDR, CREG, SP, 0u);
+                pje32(&t->e, 0xE890u | CREG, 0x0FF0u);
+                t->creg_ok = 1;
+                pj_dpi(&t->e, 13u, 1, PC, R0, 0u);
+                pjt_exit_stay(t, 0 /* EQ: helper yielded/refused */,
+                              t->ip0, t->ninsn - 1u);
+                pjt_exit(t, PJ_NEXT(), t->ninsn, 2);
+            }
+#endif
             t->fuse_at = NULL;
             return 2;
         }
