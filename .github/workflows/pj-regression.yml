@@ -1,0 +1,17 @@
+name: PJ differential regressions
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  pj-differential:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ARM compiler and user-mode emulator
+        run: sudo apt-get update && sudo apt-get install -y gcc-arm-linux-gnueabihf qemu-user
+      - name: Run native Thumb-2 PM32/PM16 comparisons (with and without v85 counters)
+        run: make pj-test

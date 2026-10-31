@@ -312,9 +312,10 @@ static void gen_pm16(int last)
 }
 static int gen_mode;
 static unsigned cur_it; static uint8_t *cur_code; static unsigned cur_len; static B86Cpu cur_init;
+static uint32_t initial_seed;
 static void dump_case(const char *why)
 {
-    printf("%s it=%u code:", why, cur_it); for (unsigned q = 0; q < cur_len; ++q) printf("%02X", cur_code[q]);
+    printf("%s seed=%u mode=%d it=%u code:", why, initial_seed, gen_mode, cur_it); for (unsigned q = 0; q < cur_len; ++q) printf("%02X", cur_code[q]);
     printf("\n  init fl=%04X", cur_init.flags & 0xFFF); for (int i = 0; i < 8; ++i) printf(" r%d=%08X", i, cur_init.r[i]); printf("\n");
 }
 static void on_crash(int sig) { (void)sig; dump_case("CRASH"); fflush(stdout); _exit(3); }
@@ -340,6 +341,7 @@ int main(int argc, char **argv)
     unsigned iters = argc > 1 ? (unsigned)atoi(argv[1]) : 1000, bad = 0, nat = 0, tot = 0, skipped = 0, partial = 0;
     if (argc > 2) rs = (uint32_t)atoi(argv[2]);
     if (argc > 3) gen_mode = atoi(argv[3]);   /* 0 original, 1 V57+ forms, 2 mixed */
+    initial_seed = rs;
     uint8_t *M = calloc(1, B86_RAM_BYTES + 64), *M2 = calloc(1, B86_RAM_BYTES + 64), *M0 = calloc(1, B86_RAM_BYTES + 64);
     void *code = mmap(NULL, 1 << 20, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     void *st = calloc(1, b86_pj_state_bytes());
@@ -430,5 +432,6 @@ int main(int argc, char **argv)
                pj_v83_n[0], pj_v83_n[1], pj_v83_n[2], pj_v83_n[3], pj_v83_n[4], pj_v83_n[5], pj_v83_n[6], pj_v83_n[7]);
 #endif
     printf("fuzz: %u sequences, %u native instructions, %u interpreter-refused, %u partial-rep, %u mismatches\n", iters, nat, skipped, partial, bad);
+    if (iters != 0 && nat == 0) { fprintf(stderr, "FAIL: zero native PJ coverage for seed=%u mode=%d\n", initial_seed, gen_mode); return 2; }
     return bad != 0;
 }
