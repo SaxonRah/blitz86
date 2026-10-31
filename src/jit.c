@@ -3461,7 +3461,14 @@ B86_COLD static Block *translate_ex(J *j, uint32_t cs, uint16_t ip, const Insn *
 /* Helpers called from generated code                                       */
 /* ------------------------------------------------------------------------ */
 
+/* V89: B86_JIT_H386_STATS (default 0) gates the r56 histogram below. It ran on
+ * every 386 instruction the real-mode JIT hands to the interpreter, from
+ * flash, plus a 3 KB heap table; 1 restores it (b86_jit_386_top reads it). */
+#ifndef B86_JIT_H386_STATS
+#define B86_JIT_H386_STATS 0
+#endif
 /* r56: which 386 forms still run in the interpreter (b86_jit_386_top) */
+#if B86_JIT_H386_STATS
 B86_COLD static void h386_count(B86Cpu *c)
 {
     J *j = c->jit;
@@ -3479,6 +3486,7 @@ B86_COLD static void h386_count(B86Cpu *c)
     if (op == 0x0F) j->h386[512 + *b86_host(c, (base + ((ip + 1) & 0xFFFFu)) & c->amask)]++;
     else j->h386[(o32 ? 256 : 0) + op]++;
 }
+#endif /* B86_JIT_H386_STATS */
 
 static inline __attribute__((always_inline)) void r386_merge(B86Cpu *c)
 {
@@ -3511,7 +3519,11 @@ B86_HOT uint32_t MPF(b86h_step)(B86Cpu *c, uint32_t ip_next, uint32_t blk)
     uint32_t cs0 = c->seg[B86_CS];
     c->ip = ip_next & 0xFFFFu;
     int m386 = c->model >= B86_CPU_386;
+#if B86_JIT_H386_STATS
     if (m386) { r386_merge(c); h386_count(c); }
+#else
+    if (m386) { r386_merge(c); }
+#endif
     int r = b86_step(c);
     if (m386) {
         r386_split(c);
@@ -4134,7 +4146,11 @@ B86_HOT static int MPF(cold_run)(J *j, B86Cpu *c, uint32_t key, int force)
                 break;
             }
         }
+#if B86_JIT_H386_STATS
         if (c->model >= B86_CPU_386) { r386_merge(c); h386_count(c); }
+#else
+        if (c->model >= B86_CPU_386) { r386_merge(c); }
+#endif
         int r = b86_step(c);
         if (c->model >= B86_CPU_386) {
             r386_split(c);
