@@ -213,6 +213,145 @@
 #if B86_PJ_V67_NATIVE_BITSCAN != 0 && B86_PJ_V67_NATIVE_BITSCAN != 1
 #error B86_PJ_V67_NATIVE_BITSCAN must be 0 or 1
 #endif
+/* V81: three independent controls; all three = 0 preprocesses to V80c.
+ *  B86_PJ_V81_JOIN_SAFE   pjt_here() keeps a translator fact (R12 loaded,
+ *     lz_ikind clear, last flag producer) only if it holds on BOTH edges of a
+ *     forward-branch join, and never fuses a Jcc across a join. Fixes V69:
+ *     SHLD/SHRD r,r,CL with CL%32==0 skipped pjt_c() + flag materialization,
+ *     the join kept creg_ok=1, and the next instruction used a stale R12
+ *     (host segfault in pj_fuzz; HardFault/stray store on RP2350).
+ *  B86_PJ_V81_REP_HELPER  REP MOVS/STOS with ECX > B86_PJ_V81_REP_NATIVE_MAX
+ *     run in the original checked whole-string helper b86_pj_str instead of
+ *     V79's two elements per dispatcher entry (a 16000-dword REP STOSD took
+ *     8000 entries; now 1). After the helper an unchained exit is taken only
+ *     if a store set pj_stop.
+ *  B86_PJ_V81_COVERAGE    makes the V73 non-REP CMPS/SCAS block reachable
+ *     (it sat between two case labels after a return), lets D2 /4/5/7 reach
+ *     V74 (V62 refused every remaining D2 form first), and adds PUSHAD/POPAD
+ *     through checked all-slots-first helpers. */
+#ifndef B86_PJ_V81_JOIN_SAFE
+#define B86_PJ_V81_JOIN_SAFE 1
+#endif
+#ifndef B86_PJ_V81_REP_HELPER
+#define B86_PJ_V81_REP_HELPER 1
+#endif
+#ifndef B86_PJ_V81_REP_NATIVE_MAX
+#define B86_PJ_V81_REP_NATIVE_MAX 2u
+#endif
+#ifndef B86_PJ_V81_COVERAGE
+#define B86_PJ_V81_COVERAGE 1
+#endif
+#if (B86_PJ_V81_JOIN_SAFE != 0 && B86_PJ_V81_JOIN_SAFE != 1) || \
+    (B86_PJ_V81_REP_HELPER != 0 && B86_PJ_V81_REP_HELPER != 1) || \
+    (B86_PJ_V81_COVERAGE != 0 && B86_PJ_V81_COVERAGE != 1)
+#error V81 controls must be 0 or 1
+#endif
+#if B86_PJ_V81_REP_NATIVE_MAX < 1u || B86_PJ_V81_REP_NATIVE_MAX > 255u
+#error B86_PJ_V81_REP_NATIVE_MAX must be 1..255
+#endif
+/* V82: PM16 native batch (16-bit protected-mode code segments).
+ *  B86_PJ_V82_PM16=1 adds, for 16-bit operand size only:
+ *   - PUSH r16 / POP r16 one-byte forms 50-5F (V56 covered only 8F /0);
+ *   - ADC/SBB (register and memory forms), and memory forms of
+ *     ADD/OR/AND/SUB/XOR/CMP (00-3B, 80/81/83), TEST r/m,r (84/85);
+ *   - MOV r/m,imm (C6/C7 /0), INC/DEC r/m8 and mem16 (FE /0-1, FF /0-1 mem),
+ *     TEST r/m,imm / NOT / NEG (F6/F7 /0,/2,/3);
+ *   - SHL/SHR/SAR by 1 or imm8 (D0/D1/C0/C1, register and memory) and by CL
+ *     (D2/D3, register, via the V74 emitter);
+ *   - DS/ES/SS/FS/GS segment-override prefixes on the memory forms above and
+ *     on MOV 88-8B (the tested V52/V53 ES MOV paths keep ES 88-8B).
+ *  Every memory operand goes through b86_pj_v82_ptr: present writable expand-up
+ *  data segment, in limit, no wrap, then b86_pj_mem (paging, RAM bounds, page
+ *  crossing, smc() note for writes). Words are accessed bytewise (odd offsets
+ *  are fine). A refusal changes nothing and replays in the interpreter.
+ *  B86_PJ_V82_STORE_CONTINUE=1: after a store the block continues unless the
+ *  store set pj_stop (then an unchained exit); 0: always exit after a store
+ *  (the policy of the older PM16 MOV store path). */
+#ifndef B86_PJ_V82_PM16
+#define B86_PJ_V82_PM16 1
+#endif
+#ifndef B86_PJ_V82_STORE_CONTINUE
+#define B86_PJ_V82_STORE_CONTINUE 1
+#endif
+#if (B86_PJ_V82_PM16 != 0 && B86_PJ_V82_PM16 != 1) || \
+    (B86_PJ_V82_STORE_CONTINUE != 0 && B86_PJ_V82_STORE_CONTINUE != 1)
+#error V82 controls must be 0 or 1
+#endif
+/* V83: second PM16 batch (requires V82).
+ *  - 66-prefixed (32-bit operand) forms in 16-bit code: memory forms of
+ *    ADD/OR/ADC/SBB/AND/SUB/XOR/CMP (01-3B odd, 81/83), ADC/SBB registers,
+ *    TEST mem,r32 (85), MOV mem,imm32 (C7 /0), INC/DEC r/m32 (FF /0-1),
+ *    TEST/NOT/NEG r/m32 (F7 /0,/2,/3), SHL/SHR/SAR r/m32 by 1 or imm8
+ *    (D1/C1), MOV r32<->mem (89/8B, any data-segment override). The segment
+ *    prefix may come before or after 66 (one of each).
+ *  - ROL/ROR/RCL/RCR by 1 (D0/D1 /0-/3; C0/C1 register with imm8%32==1),
+ *    8/16/32-bit, register and memory; same flag algorithm as flat V60.
+ *  - XCHG r/m,r (86/87), register and memory.
+ *  Memory operands use the V82 checked pointer (now also 4 bytes, bytewise).
+ *  B86_PJ_V83_PM16=0 preprocesses byte-identically to V82. */
+#ifndef B86_PJ_V83_PM16
+#define B86_PJ_V83_PM16 1
+#endif
+#if B86_PJ_V83_PM16 != 0 && B86_PJ_V83_PM16 != 1
+#error B86_PJ_V83_PM16 must be 0 or 1
+#endif
+#if B86_PJ_V83_PM16 && !B86_PJ_V82_PM16
+#error B86_PJ_V83_PM16 requires B86_PJ_V82_PM16
+#endif
+/* V84: hot-tier promotion precheck. Both promotion paths built the SRAM copy
+ * before pj_redirect() could refuse it (logged link stub in the PSRAM block's
+ * first 8 bytes, or already redirected). The refused copy was never used and
+ * the block was retried, so tiny blocks consumed the 88 KB tier repeatedly
+ * (V83 log: 181,647 refusals vs 20,720 promotions, 203 tier resets).
+ * B86_PJ_V84_HOT_PRECHECK=1 runs the same refusal tests first and skips the
+ * copy. It changes no translated code and no redirect decision.
+ * 0 preprocesses byte-identically to V83. */
+#ifndef B86_PJ_V84_HOT_PRECHECK
+#define B86_PJ_V84_HOT_PRECHECK 1
+#endif
+#if B86_PJ_V84_HOT_PRECHECK != 0 && B86_PJ_V84_HOT_PRECHECK != 1
+#error B86_PJ_V84_HOT_PRECHECK must be 0 or 1
+#endif
+#if B86_PJ_V84_HOT_PRECHECK
+static unsigned long pj_v84_skipped;   /* promotions skipped before building the SRAM copy */
+#endif
+/* V84 PM16 (requires V83): LEAVE (C9), MOV m16,Sreg (8C mem), PUSH seg:[mem]
+ * (FF /6 with a segment override), LES/LDS (C4/C5), 16-bit operand size.
+ * LEAVE runs in a checked all-or-nothing helper; LES/LDS read the far pointer
+ * through the V82 checked pointer, load the selector with b86_pj_loadseg and
+ * end the block (like the older PM16 MOV Sreg path).
+ * B86_PJ_V84_PM16=0 preprocesses byte-identically to the precheck-only V84. */
+#ifndef B86_PJ_V84_PM16
+#define B86_PJ_V84_PM16 1
+#endif
+#if B86_PJ_V84_PM16 != 0 && B86_PJ_V84_PM16 != 1
+#error B86_PJ_V84_PM16 must be 0 or 1
+#endif
+#if B86_PJ_V84_PM16 && !B86_PJ_V83_PM16
+#error B86_PJ_V84_PM16 requires B86_PJ_V83_PM16
+#endif
+/* V85: B86_PJ_V85_TIER_SPLIT - counts native entries and retired instructions
+ * by mode (flat / PM16) and by the tier of the entry block (PSRAM / SRAM hot
+ * copy), at the single native call site in b86_pj_try. Shows whether the
+ * PSRAM time of a phase is PM16 code (never taken by the SRAM tier) or flat
+ * code that the tier did not keep. Two increments per entry; no decisions.
+ * B86_PJ_V85_PM16 - PM16 ENTER imm16,0 (C8) and POP m16 (8F /0 memory).
+ * Both 0 preprocess byte-identically to V84. */
+#ifndef B86_PJ_V85_TIER_SPLIT
+#define B86_PJ_V85_TIER_SPLIT 1
+#endif
+#ifndef B86_PJ_V85_PM16
+#define B86_PJ_V85_PM16 1
+#endif
+#if (B86_PJ_V85_TIER_SPLIT != 0 && B86_PJ_V85_TIER_SPLIT != 1) || (B86_PJ_V85_PM16 != 0 && B86_PJ_V85_PM16 != 1)
+#error V85 controls must be 0 or 1
+#endif
+#if B86_PJ_V85_PM16 && !B86_PJ_V84_PM16
+#error B86_PJ_V85_PM16 requires B86_PJ_V84_PM16
+#endif
+#if B86_PJ_V85_TIER_SPLIT
+static unsigned long pj_v85_ent[4], pj_v85_ins[4];   /* flat-psram flat-sram pm16-psram pm16-sram */
+#endif
 /* V80c: F2 SCAS with ECX > 1 returns to the already hardware-working
  * checked REPNE C helper. Only ECX == 1 enters the native single-comparison
  * path, which completes without restarting an unmapped guest EIP. */
@@ -1288,6 +1427,46 @@ static B86_PM_HOT uint32_t b86_pj_str(B86Cpu *c, uint32_t desc)
     }
     return 1u;
 }
+#if B86_PJ_V81_COVERAGE
+/* V81: PUSHAD / POPAD, 32-bit operand size, flat SS (block scope). Every
+ * slot is checked by b86_pj_mem (paging, RAM bounds, page crossing and, for
+ * writes, the smc() note) BEFORE the first guest store or register write.
+ * 0 = refused with no guest change: the interpreter replays the instruction
+ * and raises any #PF/#SS. Slot order is architectural. */
+static B86_PM_HOT uint32_t b86_pj_pushad(B86Cpu *c)
+{
+    uint8_t *p[8];
+    const uint32_t esp = c->r[B86_SP];
+    unsigned i;
+    if (esp < 32u) return 0u;                     /* ESP wrap: interpreter */
+    for (i = 0u; i < 8u; ++i)                     /* EAX at ESP-4 ... EDI at ESP-32 */
+        if (!(p[i] = b86_pj_mem(c, esp - 4u * (i + 1u), 4u | 0x100u))) return 0u;
+    for (i = 0u; i < 8u; ++i) {
+        const uint32_t v = i == B86_SP ? esp : c->r[i];
+        p[i][0] = (uint8_t)v; p[i][1] = (uint8_t)(v >> 8);
+        p[i][2] = (uint8_t)(v >> 16); p[i][3] = (uint8_t)(v >> 24);
+    }
+    c->r[B86_SP] = esp - 32u;
+    return 1u;
+}
+static B86_PM_HOT uint32_t b86_pj_popad(B86Cpu *c)
+{
+    const uint8_t *p[8];
+    const uint32_t esp = c->r[B86_SP];
+    unsigned i;
+    if (esp > 0xFFFFFFE0u) return 0u;             /* ESP wrap: interpreter */
+    for (i = 0u; i < 8u; ++i)                     /* EDI at ESP ... EAX at ESP+28 */
+        if (!(p[i] = b86_pj_mem(c, esp + 4u * i, 4u))) return 0u;
+    for (i = 0u; i < 8u; ++i) {
+        const unsigned r = 7u - i;
+        if (r == B86_SP) continue;                /* the stored ESP is discarded */
+        c->r[r] = (uint32_t)p[i][0] | ((uint32_t)p[i][1] << 8) |
+                  ((uint32_t)p[i][2] << 16) | ((uint32_t)p[i][3] << 24);
+    }
+    c->r[B86_SP] = esp + 32u;
+    return 1u;
+}
+#endif /* V81 PUSHAD/POPAD helpers */
 /* CLC/STC/CMC/CLD/STD on the materialized flags */
 static B86_PM_HOT uint32_t b86_pj_flagop(B86Cpu *c, uint32_t op)
 {
@@ -1603,6 +1782,10 @@ typedef struct {
     int ikind_clear;                             /* lz_ikind known to be LZ_NONE */
     int creg_ok;                                 /* r12 holds the B86Cpu pointer */
     uint8_t *fuse_at;                            /* r71: ARM flags valid for last_kind if e.p == fuse_at */
+#if B86_PJ_V81_JOIN_SAFE
+    struct { uint8_t *at; int lk; uint8_t ik, cr; } br[16];   /* V81: facts on open forward edges */
+    unsigned nbr;
+#endif
 } PjT;
 
 #define CREG R12                                  /* B86Cpu pointer, reloaded after calls */
@@ -1947,8 +2130,44 @@ static void pjt_jcc(PjT *t, unsigned cc, uint32_t target, uint32_t next)
     pjt_exit(t, next, t->ninsn, 0);
 }
 /* local forward branch helpers */
+#if B86_PJ_V81_JOIN_SAFE
+/* V81: a forward branch records the translator's static facts on its edge;
+ * the join keeps a fact only if it also holds on the fall-through edge.
+ * An unknown edge (not found) drops all three facts. Costs at most an
+ * LDR r12,[sp,#0] or one lz_ikind clear after the join. */
+static uint8_t *pjt_bfwd(PjT *t, int cond)
+{
+    uint8_t *at = pj_b(&t->e, cond);
+    const unsigned k = t->nbr++ & 15u;
+    t->br[k].at = at;
+    t->br[k].lk = t->last_kind;
+    t->br[k].ik = (uint8_t)(t->ikind_clear != 0);
+    t->br[k].cr = (uint8_t)(t->creg_ok != 0);
+    return at;
+}
+static void pjt_here(PjT *t, uint8_t *at)
+{
+    unsigned k;
+    int found = 0;
+    pj_patch_b(at, t->e.p);
+    for (k = 0u; k < 16u && k < t->nbr; ++k) {
+        const unsigned i = (t->nbr - 1u - k) & 15u;
+        if (t->br[i].at == at) {
+            if (!t->br[i].cr) t->creg_ok = 0;
+            if (!t->br[i].ik) t->ikind_clear = 0;
+            if (t->br[i].lk != t->last_kind) t->last_kind = -1;
+            t->br[i].at = NULL;
+            found = 1;
+            break;
+        }
+    }
+    if (!found) { t->creg_ok = 0; t->ikind_clear = 0; t->last_kind = -1; }
+    t->fuse_at = NULL;                            /* ARM NZCV differs per edge */
+}
+#else
 static uint8_t *pjt_bfwd(PjT *t, int cond) { return pj_b(&t->e, cond); }
 static void pjt_here(PjT *t, uint8_t *at) { pj_patch_b(at, t->e.p); }
+#endif
 
 /* r/m operand: register or memory (pointer saved at [sp+4]) */
 typedef struct { int mem; unsigned rm; } PjOp;
@@ -2880,7 +3099,9 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
             t->fuse_at = NULL;
             return 1;                          /* continue translated native block */
         }
+#if !(B86_PJ_V81_COVERAGE && B86_PJ_V74_NARROW_CL_SHIFT)
         if (op == 0xD2u) PJ_FAIL();            /* remaining D2 forms unchanged */
+#endif /* V81: else fall to V74 'case 0xD2', which refuses all other D2 forms */
     }
 #endif /* V62 native CL-count rotations */
     switch (op) {
@@ -2911,6 +3132,28 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
         if (w == 4u) pj_ldst(&t->e, PJ_LDR, GR(op & 7u), R0, 0u);
         else { pjt_ld(t, R1, R0, 2u); pjt_putr(t, op & 7u, 2u, R1); }
         return 1;
+#if B86_PJ_V81_COVERAGE
+    case 0x60: case 0x61: {                          /* V81: PUSHAD / POPAD (o32 only) */
+        if (np != 1u || o16 || segpref || es_override || repz || repne) PJ_FAIL();
+        pjt_c(t);
+        pje32(&t->e, 0xE880u | CREG, 0x0FF0u);      /* STMIA r12, {r4-r11} */
+        pj_mov(&t->e, R0, CREG);
+        pjt_call(t, op == 0x60u ? (const void *)b86_pj_pushad : (const void *)b86_pj_popad);
+        pj_ldst(&t->e, PJ_LDR, CREG, SP, 0u);
+        pje32(&t->e, 0xE890u | CREG, 0x0FF0u);      /* LDMIA r12, {r4-r11} */
+        t->creg_ok = 1;
+        pj_dpi(&t->e, 13u, 1, PC, R0, 0u);
+        pjt_exit_stay(t, 0 /* EQ: refused, nothing changed */, t->ip0, t->ninsn - 1u);
+        if (op == 0x60u) {                           /* stack store hit translated code? */
+            uint8_t *clean81;
+            pj_ldst(&t->e, PJ_LDRB, R0, CREG, (unsigned)offsetof(B86Cpu, pj_stop));
+            pj_dpi(&t->e, 13u, 1, PC, R0, 0u);
+            clean81 = pjt_bfwd(t, 0 /* EQ */);
+            pjt_exit(t, PJ_NEXT(), t->ninsn, 2);
+            pjt_here(t, clean81);
+        }
+        return 1; }
+#endif /* V81 PUSHAD/POPAD */
     case 0x68: case 0x6A:
         if (op == 0x68u) { if (!pjt_imm(t, w, &imm)) PJ_FAIL(); }
         else { if (!pjt_u8(t, &imm)) PJ_FAIL(); imm = (uint32_t)(int32_t)(int8_t)imm; }
@@ -3293,6 +3536,10 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
         pjt_exit(t, PJ_NEXT(), t->ninsn, 2); /* re-check flatness */
         return 2;
     case 0xA4: case 0xA5: case 0xAA: case 0xAB: case 0xAC: case 0xAD: {   /* string ops through a helper */
+#if B86_PJ_V81_REP_HELPER && B86_PJ_V79_REP_STORE_STREAM && B86_PJ_V72_STACK_STRING_BATCH
+    uint8_t *big81 = NULL;                           /* V81: ECX above the native maximum */
+    int v81_big = 0;
+#endif
 #if B86_PJ_V79_REP_STORE_STREAM && B86_PJ_V72_STACK_STRING_BATCH
     /* v79: native REP/REPNE MOVS and STOS, 32-bit address size, flat DS/ES.
      * Admission is independent of runtime ECX: 0 skips *every* guest
@@ -3317,6 +3564,10 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
         const int movs79 = op == 0xA4u || op == 0xA5u;
         pj_dpi(&t->e, 13u, 1, PC, GR(1), 0u); /* CMP ECX,#0 */
         pjt_exit_cond(t, 0 /* EQ: empty REP */, PJ_NEXT(), t->ninsn);
+#if B86_PJ_V81_REP_HELPER
+        pj_dpi(&t->e, 13u, 1, PC, GR(1), B86_PJ_V81_REP_NATIVE_MAX); /* CMP ECX,#max */
+        big81 = pjt_bfwd(t, 8 /* HI: whole string in the checked C helper */);
+#endif
 #if B86_PJ_V80_STORE_BUDGET == 2
         /* Translation-time unroll: two complete individually checked stores.
          * A failure of iteration two leaves iteration one's guest state
@@ -3360,7 +3611,13 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
          * refetches the original instruction if ECX is still nonzero. */
         pjt_exit(t, t->ip0, t->ninsn - 1u, 2);
         t->fuse_at = NULL;
+#if B86_PJ_V81_REP_HELPER
+        pjt_here(t, big81);                   /* continue to the helper below */
+        t->creg_ok = 0;                       /* helper path reloads R12 itself */
+        v81_big = 1;
+#else
         return 2;
+#endif
     }
 #endif /* V79 checked REP store stream */
 #if B86_PJ_V77_REP_TAIL && B86_PJ_V72_STACK_STRING_BATCH
@@ -3371,7 +3628,12 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
      * Source DS and destination ES are flat, with no 67/address override.
      * The read and write checks precede memory/register changes. After
      * the store, move the index(es), zero ECX, and exit for SMC safety. */
+#if B86_PJ_V81_REP_HELPER && B86_PJ_V79_REP_STORE_STREAM && B86_PJ_V72_STACK_STRING_BATCH
+    if (!v81_big &&                           /* V81: ECX>max goes straight to the helper */
+        (op == 0xA4u || op == 0xA5u || op == 0xAAu || op == 0xABu) &&
+#else
     if ((op == 0xA4u || op == 0xA5u || op == 0xAAu || op == 0xABu) &&
+#endif
         repz && !repne && !segpref && !es_override &&
         (np == 2u || (np == 3u && o16 && (op & 1u)))) {
         const unsigned ww77 = (op & 1u) ? w : 1u;
@@ -3515,7 +3777,20 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
         t->creg_ok = 1;
         pj_dpi(&t->e, 13u, 1, PC, R0, 0u);
         pjt_exit_stay(t, 0 /* EQ */, t->ip0, t->ninsn - 1u);
+#if B86_PJ_V81_REP_HELPER
+        if (op != 0xACu && op != 0xADu) {
+            /* V81: a helper store that hit translated code set pj_stop; leave
+             * through an unchained exit before possibly stale code runs. */
+            uint8_t *clean81;
+            pj_ldst(&t->e, PJ_LDRB, R0, CREG, (unsigned)offsetof(B86Cpu, pj_stop));
+            pj_dpi(&t->e, 13u, 1, PC, R0, 0u);
+            clean81 = pjt_bfwd(t, 0 /* EQ: nothing invalidated */);
+            pjt_exit(t, PJ_NEXT(), t->ninsn, 2);
+            pjt_here(t, clean81);
+        }
+#endif
         return 1; }
+#if !B86_PJ_V81_COVERAGE
 #if B86_PJ_V73_STRING_COMPARE_REP_LODS
     /* Native unprefixed CMPSB/W/D and SCASB/W/D. DS and ES must be flat;
      * the shared ES guard runs before these opcodes. Validate BOTH CMPS
@@ -3546,10 +3821,45 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
         }
     }
 #endif /* V73 native CMPS SCAS */
+#endif /* !V81: original unreachable placement */
     /* F2 CMPSB/W/D and SCASB/W/D: comparison loop with exact register
      * progress and ZF termination; memory errors fall back without replaying
      * already completed comparisons. Host helpers use the live guest state. */
     case 0xA6: case 0xA7: case 0xAE: case 0xAF: {
+#if B86_PJ_V81_COVERAGE
+    /* V81: V73 block moved here from between the A4..AD case's final
+     * 'return 1; }' and this label, where no path could reach it. */
+#if B86_PJ_V73_STRING_COMPARE_REP_LODS
+    /* Native unprefixed CMPSB/W/D and SCASB/W/D. DS and ES must be flat;
+     * the shared ES guard runs before these opcodes. Validate BOTH CMPS
+     * reads before updating either index or x86 arithmetic flags.
+     * CMPS computes DS:[ESI] - ES:[EDI]. SCAS computes AL/AX/EAX - ES:[EDI].
+     * SP+4 saves the first CMPS operand across the second mem trampoline.
+     * The standard SUB lazy writer implements CF/PF/AF/ZF/SF/OF. */
+    if (!repz && !repne && !segpref && !es_override &&
+        (np == 1u || (np == 2u && o16))) {
+        const unsigned ww73 = (op & 1u) ? w : 1u;
+        if (op == 0xA6u || op == 0xA7u || op == 0xAEu || op == 0xAFu) {
+            const int cmps73 = op == 0xA6u || op == 0xA7u;
+            if (cmps73) {
+                pj_mov(&t->e, R1, GR(6));
+                pjt_mem(t, ww73, 0);         /* checked DS source read */
+                pjt_ld(t, R2, R0, ww73);
+                pj_ldst(&t->e, PJ_STR, R2, SP, 4u);
+            }
+            pj_mov(&t->e, R1, GR(7));
+            pjt_mem(t, ww73, 0);             /* checked ES destination read */
+            pjt_ld(t, R0, R0, ww73);
+            if (cmps73) pj_ldst(&t->e, PJ_LDR, R1, SP, 4u);
+            else pjt_getr(t, R1, 0u, ww73);
+            pjt_alu(t, 7u, ww73, R3, R1, R0);
+            if (cmps73) pjt_v72_string_step(t, 6u, ww73);
+            pjt_v72_string_step(t, 7u, ww73);
+            return 1;                      /* same native block; no guest store */
+        }
+    }
+#endif /* V73 native CMPS SCAS */
+#endif /* V81 reachable V73 CMPS/SCAS */
 #if B86_PJ_V78_REP_COMPARE && B86_PJ_V73_STRING_COMPARE_REP_LODS
         /* F2 REPNE / F3 REPE CMPSB/W/D and SCASB/W/D, address32 only.
          * Every iteration independently checks its guest reads BEFORE
@@ -6718,6 +7028,732 @@ static void pjt_v56_sp_add(PjT *t, uint32_t bytes)
 }
 #endif /* V56 checked PM16 stack additions */
 
+#if B86_PJ_V82_PM16 && BB_PJ_PM16_REG_TIER
+/* V82 checked PM16 data pointer: desc = width | seg<<8 | write<<12. */
+static B86_PM_HOT uint8_t *b86_pj_v82_ptr(B86Cpu *c, uint32_t off, uint32_t desc)
+{
+    const unsigned width = desc & 0xFFu, seg = (desc >> 8) & 7u, write = (desc >> 12) & 1u;
+    const B86PM1Cache *s;
+    uint64_t linear;
+#if B86_PJ_V83_PM16
+    if ((width != 1u && width != 2u && width != 4u) || seg > 5u || off > 0xFFFFu) return NULL;
+#else
+    if ((width != 1u && width != 2u) || seg > 5u || off > 0xFFFFu) return NULL;
+#endif
+    s = &c->pm386.seg[seg];
+    /* present, data, writable, expand-up; anything else -> interpreter */
+    if (!s->valid || s->reserved || (s->access & 0x9Au) != 0x92u ||
+        (s->access & 0x04u) || off > s->limit ||
+        (uint32_t)(width - 1u) > s->limit - off) return NULL;
+    linear = (uint64_t)s->base + (uint64_t)off;
+    if (linear + width - 1u > UINT32_MAX) return NULL;
+    return b86_pj_mem(c, (uint32_t)linear, width | (write ? 0x100u : 0u));
+}
+static unsigned long pj_v82_n[12];   /* translations: push pop alu adcsbb movimm incdec grp3 shift shcl segmov stores */
+/* R1 = EA16. Host pointer -> R0 and [sp+4]; refusal replays the instruction. */
+static void pjt_v82_ptr(PjT *t, unsigned seg, unsigned width, int write)
+{
+    pjt_c(t);
+    pj_mov(&t->e, R0, CREG);
+    pj_movw(&t->e, R2, width | (seg << 8) | (write ? 0x1000u : 0u));
+    pjt_call(t, (const void *)b86_pj_v82_ptr);
+    pj_dpi(&t->e, 13u, 1, PC, R0, 0u);
+    pjt_exit_stay(t, 0 /* EQ: refused, nothing changed */, t->ip0, t->ninsn - 1u);
+    pj_ldst(&t->e, PJ_STR, R0, SP, 4u);
+}
+static void pjt_v82_load(PjT *t, int d, int tmp, unsigned w)    /* from [R0] */
+{
+    pj_ldst(&t->e, PJ_LDRB, d, R0, 0u);
+    if (w == 2u) {
+        pj_ldst(&t->e, PJ_LDRB, tmp, R0, 1u);
+        pj_dpr(&t->e, 2u, 0, d, d, tmp, 0u, 8u);
+    }
+#if B86_PJ_V83_PM16
+    if (w == 4u) {
+        unsigned k;
+        for (k = 1u; k < 4u; ++k) {
+            pj_ldst(&t->e, PJ_LDRB, tmp, R0, k);
+            pj_dpr(&t->e, 2u, 0, d, d, tmp, 0u, 8u * k);
+        }
+    }
+#endif
+}
+static void pjt_v82_store(PjT *t, int s, int tmp, unsigned w)   /* to [[sp+4]] */
+{
+    pj_ldst(&t->e, PJ_LDR, R0, SP, 4u);
+    pj_ldst(&t->e, PJ_STRB, s, R0, 0u);
+    if (w == 2u) {
+        pj_shift(&t->e, tmp, s, 1u, 8u);
+        pj_ldst(&t->e, PJ_STRB, tmp, R0, 1u);
+    }
+#if B86_PJ_V83_PM16
+    if (w == 4u) {
+        unsigned k;
+        for (k = 1u; k < 4u; ++k) {
+            pj_shift(&t->e, tmp, s, 1u, 8u * k);
+            pj_ldst(&t->e, PJ_STRB, tmp, R0, k);
+        }
+    }
+#endif
+    ++pj_v82_n[11];
+}
+static int pjt_v82_after_store(PjT *t, uint32_t next_ip)
+{
+#if B86_PJ_V82_STORE_CONTINUE
+    uint8_t *clean;
+    pjt_c(t);
+    pj_ldst(&t->e, PJ_LDRB, R0, CREG, (unsigned)offsetof(B86Cpu, pj_stop));
+    pj_dpi(&t->e, 13u, 1, PC, R0, 0u);
+    clean = pjt_bfwd(t, 0 /* EQ: no translated code was hit */);
+    pjt_exit(t, next_ip, t->ninsn, 2);
+    pjt_here(t, clean);
+    return 1;
+#else
+    pjt_exit(t, next_ip, t->ninsn, 2);
+    return 2;
+#endif
+}
+/* Translation-time admission: claim only forms the older PM16 paths do not
+ * translate, so every tested V9-V56 path keeps its exact code. at = index
+ * of the byte after the opcode. */
+static int pj_v82_claims(const PjT *t, unsigned at, uint32_t op, unsigned segov)
+{
+    unsigned mr, mod, reg;
+    int mem;
+    if (op >= 0x50u && op <= 0x5Fu) return segov == 255u;
+    if (at >= t->n) return 0;
+    mr = t->b[at]; mod = mr >> 6; reg = (mr >> 3) & 7u; mem = mod != 3u;
+    if (segov != 255u && !mem) return 0;
+    if (op < 0x40u && (op & 7u) < 4u) return mem || (op >> 3) == 2u || (op >> 3) == 3u;
+    if (op == 0x80u || op == 0x81u || op == 0x83u) return mem || reg == 2u || reg == 3u;
+    if (op == 0x84u || op == 0x85u) return mem;
+    if (op == 0xC6u || op == 0xC7u) return reg == 0u;
+    if (op == 0xFEu) return reg <= 1u;
+    if (op == 0xFFu) return reg <= 1u && mem;
+    if (op == 0xF6u || op == 0xF7u) return reg == 0u || reg == 2u || reg == 3u;
+    if (op == 0xD0u || op == 0xD1u || op == 0xC0u || op == 0xC1u)
+        return reg == 4u || reg == 5u || reg == 7u;
+#if B86_PJ_V74_NARROW_CL_SHIFT
+    if (op == 0xD2u || op == 0xD3u) return !mem && (reg == 4u || reg == 5u || reg == 7u);
+#endif
+    if (op >= 0x88u && op <= 0x8Bu)
+        return mem && segov != 255u && segov != B86_ES && segov != B86_CS;
+    return 0;
+}
+/* Emit one claimed instruction (opcode already consumed). 0 = refuse (the
+ * caller rolls back everything), 1 = continue, 2 = terminal exit emitted. */
+static int pjt_v82_pm16(PjT *t, uint32_t op, unsigned segov, unsigned start, unsigned base_ip)
+{
+#define V82_NEXT() ((base_ip + (t->pos - start)) & 0xFFFFu)
+    PjUnifiedModRM m;
+    unsigned seg = 0u, w;
+    uint32_t imm;
+#if B86_PJ_V54_NATIVE_CONTROL && BB_PJ_PM16_GS_STACK_V17
+    if (op >= 0x50u && op <= 0x57u) {                    /* PUSH r16 (PUSH SP: old SP) */
+        pjt_v54_stack_check(t, 1);
+        pjt_getr(t, R1, op & 7u, 2u);
+        pjt_v54_store16(t);
+        pjt_v54_sp_step(t, 1);
+        ++pj_v82_n[0];
+        return pjt_v82_after_store(t, V82_NEXT());
+    }
+    if (op >= 0x58u && op <= 0x5Fu) {                    /* POP r16 (POP SP: loaded value) */
+        pjt_v54_stack_check(t, 0);
+        pjt_v54_read16(t);
+        pjt_v54_sp_step(t, 0);
+        pjt_putr(t, op & 7u, 2u, R1);
+        ++pj_v82_n[1];
+        return 1;
+    }
+#else
+    if (op >= 0x50u && op <= 0x5Fu) return 0;
+#endif
+    if (!pjt_unified_modrm(t, &m)) return 0;
+    /* ADC/SBB: CF into [sp+16] BEFORE the EA (the helper call clobbers R0-R3) */
+    if ((op < 0x40u && (op & 7u) < 4u && ((op >> 3) == 2u || (op >> 3) == 3u)) ||
+        ((op == 0x80u || op == 0x81u || op == 0x83u) && (m.reg == 2u || m.reg == 3u)))
+        pjt_cf(t);
+    if (m.mod != 3u) {
+        if (!pjt_unified_ea16(t, m.raw, &seg)) return 0;   /* EA16 -> R1 */
+        if (segov != 255u) seg = segov;
+    }
+    /* ---- 00-3B: ALU r/m,r and r,r/m -------------------------------------- */
+    if (op < 0x40u && (op & 7u) < 4u) {
+        const unsigned alu = op >> 3, form = op & 7u;
+        w = (form & 1u) ? 2u : 1u;
+        if (m.mod == 3u) {                               /* ADC/SBB registers (CF taken above) */
+            if (form & 2u) {
+                pjt_getr(t, R0, m.reg, w); pjt_getr(t, R1, m.rm, w);
+                if (!pjt_alu(t, alu, w, R0, R0, R1)) return 0;
+                pjt_putr(t, m.reg, w, R0);
+            } else {
+                pjt_getr(t, R1, m.rm, w); pjt_getr(t, R0, m.reg, w);
+                if (!pjt_alu(t, alu, w, R1, R1, R0)) return 0;
+                pjt_putr(t, m.rm, w, R1);
+            }
+            ++pj_v82_n[3];
+            return 1;
+        }
+        if (alu == 2u || alu == 3u) ++pj_v82_n[3]; else ++pj_v82_n[2];
+        {
+            const int write = !(form & 2u) && alu != 7u;
+            pjt_v82_ptr(t, seg, w, write);
+            pjt_v82_load(t, R1, R2, w);
+            pjt_getr(t, R0, m.reg, w);
+            if (form & 2u) {                             /* reg <- reg op mem */
+                if (!pjt_alu(t, alu, w, alu == 7u ? R3 : R0, R0, R1)) return 0;
+                if (alu != 7u) pjt_putr(t, m.reg, w, R0);
+                return 1;
+            }
+            if (!pjt_alu(t, alu, w, alu == 7u ? R3 : R1, R1, R0)) return 0;
+            if (alu == 7u) return 1;
+            pjt_v82_store(t, R1, R2, w);
+            return pjt_v82_after_store(t, V82_NEXT());
+        }
+    }
+    /* ---- 80/81/83: ALU r/m,imm ------------------------------------------- */
+    if (op == 0x80u || op == 0x81u || op == 0x83u) {
+        const unsigned alu = m.reg;
+        w = op == 0x80u ? 1u : 2u;
+        if (op == 0x83u) {
+            if (!pjt_u8(t, &imm)) return 0;
+            imm = (uint32_t)(int32_t)(int8_t)imm;
+        } else if (!pjt_imm(t, w, &imm)) return 0;
+        if (alu == 2u || alu == 3u) ++pj_v82_n[3]; else ++pj_v82_n[2];
+        if (m.mod == 3u) {
+            pjt_getr(t, R1, m.rm, w);
+            pj_imm32(&t->e, R0, imm);
+            if (!pjt_alu(t, alu, w, alu == 7u ? R3 : R1, R1, R0)) return 0;
+            if (alu != 7u) pjt_putr(t, m.rm, w, R1);
+            return 1;
+        }
+        pjt_v82_ptr(t, seg, w, alu != 7u);
+        pjt_v82_load(t, R1, R2, w);
+        pj_imm32(&t->e, R0, imm);
+        if (!pjt_alu(t, alu, w, alu == 7u ? R3 : R1, R1, R0)) return 0;
+        if (alu == 7u) return 1;
+        pjt_v82_store(t, R1, R2, w);
+        return pjt_v82_after_store(t, V82_NEXT());
+    }
+    /* ---- 84/85: TEST mem,r ----------------------------------------------- */
+    if (op == 0x84u || op == 0x85u) {
+        w = (op & 1u) ? 2u : 1u;
+        pjt_v82_ptr(t, seg, w, 0);
+        pjt_v82_load(t, R1, R2, w);
+        pjt_getr(t, R0, m.reg, w);
+        if (!pjt_alu(t, 4u, w, R3, R1, R0)) return 0;
+        ++pj_v82_n[2];
+        return 1;
+    }
+    /* ---- C6/C7 /0: MOV r/m,imm ------------------------------------------ */
+    if (op == 0xC6u || op == 0xC7u) {
+        w = (op & 1u) ? 2u : 1u;
+        if (!pjt_imm(t, w, &imm)) return 0;
+        ++pj_v82_n[4];
+        if (m.mod == 3u) {
+            pj_imm32(&t->e, R1, imm);
+            pjt_putr(t, m.rm, w, R1);
+            return 1;
+        }
+        pjt_v82_ptr(t, seg, w, 1);
+        pj_imm32(&t->e, R1, imm);
+        pjt_v82_store(t, R1, R2, w);
+        return pjt_v82_after_store(t, V82_NEXT());
+    }
+    /* ---- FE /0-1 (r/m8), FF /0-1 (mem16): INC/DEC ------------------------ */
+    if (op == 0xFEu || op == 0xFFu) {
+        const int dec = m.reg == 1u;
+        w = op == 0xFEu ? 1u : 2u;
+        ++pj_v82_n[5];
+        if (m.mod == 3u) {
+            pjt_getr(t, R2, m.rm, w);
+            if (!dec) pj_dpi(&t->e, 8u, 0, R3, R2, 1u); else pj_dpi(&t->e, 13u, 0, R3, R2, 1u);
+            pjt_putr(t, m.rm, w, R3);
+            pjt_lazy(t, dec ? pj_k_dec[w] : pj_k_inc[w], R2, R3);
+            return 1;
+        }
+        pjt_v82_ptr(t, seg, w, 1);
+        pjt_v82_load(t, R2, R3, w);
+        if (!dec) pj_dpi(&t->e, 8u, 0, R3, R2, 1u); else pj_dpi(&t->e, 13u, 0, R3, R2, 1u);
+        pjt_v82_store(t, R3, R1, w);
+        pjt_lazy(t, dec ? pj_k_dec[w] : pj_k_inc[w], R2, R3);
+        return pjt_v82_after_store(t, V82_NEXT());
+    }
+    /* ---- F6/F7 /0 TEST imm, /2 NOT, /3 NEG ------------------------------- */
+    if (op == 0xF6u || op == 0xF7u) {
+        const unsigned sub = m.reg;
+        w = (op & 1u) ? 2u : 1u;
+        if (sub == 0u && !pjt_imm(t, w, &imm)) return 0;
+        ++pj_v82_n[6];
+        if (m.mod != 3u) {
+            pjt_v82_ptr(t, seg, w, sub != 0u);
+            pjt_v82_load(t, R1, R2, w);
+        } else pjt_getr(t, R1, m.rm, w);
+        if (sub == 0u) {
+            pj_imm32(&t->e, R0, imm);
+            if (!pjt_alu(t, 4u, w, R3, R1, R0)) return 0;
+            return 1;
+        }
+        if (sub == 2u) {
+            pj_imm32(&t->e, R0, w == 1u ? 0xFFu : 0xFFFFu);
+            pj_dpr(&t->e, 4u, 0, R1, R1, R0, 0u, 0u);         /* EOR: no flags */
+        } else {
+            pj_movw(&t->e, R0, 0u);
+            if (!pjt_alu(t, 5u, w, R1, R0, R1)) return 0;     /* NEG = 0 - v */
+        }
+        if (m.mod == 3u) { pjt_putr(t, m.rm, w, R1); return 1; }
+        pjt_v82_store(t, R1, R2, w);
+        return pjt_v82_after_store(t, V82_NEXT());
+    }
+    /* ---- D0/D1/C0/C1 /4,/5,/7: SHL/SHR/SAR by 1 or imm8 ----------------- */
+    if (op == 0xD0u || op == 0xD1u || op == 0xC0u || op == 0xC1u) {
+        unsigned n = 1u;
+        w = (op & 1u) ? 2u : 1u;
+        if (op == 0xC0u || op == 0xC1u) {
+            if (!pjt_u8(t, &imm)) return 0;
+            n = imm & 31u;
+        }
+        if (n == 0u) return m.mod == 3u ? 1 : 0;           /* count 0: no-op (memory: interpreter) */
+        if (n >= 8u * w) return 0;                          /* whole-width counts: interpreter */
+        ++pj_v82_n[7];
+        if (m.mod != 3u) {
+            pjt_v82_ptr(t, seg, w, 1);
+            pjt_v82_load(t, R1, R2, w);
+        } else pjt_getr(t, R1, m.rm, w);
+        if (!pjt_shift(t, m.reg, w, n)) return 0;
+        t->fuse_at = NULL;
+        if (m.mod == 3u) { pjt_putr(t, m.rm, w, R1); return 1; }
+        pjt_v82_store(t, R1, R2, w);
+        return pjt_v82_after_store(t, V82_NEXT());
+    }
+#if B86_PJ_V74_NARROW_CL_SHIFT
+    /* ---- D2/D3 /4,/5,/7 register: SHL/SHR/SAR by CL ---------------------- */
+    if ((op == 0xD2u || op == 0xD3u) && m.mod == 3u) {
+        PjM pm;
+        pm.mod = 3u; pm.reg = m.reg; pm.rm = m.raw & 7u;
+        ++pj_v82_n[8];
+        return pjt_v74_shift_cl(t, &pm, (op & 1u) ? 2u : 1u, V82_NEXT());
+    }
+#endif
+    /* ---- 88-8B with a DS/SS/FS/GS/CS override ---------------------------- */
+    if (op >= 0x88u && op <= 0x8Bu && m.mod != 3u) {
+        w = (op & 1u) ? 2u : 1u;
+        ++pj_v82_n[9];
+        if (op & 2u) {                                       /* MOV r, seg:[ea] */
+            pjt_v82_ptr(t, seg, w, 0);
+            pjt_v82_load(t, R1, R2, w);
+            pjt_putr(t, m.reg, w, R1);
+            return 1;
+        }
+        pjt_v82_ptr(t, seg, w, 1);                           /* MOV seg:[ea], r */
+        pjt_getr(t, R1, m.reg, w);
+        pjt_v82_store(t, R1, R2, w);
+        return pjt_v82_after_store(t, V82_NEXT());
+    }
+    return 0;
+#undef V82_NEXT
+}
+#endif /* V82 PM16 batch helpers */
+#if B86_PJ_V83_PM16 && BB_PJ_PM16_REG_TIER
+static unsigned long pj_v83_n[8];   /* o32-alu o32-adcsbb o32-incdec o32-grp3 o32-shift o32-mov rotate xchg */
+/* Disjoint from V82 (which never claims 66 forms, rotates or XCHG) and from
+ * the older PM16 paths (OP66REG keeps every 66 register form it had). */
+static int pj_v83_claims(const PjT *t, unsigned at, uint32_t op, unsigned segov, int o32)
+{
+    unsigned mr, mod, reg;
+    int mem;
+    if (at >= t->n) return 0;
+    mr = t->b[at]; mod = mr >> 6; reg = (mr >> 3) & 7u; mem = mod != 3u;
+    if (segov != 255u && !mem) return 0;
+    if (segov == B86_CS) return 0;
+    if (o32) {
+        if (op < 0x40u && (op & 7u) < 4u && (op & 1u))
+            return mem || (op >> 3) == 2u || (op >> 3) == 3u;
+        if (op == 0x81u || op == 0x83u) return mem || reg == 2u || reg == 3u;
+        if (op == 0x85u || op == 0x89u || op == 0x8Bu) return mem;
+        if (op == 0xC7u) return mem && reg == 0u;
+        if (op == 0xFFu) return reg <= 1u;
+        if (op == 0xF7u) return reg == 0u || reg == 2u || reg == 3u;
+        if (op == 0xD1u || op == 0xC1u) return reg == 4u || reg == 5u || reg == 7u ||
+                                               (op == 0xD1u && reg <= 3u) ||
+                                               (op == 0xC1u && reg <= 3u && !mem && at + 1u < t->n && (t->b[at + 1u] & 31u) == 1u);
+        if (op == 0x87u) return 1;
+        return 0;
+    }
+    if (op == 0xD0u || op == 0xD1u) return reg <= 3u;
+    if (op == 0xC0u || op == 0xC1u)
+        return reg <= 3u && !mem && at + 1u < t->n && (t->b[at + 1u] & 31u) == 1u;
+    if (op == 0x86u || op == 0x87u) return 1;
+    return 0;
+}
+/* ROL/ROR/RCL/RCR by exactly 1 on R1 (width ww): flat V60's algorithm.
+ * Lazy flags are materialized first; only CF/OF change. Result in R1. */
+static void pjt_v83_rot1_core(PjT *t, unsigned sub, unsigned ww)
+{
+    const unsigned bits = ww * 8u;
+    pj_ldst(&t->e, PJ_LDR, R0, CREG, (unsigned)offsetof(B86Cpu, flags));
+    pj_dpi(&t->e, 0u, 0, R3, R0, B86_CF);                 /* previous CF: 0/1 */
+    if (sub == 0u || sub == 2u) {                        /* ROL / RCL */
+        pj_ubfx(&t->e, R2, R1, bits - 1u, 1u);
+        pj_shift(&t->e, R1, R1, 0u, 1u);
+        pj_dpr(&t->e, 2u, 0, R1, R1, sub == 0u ? R2 : R3, 0u, 0u);
+        if (ww < 4u) pj_ubfx(&t->e, R1, R1, 0u, bits);
+        pj_ubfx(&t->e, R3, R1, bits - 1u, 1u);
+        pj_dpr(&t->e, 4u, 0, R3, R3, R2, 0u, 0u);       /* OF */
+    } else {                                             /* ROR / RCR */
+        if (ww < 4u) pj_ubfx(&t->e, R1, R1, 0u, bits);
+        pj_dpi(&t->e, 0u, 0, R2, R1, 1u);
+        pj_shift(&t->e, R1, R1, 1u, 1u);
+        pj_shift(&t->e, R3, sub == 1u ? R2 : R3, 0u, bits - 1u);
+        pj_dpr(&t->e, 2u, 0, R1, R1, R3, 0u, 0u);
+        pj_ubfx(&t->e, R3, R1, bits - 1u, 1u);
+        pj_ubfx(&t->e, LR, R1, bits - 2u, 1u);
+        pj_dpr(&t->e, 4u, 0, R3, R3, LR, 0u, 0u);       /* OF */
+    }
+    pj_shift(&t->e, R3, R3, 0u, 11u);
+    pj_dpr(&t->e, 2u, 0, R2, R2, R3, 0u, 0u);
+    if (!pj_dpi(&t->e, 1u, 0, R0, R0, (B86_CF | B86_OF))) {
+        pj_movw(&t->e, LR, (B86_CF | B86_OF));
+        pj_dpr(&t->e, 1u, 0, R0, R0, LR, 0u, 0u);
+    }
+    pj_dpr(&t->e, 2u, 0, R0, R0, R2, 0u, 0u);
+    pj_ldst(&t->e, PJ_STR, R0, CREG, (unsigned)offsetof(B86Cpu, flags));
+}
+static void pjt_v83_materialize(PjT *t)
+{
+    uint8_t *ready;
+    pjt_c(t);
+    pj_ldst(&t->e, PJ_LDR, R2, CREG, (unsigned)offsetof(B86Cpu, lz_kind));
+    pj_ldst(&t->e, PJ_LDR, R3, CREG, (unsigned)offsetof(B86Cpu, lz_ikind));
+    pj_dpr(&t->e, 2u, 1, R2, R2, R3, 0u, 0u);            /* ORRS: either pending? */
+    ready = pjt_bfwd(t, 0 /* EQ: nothing pending */);
+    pj_mov(&t->e, R0, CREG);
+    pjt_call(t, (const void *)b86_flags_materialize);
+    pjt_c(t);
+    pjt_here(t, ready);
+}
+static int pjt_v83_pm16(PjT *t, uint32_t op, unsigned segov, int o32,
+                        unsigned start, unsigned base_ip)
+{
+#define V83_NEXT() ((base_ip + (t->pos - start)) & 0xFFFFu)
+    PjUnifiedModRM m;
+    unsigned seg = 0u, w;
+    uint32_t imm;
+    if (!pjt_unified_modrm(t, &m)) return 0;
+    if (o32 && ((op < 0x40u && ((op >> 3) == 2u || (op >> 3) == 3u)) ||
+                ((op == 0x81u || op == 0x83u) && (m.reg == 2u || m.reg == 3u))))
+        pjt_cf(t);                                       /* CF before EA: the call clobbers R0-R3 */
+    if (m.mod != 3u) {
+        if (!pjt_unified_ea16(t, m.raw, &seg)) return 0;
+        if (segov != 255u) seg = segov;
+    }
+    /* ---- rotates by 1 (any width) ------------------------------------- */
+    if ((op == 0xD0u || op == 0xD1u || op == 0xC0u || op == 0xC1u) && m.reg <= 3u) {
+        w = (op & 1u) ? (o32 ? 4u : 2u) : 1u;
+        if (op == 0xC0u || op == 0xC1u) {
+            if (!pjt_u8(t, &imm) || (imm & 31u) != 1u) return 0;
+        }
+        ++pj_v83_n[6];
+        if (m.mod != 3u) pjt_v82_ptr(t, seg, w, 1);      /* check before any change */
+        pjt_v83_materialize(t);
+        if (m.mod != 3u) {
+            pj_ldst(&t->e, PJ_LDR, R0, SP, 4u);
+            pjt_v82_load(t, R1, R2, w);
+        } else pjt_getr(t, R1, m.rm, w);
+        pjt_v83_rot1_core(t, m.reg, w);
+        t->last_kind = -1;
+        t->ikind_clear = 1;
+        t->fuse_at = NULL;
+        if (m.mod == 3u) { pjt_putr(t, m.rm, w, R1); return 1; }
+        pjt_v82_store(t, R1, R2, w);
+        return pjt_v82_after_store(t, V83_NEXT());
+    }
+    /* ---- XCHG r/m,r (no flags) ---------------------------------------- */
+    if (op == 0x86u || op == 0x87u) {
+        w = (op & 1u) ? (o32 ? 4u : 2u) : 1u;
+        ++pj_v83_n[7];
+        if (m.mod == 3u) {
+            pjt_getr(t, R1, m.rm, w);
+            pjt_getr(t, R2, m.reg, w);
+            pjt_putr(t, m.rm, w, R2);
+            pjt_putr(t, m.reg, w, R1);
+            return 1;
+        }
+        pjt_v82_ptr(t, seg, w, 1);
+        pjt_v82_load(t, R1, R2, w);                      /* old memory value stays in R1 */
+        pjt_getr(t, R3, m.reg, w);
+        pjt_v82_store(t, R3, R2, w);                     /* uses only R0/R2 */
+        pjt_putr(t, m.reg, w, R1);
+        return pjt_v82_after_store(t, V83_NEXT());
+    }
+    if (!o32) return 0;
+    w = 4u;
+    /* ---- 66 01-3B ------------------------------------------------------ */
+    if (op < 0x40u) {
+        const unsigned alu = op >> 3, form = op & 7u;
+        if (alu == 2u || alu == 3u) ++pj_v83_n[1]; else ++pj_v83_n[0];
+        if (m.mod == 3u) {
+            if (form & 2u) {
+                pjt_getr(t, R0, m.reg, w); pjt_getr(t, R1, m.rm, w);
+                if (!pjt_alu(t, alu, w, R0, R0, R1)) return 0;
+                pjt_putr(t, m.reg, w, R0);
+            } else {
+                pjt_getr(t, R1, m.rm, w); pjt_getr(t, R0, m.reg, w);
+                if (!pjt_alu(t, alu, w, R1, R1, R0)) return 0;
+                pjt_putr(t, m.rm, w, R1);
+            }
+            return 1;
+        }
+        pjt_v82_ptr(t, seg, w, !(form & 2u) && alu != 7u);
+        pjt_v82_load(t, R1, R2, w);
+        pjt_getr(t, R0, m.reg, w);
+        if (form & 2u) {
+            if (!pjt_alu(t, alu, w, alu == 7u ? R3 : R0, R0, R1)) return 0;
+            if (alu != 7u) pjt_putr(t, m.reg, w, R0);
+            return 1;
+        }
+        if (!pjt_alu(t, alu, w, alu == 7u ? R3 : R1, R1, R0)) return 0;
+        if (alu == 7u) return 1;
+        pjt_v82_store(t, R1, R2, w);
+        return pjt_v82_after_store(t, V83_NEXT());
+    }
+    /* ---- 66 81/83 ------------------------------------------------------- */
+    if (op == 0x81u || op == 0x83u) {
+        const unsigned alu = m.reg;
+        if (op == 0x83u) {
+            if (!pjt_u8(t, &imm)) return 0;
+            imm = (uint32_t)(int32_t)(int8_t)imm;
+        } else if (!pjt_imm(t, 4u, &imm)) return 0;
+        if (alu == 2u || alu == 3u) ++pj_v83_n[1]; else ++pj_v83_n[0];
+        if (m.mod == 3u) {
+            pjt_getr(t, R1, m.rm, w);
+            pj_imm32(&t->e, R0, imm);
+            if (!pjt_alu(t, alu, w, alu == 7u ? R3 : R1, R1, R0)) return 0;
+            if (alu != 7u) pjt_putr(t, m.rm, w, R1);
+            return 1;
+        }
+        pjt_v82_ptr(t, seg, w, alu != 7u);
+        pjt_v82_load(t, R1, R2, w);
+        pj_imm32(&t->e, R0, imm);
+        if (!pjt_alu(t, alu, w, alu == 7u ? R3 : R1, R1, R0)) return 0;
+        if (alu == 7u) return 1;
+        pjt_v82_store(t, R1, R2, w);
+        return pjt_v82_after_store(t, V83_NEXT());
+    }
+    /* ---- 66 85 TEST mem,r32 / 66 89,8B MOV ------------------------------ */
+    if (op == 0x85u) {
+        ++pj_v83_n[0];
+        pjt_v82_ptr(t, seg, w, 0);
+        pjt_v82_load(t, R1, R2, w);
+        pjt_getr(t, R0, m.reg, w);
+        return pjt_alu(t, 4u, w, R3, R1, R0) ? 1 : 0;
+    }
+    if (op == 0x8Bu) {
+        ++pj_v83_n[5];
+        pjt_v82_ptr(t, seg, w, 0);
+        pjt_v82_load(t, R1, R2, w);
+        pjt_putr(t, m.reg, w, R1);
+        return 1;
+    }
+    if (op == 0x89u) {
+        ++pj_v83_n[5];
+        pjt_v82_ptr(t, seg, w, 1);
+        pjt_getr(t, R1, m.reg, w);
+        pjt_v82_store(t, R1, R2, w);
+        return pjt_v82_after_store(t, V83_NEXT());
+    }
+    /* ---- 66 C7 /0 mem --------------------------------------------------- */
+    if (op == 0xC7u) {
+        if (!pjt_imm(t, 4u, &imm)) return 0;
+        ++pj_v83_n[5];
+        pjt_v82_ptr(t, seg, w, 1);
+        pj_imm32(&t->e, R1, imm);
+        pjt_v82_store(t, R1, R2, w);
+        return pjt_v82_after_store(t, V83_NEXT());
+    }
+    /* ---- 66 FF /0-1 INC/DEC r/m32 ---------------------------------------- */
+    if (op == 0xFFu) {
+        const int dec = m.reg == 1u;
+        ++pj_v83_n[2];
+        if (m.mod == 3u) {
+            pjt_getr(t, R2, m.rm, w);
+            if (!dec) pj_dpi(&t->e, 8u, 0, R3, R2, 1u); else pj_dpi(&t->e, 13u, 0, R3, R2, 1u);
+            pjt_putr(t, m.rm, w, R3);
+            pjt_lazy(t, dec ? pj_k_dec[w] : pj_k_inc[w], R2, R3);
+            return 1;
+        }
+        pjt_v82_ptr(t, seg, w, 1);
+        pjt_v82_load(t, R2, R3, w);
+        if (!dec) pj_dpi(&t->e, 8u, 0, R3, R2, 1u); else pj_dpi(&t->e, 13u, 0, R3, R2, 1u);
+        pjt_v82_store(t, R3, R1, w);
+        pjt_lazy(t, dec ? pj_k_dec[w] : pj_k_inc[w], R2, R3);
+        return pjt_v82_after_store(t, V83_NEXT());
+    }
+    /* ---- 66 F7 /0,/2,/3 ------------------------------------------------- */
+    if (op == 0xF7u) {
+        const unsigned sub = m.reg;
+        if (sub == 0u && !pjt_imm(t, 4u, &imm)) return 0;
+        ++pj_v83_n[3];
+        if (m.mod != 3u) {
+            pjt_v82_ptr(t, seg, w, sub != 0u);
+            pjt_v82_load(t, R1, R2, w);
+        } else pjt_getr(t, R1, m.rm, w);
+        if (sub == 0u) {
+            pj_imm32(&t->e, R0, imm);
+            return pjt_alu(t, 4u, w, R3, R1, R0) ? 1 : 0;
+        }
+        if (sub == 2u) {
+            pj_imm32(&t->e, R0, 0xFFFFFFFFu);
+            pj_dpr(&t->e, 4u, 0, R1, R1, R0, 0u, 0u);
+            t->fuse_at = NULL;
+        } else {
+            pj_movw(&t->e, R0, 0u);
+            if (!pjt_alu(t, 5u, w, R1, R0, R1)) return 0;
+        }
+        if (m.mod == 3u) { pjt_putr(t, m.rm, w, R1); return 1; }
+        pjt_v82_store(t, R1, R2, w);
+        return pjt_v82_after_store(t, V83_NEXT());
+    }
+    /* ---- 66 D1/C1 /4,/5,/7 ---------------------------------------------- */
+    if (op == 0xD1u || op == 0xC1u) {
+        unsigned n = 1u;
+        if (op == 0xC1u) {
+            if (!pjt_u8(t, &imm)) return 0;
+            n = imm & 31u;
+        }
+        if (n == 0u) return m.mod == 3u ? 1 : 0;
+        ++pj_v83_n[4];
+        if (m.mod != 3u) {
+            pjt_v82_ptr(t, seg, w, 1);
+            pjt_v82_load(t, R1, R2, w);
+        } else pjt_getr(t, R1, m.rm, w);
+        if (!pjt_shift(t, m.reg, w, n)) return 0;
+        t->fuse_at = NULL;
+        if (m.mod == 3u) { pjt_putr(t, m.rm, w, R1); return 1; }
+        pjt_v82_store(t, R1, R2, w);
+        return pjt_v82_after_store(t, V83_NEXT());
+    }
+    return 0;
+#undef V83_NEXT
+}
+#endif /* V83 PM16 batch helpers */
+#if B86_PJ_V84_PM16 && BB_PJ_PM16_REG_TIER
+static unsigned long pj_v84_n[4];   /* leave movsreg-mem push-seg-mem les-lds */
+/* LEAVE, 16-bit operand: (E)SP <- (E)BP by SS.B, then BP <- pop16.
+ * Checked before any change; 0 = refused, nothing changed. */
+static B86_PM_HOT uint32_t b86_pj_v84_leave16(B86Cpu *c)
+{
+    const int big = (c->pm386.seg[B86_SS].flags & 4u) != 0u;
+    const uint32_t esp = big ? c->r[B86_BP] : ((c->r[B86_SP] & 0xFFFF0000u) | (c->r[B86_BP] & 0xFFFFu));
+    const uint32_t off = big ? esp : (esp & 0xFFFFu);
+    const uint8_t *p = b86_pj_v82_ptr(c, off, 2u | ((uint32_t)B86_SS << 8));
+    if (!p) return 0u;
+    c->r[B86_BP] = (c->r[B86_BP] & 0xFFFF0000u) | (uint32_t)p[0] | ((uint32_t)p[1] << 8);
+    c->r[B86_SP] = big ? esp + 2u : ((esp & 0xFFFF0000u) | ((off + 2u) & 0xFFFFu));
+    return 1u;
+}
+static int pj_v84_claims(const PjT *t, unsigned at, uint32_t op, unsigned segov)
+{
+    unsigned mr, reg;
+    if (op == 0xC9u) return segov == 255u;
+    if (at >= t->n) return 0;
+    mr = t->b[at]; reg = (mr >> 3) & 7u;
+    if ((mr >> 6) == 3u || segov == B86_CS) return 0;          /* memory forms only */
+    if (op == 0x8Cu) return reg <= B86_GS;
+    if (op == 0xFFu) return reg == 6u && segov != 255u;        /* no-override PUSH [mem] is older code */
+    if (op == 0xC4u || op == 0xC5u) return 1;
+    return 0;
+}
+static int pjt_v84_pm16(PjT *t, uint32_t op, unsigned segov, unsigned start, unsigned base_ip)
+{
+#define V84_NEXT() ((base_ip + (t->pos - start)) & 0xFFFFu)
+    PjUnifiedModRM m;
+    unsigned seg = 0u;
+    if (op == 0xC9u) {                                    /* LEAVE */
+        ++pj_v84_n[0];
+        pjt_c(t);
+        pje32(&t->e, 0xE880u | CREG, 0x0FF0u);            /* STMIA r12, {r4-r11} */
+        pj_mov(&t->e, R0, CREG);
+        pjt_call(t, (const void *)b86_pj_v84_leave16);
+        pj_ldst(&t->e, PJ_LDR, CREG, SP, 0u);
+        pje32(&t->e, 0xE890u | CREG, 0x0FF0u);            /* LDMIA r12, {r4-r11} */
+        t->creg_ok = 1;
+        pj_dpi(&t->e, 13u, 1, PC, R0, 0u);
+        pjt_exit_stay(t, 0 /* EQ: refused, nothing changed */, t->ip0, t->ninsn - 1u);
+        return 1;
+    }
+    if (!pjt_unified_modrm(t, &m) || m.mod == 3u) return 0;
+    if (!pjt_unified_ea16(t, m.raw, &seg)) return 0;      /* EA16 -> R1 */
+    if (segov != 255u) seg = segov;
+    if (op == 0x8Cu) {                                    /* MOV m16, Sreg */
+        const unsigned sr = m.reg;
+        ++pj_v84_n[1];
+        pjt_v82_ptr(t, seg, 2u, 1);
+        pjt_c(t);
+        if (sr <= B86_DS) {
+            pj_ldst(&t->e, PJ_LDR, R1, CREG, (unsigned)offsetof(B86Cpu, seg) + 4u * sr);
+            pj_ext(&t->e, 0xFA1Fu, R1, R1);               /* UXTH */
+        } else {
+            pj_ldst(&t->e, PJ_LDRH, R1, CREG, (unsigned)offsetof(B86Cpu, seg386) + 2u * (sr - B86_FS));
+        }
+        pjt_v82_store(t, R1, R2, 2u);
+        return pjt_v82_after_store(t, V84_NEXT());
+    }
+#if B86_PJ_V54_NATIVE_CONTROL && BB_PJ_PM16_GS_STACK_V17
+    if (op == 0xFFu) {                                    /* PUSH seg:[mem] */
+        ++pj_v84_n[2];
+        pjt_v82_ptr(t, seg, 2u, 0);
+        pjt_v82_load(t, R1, R2, 2u);
+        pj_ldst(&t->e, PJ_STR, R1, SP, 16u);              /* value survives the stack check call */
+        pjt_v54_stack_check(t, 1);
+        pj_ldst(&t->e, PJ_LDR, R1, SP, 16u);
+        pjt_v54_store16(t);
+        pjt_v54_sp_step(t, 1);
+        return pjt_v82_after_store(t, V84_NEXT());
+    }
+#else
+    if (op == 0xFFu) return 0;
+#endif
+    if (op == 0xC4u || op == 0xC5u) {                     /* LES / LDS r16, m16:16 */
+        ++pj_v84_n[3];
+        pjt_v82_ptr(t, seg, 4u, 0);
+        pjt_v82_load(t, R1, R2, 4u);
+        pj_ldst(&t->e, PJ_STR, R1, SP, 16u);              /* offset:selector */
+        pj_shift(&t->e, R2, R1, 1u, 16u);                 /* selector */
+        pjt_c(t);
+        pj_mov(&t->e, R0, CREG);
+        pj_movw(&t->e, R1, op == 0xC4u ? B86_ES : B86_DS);
+        pjt_call(t, (const void *)b86_pj_loadseg);
+        pj_dpi(&t->e, 13u, 1, PC, R0, 0u);
+        pjt_exit_stay(t, 0 /* EQ: refused, nothing changed */, t->ip0, t->ninsn - 1u);
+        pj_ldst(&t->e, PJ_LDR, R1, SP, 16u);
+        pjt_putr(t, m.reg, 2u, R1);
+        pjt_exit(t, V84_NEXT(), t->ninsn, 2);             /* new segment: leave the block */
+        return 2;
+    }
+    return 0;
+#undef V84_NEXT
+}
+#endif /* V84 PM16 helpers */
+#if B86_PJ_V85_PM16 && BB_PJ_PM16_REG_TIER
+static unsigned long pj_v85_n[2];   /* enter pop-mem */
+/* ENTER imm16, 0 with 16-bit operand size: push BP; BP <- frame; SP -= size.
+ * Checked before any change; 0 = refused, nothing changed. */
+static B86_PM_HOT uint32_t b86_pj_v85_enter16(B86Cpu *c, uint32_t size)
+{
+    const int big = (c->pm386.seg[B86_SS].flags & 4u) != 0u;
+    const uint32_t esp = c->r[B86_SP];
+    const uint32_t slot = big ? esp - 2u : ((esp - 2u) & 0xFFFFu);
+    uint8_t *p = b86_pj_v82_ptr(c, slot, 2u | ((uint32_t)B86_SS << 8) | 0x1000u);
+    uint32_t frame;
+    if (!p) return 0u;
+    p[0] = (uint8_t)c->r[B86_BP]; p[1] = (uint8_t)(c->r[B86_BP] >> 8);
+    frame = big ? esp - 2u : ((esp & 0xFFFF0000u) | slot);
+    c->r[B86_BP] = (c->r[B86_BP] & 0xFFFF0000u) | (frame & 0xFFFFu);
+    c->r[B86_SP] = big ? frame - size : ((frame & 0xFFFF0000u) | ((frame - size) & 0xFFFFu));
+    return 1u;
+}
+#endif /* V85 PM16 helpers */
 static B86_PJ_COLD int pjt_insn_pm16(PjT *t)
 {
     uint32_t op, modrm, imm;
@@ -6754,6 +7790,121 @@ static B86_PJ_COLD int pjt_insn_pm16(PjT *t)
         else if (x == 0x0Fu) BB_PM16_DIAG_INC(pref66_0f);
         else BB_PM16_DIAG_INC(pref66_other);
     }
+#if B86_PJ_V85_PM16 && B86_PJ_V54_NATIVE_CONTROL && BB_PJ_PM16_GS_STACK_V17
+    {   /* V85: ENTER imm16,0 (C8) and POP m16 (8F /0 memory, optional segment prefix) */
+        unsigned segov = 255u, at = t->pos;
+        uint32_t op85 = op;
+        if (op == 0x26u || op == 0x36u || op == 0x3Eu || op == 0x64u || op == 0x65u) {
+            segov = op == 0x26u ? (unsigned)B86_ES : op == 0x36u ? (unsigned)B86_SS :
+                    op == 0x3Eu ? (unsigned)B86_DS : op == 0x64u ? (unsigned)B86_FS : (unsigned)B86_GS;
+            op85 = at < t->n ? t->b[at] : 0x100u;
+            ++at;
+        }
+        if (op85 == 0xC8u && segov == 255u && at + 2u < t->n && t->b[at + 2u] == 0u) {
+            const uint32_t size = (uint32_t)t->b[at] | ((uint32_t)t->b[at + 1u] << 8);
+            t->pos = at + 3u;
+            ++pj_v85_n[0];
+            pjt_c(t);
+            pje32(&t->e, 0xE880u | CREG, 0x0FF0u);        /* STMIA r12, {r4-r11} */
+            pj_mov(&t->e, R0, CREG);
+            pj_movw(&t->e, R1, size);
+            pjt_call(t, (const void *)b86_pj_v85_enter16);
+            pj_ldst(&t->e, PJ_LDR, CREG, SP, 0u);
+            pje32(&t->e, 0xE890u | CREG, 0x0FF0u);        /* LDMIA r12, {r4-r11} */
+            t->creg_ok = 1;
+            pj_dpi(&t->e, 13u, 1, PC, R0, 0u);
+            pjt_exit_stay(t, 0 /* EQ: refused, nothing changed */, t->ip0, t->ninsn - 1u);
+            {
+                const int r85 = pjt_v82_after_store(t, (base_ip + (t->pos - start)) & 0xFFFFu);
+                do { BB_PM16_DIAG_INC(emit_ok); return r85; } while (0);
+            }
+        }
+        if (op85 == 0x8Fu && at < t->n && (t->b[at] >> 6) != 3u && ((t->b[at] >> 3) & 7u) == 0u) {
+            PjUnifiedModRM m85;
+            unsigned seg85 = 0u;
+            int r85;
+            t->pos = at;
+            if (!pjt_unified_modrm(t, &m85) || !pjt_unified_ea16(t, m85.raw, &seg85)) PJ16_FAIL();
+            if (segov != 255u) seg85 = segov;
+            ++pj_v85_n[1];
+            pjt_v82_ptr(t, seg85, 2u, 1);                  /* destination checked first; ptr in [sp+4] */
+            pjt_v54_stack_check(t, 0);
+            pjt_v54_read16(t);                             /* popped value -> R1 */
+            pjt_v82_store(t, R1, R2, 2u);
+            pjt_v54_sp_step(t, 0);
+            r85 = pjt_v82_after_store(t, (base_ip + (t->pos - start)) & 0xFFFFu);
+            do { BB_PM16_DIAG_INC(emit_ok); return r85; } while (0);
+        }
+    }
+#endif /* V85 PM16 batch */
+#if B86_PJ_V84_PM16
+    {   /* V84: optional segment prefix (no 66), then LEAVE / 8C mem / FF /6 / LES / LDS */
+        unsigned segov = 255u, at = t->pos;
+        uint32_t op84 = op;
+        if (op == 0x26u || op == 0x2Eu || op == 0x36u || op == 0x3Eu || op == 0x64u || op == 0x65u) {
+            segov = op == 0x26u ? (unsigned)B86_ES : op == 0x2Eu ? (unsigned)B86_CS :
+                    op == 0x36u ? (unsigned)B86_SS : op == 0x3Eu ? (unsigned)B86_DS :
+                    op == 0x64u ? (unsigned)B86_FS : (unsigned)B86_GS;
+            op84 = at < t->n ? t->b[at] : 0x100u;
+            ++at;
+        }
+        if (op84 < 0x100u && pj_v84_claims(t, at, op84, segov)) {
+            int r84;
+            t->pos = at;
+            r84 = pjt_v84_pm16(t, op84, segov, start, base_ip);
+            if (!r84) PJ16_FAIL();
+            do { BB_PM16_DIAG_INC(emit_ok); return r84; } while (0);
+        }
+    }
+#endif /* V84 PM16 batch */
+#if B86_PJ_V83_PM16
+    {   /* V83: up to one segment prefix and one 66, in either order */
+        unsigned segov = 255u, at = t->pos, k;
+        int o32 = 0;
+        uint32_t op83 = op;
+        for (k = 0u; k < 2u; ++k) {
+            if (op83 == 0x66u && !o32) o32 = 1;
+            else if ((op83 == 0x26u || op83 == 0x2Eu || op83 == 0x36u || op83 == 0x3Eu ||
+                      op83 == 0x64u || op83 == 0x65u) && segov == 255u)
+                segov = op83 == 0x26u ? (unsigned)B86_ES : op83 == 0x2Eu ? (unsigned)B86_CS :
+                        op83 == 0x36u ? (unsigned)B86_SS : op83 == 0x3Eu ? (unsigned)B86_DS :
+                        op83 == 0x64u ? (unsigned)B86_FS : (unsigned)B86_GS;
+            else break;
+            if (at >= t->n) break;
+            op83 = t->b[at++];
+        }
+        if (op83 != 0x66u && op83 != 0x26u && op83 != 0x2Eu && op83 != 0x36u &&
+            op83 != 0x3Eu && op83 != 0x64u && op83 != 0x65u &&
+            pj_v83_claims(t, at, op83, segov, o32)) {
+            int r83;
+            t->pos = at;
+            r83 = pjt_v83_pm16(t, op83, segov, o32, start, base_ip);
+            if (!r83) PJ16_FAIL();
+            do { BB_PM16_DIAG_INC(emit_ok); return r83; } while (0);
+        }
+    }
+#endif /* V83 PM16 batch */
+#if B86_PJ_V82_PM16
+    {   /* V82: one optional segment prefix, then a claimed 16-bit form */
+        unsigned segov = 255u, at = t->pos;
+        uint32_t op82 = op;
+        if (op == 0x26u || op == 0x2Eu || op == 0x36u || op == 0x3Eu || op == 0x64u || op == 0x65u) {
+            if (t->pos >= t->n) PJ16_FAIL();
+            segov = op == 0x26u ? (unsigned)B86_ES : op == 0x2Eu ? (unsigned)B86_CS :
+                    op == 0x36u ? (unsigned)B86_SS : op == 0x3Eu ? (unsigned)B86_DS :
+                    op == 0x64u ? (unsigned)B86_FS : (unsigned)B86_GS;
+            op82 = t->b[t->pos];
+            at = t->pos + 1u;
+        }
+        if (pj_v82_claims(t, at, op82, segov)) {
+            int r82;
+            if (segov != 255u) ++t->pos;
+            r82 = pjt_v82_pm16(t, op82, segov, start, base_ip);
+            if (!r82) PJ16_FAIL();
+            do { BB_PM16_DIAG_INC(emit_ok); return r82; } while (0);
+        }
+    }
+#endif /* V82 PM16 batch */
 
 /* V9: 16-bit protected-mode, register-only MOVZX/MOVSX.
  * Memory operands and invalid width combinations remain in the interpreter.
@@ -8523,6 +9674,9 @@ static B86_PJ_COLD void pj_hot_reset(B86Cpu *c, B86Pj *j)
     c->pj_stop = 1u;
     printf("[bb386-hotreset] #%lu redirects=%lu restored=%lu stubbed-dead=%lu stubbed-short=%lu stubbed-bad=%lu refused-overlap=%lu link-tramp=%lu (totals) evictions=%lu\n",
            j->hot_resets, pj_hr_redirs, pj_hr_restored, pj_hr_dead, pj_hr_short, pj_hr_bad, pj_redir_overlap, pj_link_tramp, j->evictions);
+#if B86_PJ_V84_HOT_PRECHECK
+    printf("[bb386-v84-hot] precheck-skipped=%lu (SRAM copies not built for redirects that would be refused)\n", pj_v84_skipped);
+#endif
     pj_audit(j, "hotreset");
 }
 /* r72: translate eip into the SRAM tier; returns its entry (0 = refused) */
@@ -8603,6 +9757,28 @@ static inline int pj_v30j_possible_overlap(uint32_t code_off)
 #endif
 /* V30J_LINKFILTER_END */
 
+#if B86_PJ_V84_HOT_PRECHECK
+/* Exactly the refusal tests of pj_redirect() below, without side effects. */
+static B86_PJ_COLD int pj_v84_redirect_feasible(B86Pj *j, uint32_t off)
+{
+    const uint8_t *code = j->code + off + PJ_HDR_BYTES;
+    const uint32_t c0 = off + PJ_HDR_BYTES;
+    int need_exact_scan = 1;
+#if B86_PJ_V30J_LINK_FILTER
+    if (!pj_v30j_possible_overlap(c0)) need_exact_scan = 0;
+#endif
+    if (need_exact_scan) {
+        const uint32_t *lk = pj_links(j);
+        uint32_t i;
+        for (i = 0; i < j->nlinks; ++i) {
+            const uint32_t so = lk[2u * i];
+            if (so + 14u > c0 && so < c0 + 8u) return 0;
+        }
+    }
+    if (code[0] == 0xDFu && code[1] == 0xF8u && code[2] == 0x00u && code[3] == 0xF0u) return 0;
+    return 1;
+}
+#endif /* V84 */
 static B86_PJ_COLD int pj_redirect(B86Pj *j, uint32_t off, uint32_t hot_ent)
 {
     uint8_t *code = j->code + off + PJ_HDR_BYTES;
@@ -9226,6 +10402,9 @@ static B86_PJ_COLD void pj_pcs_promote(B86Cpu *c, B86Pj *j, uint32_t off)
     const uint32_t ent = off + PJ_HDR_BYTES + 1u, lin = pj_hdr(j, off)[0], eip = pj_hdr(j, off)[4];
     uint32_t e2, k;
     if (pj_find_block(j, lin, eip, 0u) != ent) { pj_hdr(j, off)[7] &= 0xF00FFFFFu; return; }   /* not a live block start */
+#if B86_PJ_V84_HOT_PRECHECK
+    if (!pj_v84_redirect_feasible(j, off)) { pj_hdr(j, off)[7] &= 0xF00FFFFFu; ++pj_v84_skipped; return; }
+#endif
     e2 = pj_hot_translate(c, j, eip);
     if (e2 && !(pj_hdr(j, off)[1] & 0x80000000u) && pj_hdr(j, off)[4] == eip && pj_hdr(j, off)[0] == lin &&
         pj_redirect(j, off, e2)) {   /* (the new SRAM copy now heads the page list); r73k: may refuse */
@@ -9530,11 +10709,22 @@ static B86_PM_HOT unsigned b86_pj_try(B86Cpu *c)
             j->hot_used - j->hot_start < (j->hot_cap - (j->hot_start - j->hot_base)) / 2u) j->hot_after /= 2u;
         if (!(hd[1] & 0x80000000u) && (++hd[7] & 0xFFFFFu) >= j->hot_after) {
             hd[7] = 0u;                              /* r72d: a refused promotion backs off */
+#if B86_PJ_V84_HOT_PRECHECK
+            if (!pj_v84_redirect_feasible(j, off)) ++pj_v84_skipped;
+            else {
+                const uint32_t e2 = pj_hot_translate(c, j, c->ip);
+                if (e2 && !(hd[1] & 0x80000000u) && pj_hdr(j, off)[4] == c->ip && pj_redirect(j, off, e2)) {   /* r73k: may refuse */
+                    j->tag[h] = c->ip | 1u; j->ent[h] = e2; ent = e2;
+                    ++j->promotions;
+                }
+            }
+#else
             const uint32_t e2 = pj_hot_translate(c, j, c->ip);
             if (e2 && !(hd[1] & 0x80000000u) && pj_hdr(j, off)[4] == c->ip && pj_redirect(j, off, e2)) {   /* r73k: may refuse */
                 j->tag[h] = c->ip | 1u; j->ent[h] = e2; ent = e2;
                 ++j->promotions;
             }
+#endif
         }
     }
     c->pj_exit = 0u;
@@ -9562,6 +10752,12 @@ static B86_PM_HOT unsigned b86_pj_try(B86Cpu *c)
             j->xla = a1; j->xlh = h1; j->xlt = t1 ? t1 : 1u;
         }
 #endif /* B86_PJ_V30K_XIP_SPLIT: post-entry hardware reads */
+#if B86_PJ_V85_TIER_SPLIT
+        {   /* V85: entries / retired instructions by mode and entry-block tier */
+            const unsigned k5 = (j->pm16_active ? 2u : 0u) + (hot ? 1u : 0u);
+            ++pj_v85_ent[k5]; pj_v85_ins[k5] += n;
+        }
+#endif
     }
 #ifdef B86_PJ_VERIFY
     if (n) {
@@ -9999,6 +11195,26 @@ void b86_pj_mem_profile(const B86Cpu *c, unsigned long out[8])
            (unsigned long)bb_pm16_diag.read_success,
            (unsigned long)bb_pm16_diag.write_attempt,
            (unsigned long)bb_pm16_diag.write_success);
+#if B86_PJ_V82_PM16 && BB_PJ_PM16_REG_TIER
+    printf("[bb386-v82-pm16] push=%lu pop=%lu alu=%lu adc-sbb=%lu movimm=%lu incdec=%lu grp3=%lu shift=%lu shift-cl=%lu segmov=%lu stores=%lu continue=%d\n",
+           pj_v82_n[0], pj_v82_n[1], pj_v82_n[2], pj_v82_n[3], pj_v82_n[4], pj_v82_n[5],
+           pj_v82_n[6], pj_v82_n[7], pj_v82_n[8], pj_v82_n[9], pj_v82_n[11], B86_PJ_V82_STORE_CONTINUE);
+#endif
+#if B86_PJ_V85_TIER_SPLIT
+    printf("[bb386-v85-tier] flat-psram=%lu/%lu flat-sram=%lu/%lu pm16-psram=%lu/%lu pm16-sram=%lu/%lu (entries/retired insns by entry block tier)\n",
+           pj_v85_ent[0], pj_v85_ins[0], pj_v85_ent[1], pj_v85_ins[1], pj_v85_ent[2], pj_v85_ins[2], pj_v85_ent[3], pj_v85_ins[3]);
+#endif
+#if B86_PJ_V85_PM16 && BB_PJ_PM16_REG_TIER
+    printf("[bb386-v85-pm16] enter=%lu pop-mem=%lu\n", pj_v85_n[0], pj_v85_n[1]);
+#endif
+#if B86_PJ_V84_PM16 && BB_PJ_PM16_REG_TIER
+    printf("[bb386-v84-pm16] leave=%lu mov-mem-sreg=%lu push-seg-mem=%lu les-lds=%lu\n",
+           pj_v84_n[0], pj_v84_n[1], pj_v84_n[2], pj_v84_n[3]);
+#endif
+#if B86_PJ_V83_PM16 && BB_PJ_PM16_REG_TIER
+    printf("[bb386-v83-pm16] o32-alu=%lu o32-adc-sbb=%lu o32-incdec=%lu o32-grp3=%lu o32-shift=%lu o32-mov=%lu rotate1=%lu xchg=%lu\n",
+           pj_v83_n[0], pj_v83_n[1], pj_v83_n[2], pj_v83_n[3], pj_v83_n[4], pj_v83_n[5], pj_v83_n[6], pj_v83_n[7]);
+#endif
     printf("[bb386-pm16-native] v9-movext16=%lu v9-movext32=%lu v10-setcc=%lu\n",
            (unsigned long)bb_pm16_diag.v9_movext16,
            (unsigned long)bb_pm16_diag.v9_movext32,
