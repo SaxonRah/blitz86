@@ -12,7 +12,7 @@ function Pico {
  $build="$MicroDos\build-pico\out"
  if(!$NoBuild){Run 'Pico configure' cmake.exe @('-S',"$MicroDos\pico",'-B',$build,('-DBLITZ86_ROOT='+$Blitz86.Replace([char]92,[char]47)));Run 'Pico JIT build' cmake.exe @('--build',$build,'--target','blitz86_pico_jit','--parallel','4')}
  if(!(Test-Path "$build\blitz86_pico_jit.uf2")){throw 'Pico JIT UF2 missing'}
- & "$Blitz86\b86_jit_pico_run.ps1" run -MicroDos $MicroDos -Blitz86 $Blitz86 -Port $Port -Seconds $CaptureSeconds
+ & "$Blitz86\scripts\b86_jit_pico_run.ps1" run -MicroDos $MicroDos -Blitz86 $Blitz86 -Port $Port -Seconds $CaptureSeconds
  if($LASTEXITCODE -ne 0){throw 'Pico native JIT firmware did not pass'}
 }
 function Pi {

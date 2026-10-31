@@ -1,109 +1,141 @@
-# blitz86 unified hardware v5 — HID preflight PowerShell quoting fix
+# blitz86
 
-The v4 Pi preflight used `python -c` with nested quotes, which PowerShell passed incorrectly, producing a Python SyntaxError. This package replaces it with an actual Python script and preserves the existing microDOS v29 HID / rpiboot runner.
+blitz86 is an x86 CPU core for ARM microcontrollers and SBCs. It covers the 8086,
+80186 and 80286 in real mode, and the 386 in both real and protected mode. It has:
 
-Extract **both** `b86_hardware.ps1` and `tools/b86_hid_preflight.py` into `C:\blitz86_v2`, maintaining the `tools` folder.
+- a reference interpreter (`src/interp.c`, with the 386 parts in `src/i386_*.inc`);
+- a dynamic translator with a **Thumb-2** backend for the RP2350 (Cortex-M33,
+  Pimoroni Pico Plus 2) and an **AArch64** backend for the Raspberry Pi Zero 2 W;
+- a separate native tier for 386 protected-mode code (`src/i386_pj.inc`, "PJ"),
+  including 16-bit protected-mode code such as the DOS/4GW kernel.
+
+The translator translates everything. An instruction without a native lowering
+becomes a call to the interpreter for that one instruction, never a rejected
+region. `DESIGN.md` explains the design and `CHANGES.md` records the history.
+
+blitz86 runs DOS 6.22 and DOS/4GW programs such as Descent on the Pico through
+**blitzBUS**. blitzBUS compiles `src/interp.c`, `src/jit.c`, `src/be_t2.c` and
+`include/` straight from this checkout (default `C:\blitz86_v2`).
+
+## Commands (Windows)
+
+Everything starts from `b86.bat`:
 
 ```powershell
 cd C:\blitz86_v2
-Unblock-File .\b86_hardware.ps1
-.\b86_hardware.ps1 pi
+.\b86.bat help
 ```
 
-To independently diagnose bridge discovery:
+**Host development** uses MSVC for the native build and WSL for the cross and
+qemu tests.
 
-```powershell
-python .\tools\b86_hid_preflight.py
+| Command | What it does |
+|---|---|
+| `doctor` | checks the toolchains and paths |
+| `deps` | installs the WSL packages (asks for the sudo password) |
+| `build` | compiles only |
+| `quick` | a short subset of the tests |
+| `test [-FuzzCount N]` | the full suite |
+| `bench` | the instruction-count benchmark |
+| `all` | everything; downloads the SingleStepTests vectors on first use |
+| `clean` | removes the build folders (`-NoClean` keeps them where supported) |
+| `arm-build` | cross-compiles the backends |
+| `capture -Port COM5 -Baud 115200 -Seconds 120` | serial capture; needs `py -m pip install pyserial` |
+| `flash -Uf2 FILE [-BootDrive E:]` | copies a UF2 to a Pico in BOOTSEL mode |
+| `microdos` | microDOS `md.bat test all` |
+| `compare` | microDOS and blitz86 tests side by side (separate workloads, not a speed ratio) |
+
+**Standalone blitz86 probe on hardware.** This is a microDOS sidecar target,
+independent of blitzBUS.
+
+| Command | What it does |
+|---|---|
+| `sidecar` | installs the probe target into microDOS `pico\` |
+| `hw doctor\|build\|flash\|capture\|run [-Port COMx] [-NoFlash]` | interpreter probe on the Pico |
+| `jit-pico doctor\|build\|flash\|capture\|run` | JIT probe on the Pico |
+| `hardware doctor\|pico\|pi\|all\|pico-capture\|pi-capture` | Pico and Pi Zero 2 W runners |
+| `jit-hardware pico\|pi\|all` | JIT probe on the Pico and Pi |
+
+The Pi path needs microDOS `md_pi0w_run.ps1` and the USB HID bridge. Check the
+bridge with `python tools\b86_hid_preflight.py`: it exits 0 when the bridge is
+found, 12 when it isn't, 13 when hidapi is missing, and 14 on a USB error.
+
+`b86 config` shows the settings. They live in `b86.config.psd1`:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `B86_MICRODOS` | `C:\microDOS` | microDOS checkout |
+| `B86_PORT` | empty | Empty means each tool's own default: COM5 for the dev tools, auto-detect for `hw`/`jit-pico`. |
+
+A variable already set in the window wins:
+`$env:B86_PORT = 'COM7'; .\b86.bat hw run`. Logs go to `logs\`.
+
+## Test suite (Linux or WSL)
+
+```sh
+sudo apt install gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf qemu-user
+make sst       # once: download and convert the 8086 SingleStepTests vectors (~170 MB)
+make quick     # a minute: a subset of everything
+make test      # silicon vectors + fuzzer through both backends (FUZZ_N=...)
+make bench     # host-instructions-per-guest-instruction table
+make hwbench   # the microDOS Pico/Pi driver workloads under qemu
+make paged     # Thumb-2 with paged guest memory (the RP2350 build's addressing)
 ```
 
-Result exit codes: 0 found, 12 not found, 13 missing hidapi, 14 USB enumeration error. The Pi runner will then stream rpiboot/HID output and check its blitz86 PASS marker. No firmware or CMake changes. Windows execution is not verified here.
+| Test | What it covers |
+|---|---|
+| `tests/sst_interp.c`, `tests/sst_jit.c` | interpreter and translator against physical-8086 vectors |
+| `tests/sst386.c` | 386 real-mode vectors (`tools/sst386_convert.py`); `tools/sst286_convert.py` handles the 286 set |
+| `tests/fuzz.c` | random structured programs, translator vs interpreter; `FUZZ_TRACE=1` prints the first diverging block |
+| `tests/t386u.c` | single 386 instructions, interpreter vs JIT: `t386u "66 01 E8" [iters]` |
+| `tests/flags/*.c` | flag edge cases (link with `src/jit.c` and a backend) |
+| `tests/bb_386_*` | 386 real-mode, protected-mode and extended-memory smoke tests (link with `src/interp.c`) |
+| `tests/pj_fuzz.c` | protected-mode native tier vs interpreter under `qemu-arm`. Modes 0–2 are flat 32-bit; modes 10–12 are 16-bit protected mode. Build command is in `tests/DOS4GW_HOST.md`. |
+| `tests/pmfz/` | protected-mode fuzz templates (`tests/pmfz/README.md`) |
+| `tests/dos4gw_host.c` | runs real DOS/4GW programs (Descent) on the host (`tests/DOS4GW_HOST.md`) |
 
-r52j: POP r16 (not SP) is a flag-free 3-instruction sequence (load indexed
-from the SS base by uxth(SP + 2k)), and runs of consecutive POPs share one SP
-update. Exact at the 64 KiB wrap and safe when a CMP/Jcc pair keeps its result
-in NZCV across the pops (a first version with a flag-setting wrap guard broke
-exactly that; the fuzzer caught it). Push runs were tried and dropped: with the
-SMC range check and a fallback path the code grew.
+`tests/R71_PJ_NOTES.md` and `tests/R72_PJ_HOT_NOTES.md` describe the
+protected-mode tier and its SRAM hot tier.
 
-r52k: fix the r52i/r52j regression on the Pico (50.0 -> 37.0). The inline REP
-path stopped feeding rep_page_bytes, which blitzBUS uses to pick the 64 KiB
-back buffer to move to SRAM: the buffer stayed in PSRAM (or a misaligned
-window was picked) and PSRAM misses doubled. The inline path counts again
-(7 instructions per REP, fast path only).
+Building with `-DB86_DEBUG_DUMP` writes every translated block to
+`/tmp/blk_CS_IP.bin`. Disassemble them with
+`objdump -D -b binary -marm -M force-thumb` or with `-maarch64`.
 
-r52l: finer code-cache eviction. The ring used to reclaim 16 KiB at a time
-and keep 16 KiB free before every translation, so up to ~32 KiB of the
-232 KiB cache sat empty - and 3DBENCH's working set is right at the cache
-size. Now 4 KiB chunks and a 2 KiB reserve (a block that does not fit
-overflows, evicts another chunk and retries, as before). Host 3DBENCH at 420M
-instructions: blocks evicted 4176 -> 848, guest code retranslated 45K -> 16K
-instructions, translation time 345 -> 137 ms. Both are overridable
-(-DB86_EVICT_CHUNK, -DB86_EVICT_ROOM).
+## Embedding
 
-Tried and dropped: a two-ring cache (nursery + tenured for blocks evicted
-while still needed). Either ring alone is smaller than the working set, so
-it thrashed: 3-7x more evictions than one ring.
+```c
+static uint8_t guest[B86_MEM_BYTES] __attribute__((aligned(64)));  /* PSRAM ok */
+static uint8_t code[192 * 1024] __attribute__((aligned(8)));       /* SRAM, executable */
 
-r52m: fewer C calls for flags.
-* A conditional jump whose producer is not in the block (typical: `call f;
-  jae` where f returns CF from STC/CLC) tests the flag bit in ctx when no
-  lazy record is pending, instead of calling b86h_cond.
-* ADC/SBB right after ADC/SBB (32/48-bit arithmetic chains) gets its carry
-  from the previous record inline (same formula as lazy_eval) instead of
-  materializing all flags in C.
-Host 3DBENCH (600M instructions): b86h_cond 6.70M -> 0.33M, b86h_flags
-0.80M -> 0.35M. Remaining big one: IMUL's CF/OF (b86h_mulflags) before an
-IDIV - left for later (the other flags IMUL leaves undefined would have to
-match the interpreter exactly).
+B86Cpu cpu;
+b86_init(&cpu, guest);
+cpu.int_hook = my_int_hook;   /* return 1 to handle INT n in C (DOS/BIOS HLE) */
+cpu.in8 = my_in;  cpu.out8 = my_out;
+b86_jit_create(&cpu, code, sizeof code);
+b86_set_seg(&cpu, B86_CS, 0x1000); cpu.ip = 0x100;
+for (;;) {
+    int r = b86_jit_run(&cpu, ~0ull);   /* returns on HLT or when cpu.irq != 0 */
+    if (r == B86_EXIT) { cpu.irq = 0; service_timers_usb_video(); }
+    if (r == B86_HALT) wait_for_interrupt();
+}
+```
 
-r52n: DS-absolute operands (globals, `mov ax,[1B8C]`) skip the page lookup.
-Once any guest page is mapped to SRAM, every DS/ES access pays ubfx + table
-load + add. A block with two or more absolute DS operands (before any DS
-write or helper instruction) now starts with a guard: DS == the value at
-translation. Under it, an absolute operand whose page is unmapped at
-translation (and not the last byte of a page) is addressed directly. Guard
-miss: the block is dropped and its entry is never baked again (b86h_dsmiss).
-b86_map_range kills blocks that baked an access in a page being mapped.
-Stats: ds_baked, ds_miss. -DB86_DS_BAKE=0 disables, -DB86_DS_BAKE_MIN sets the
-operand threshold. Fuzz with FUZZ_MAP + B86_OPT_PAGE_ZERO and threshold 1:
-~490 baked blocks, ~30 guard misses per 400 programs, no new mismatches (the
-remaining FUZZ_MAP mismatches - seeds 189, 2108, 2575, 4056 - occur with the
-pre-session JIT too).
+- **Interrupt polling.** Set `cpu.irq` from a timer ISR. Translated code polls it
+  on every backward branch and indirect jump.
+- **Code writes from C.** Writes from C into guest memory that may hold
+  translated code must go through `b86_jit_flush` or the SMC hook.
+- **The full 386 path.** blitzBUS `src/bb_live.c` shows the real integration:
+  paging, protected mode, the PJ tier and the PSRAM/SRAM code caches.
 
-r53: CPU model setting, 80186 instruction set (B86Cpu.model = B86_CPU_186).
-Default stays B86_CPU_8086 (exact 8086: 60-6F are Jcc aliases, C0/C1 RET
-aliases, 0F POP CS, shift counts unmasked). With model 186:
-PUSHA/POPA, BOUND (INT 5; reg form INT 6), PUSH imm16/imm8, IMUL r,r/m,imm,
-INS/OUTS (REP), shift/rotate r/m,imm8, ENTER/LEAVE, shift counts masked to 5
-bits. Interpreter only for now: the JIT ends a block at these opcodes (and at
-shift-by-CL) and the interpreter steps them; hot ones go native next.
-Tests: tools/sst286_convert.py turns the SingleStepTests 80286 real-mode
-vectors (moo2json output) into sst.bin; 286-only faults (segment limit) are
-skipped. SST_MODEL=1 SST_A20=1 build/sst_interp: 28325/28326 (the one ENTER
-miss reads memory the vector does not list); JIT runners: all pass. 8086
-vectors, fuzzers (8086) unchanged; FUZZ_186=1 adds 186 instructions.
+## Layout
 
-r53b: native 80186 paths (Thumb-2): PUSH imm16/imm8, LEAVE, shift by
-immediate (C0/C1 SHL/SHR/SAR, flags dead) and shift by CL with the count
-masked to 5 bits (register form). These decode to the unused op value 0xF1
-(PUSH imm, LEAVE) or to D2/D3 with an immediate count, so no 8086 meaning of
-60-6F / C0-C1 can leak into the analysis. Memory-form shift by CL, PUSHA/POPA,
-IMUL imm, ENTER, BOUND, INS/OUTS still run in the interpreter. AArch64 keeps
-them all in the interpreter. 186 vectors: 3865 of 24986 now native, all pass.
-
-r54: 80286 real mode (B86Cpu.model = B86_CPU_286, includes the 186 set).
-* 0F 01: SGDT/SIDT (6th byte FFh), LGDT/LIDT (24-bit base; LIDT moves the
-  real-mode IVT), SMSW (FFF0h | MSW), LMSW (MP/EM/TS; setting PE -> #UD,
-  protected mode is not implemented yet); 0F 06 CLTS; other 0F xx -> #UD.
-* FLAGS bits 12-15 read 0 (PUSHF, interrupts); PUSH SP pushes the old SP.
-* #UD (INT 6) for the 8086 alias forms: MOV sreg reg>3 / MOV CS,x; LEA, LES,
-  LDS, CALL/JMP FAR with a register operand; 8F/C6/C7 reg != 0; FE reg > 1;
-  FF /7.
-* Divide error pushes the faulting IP; IDIV accepts -128 / -32768 quotients;
-  AAA/AAS adjust AX as a whole; DAA/DAS carry/borrow from the +-6 step and
-  test the old AL > 99h.
-* Not modelled: 286 segment-limit faults in real mode (word access at offset
-  FFFFh -> #GP/#SS); the converter skips those vectors.
-SingleStepTests 80286 v1_real_mode (300 per opcode): 94427/94427 in the
-interpreter, 83809/83809 through the JIT (the rest wrap-dependent). 8086
-suite 61600/61600 unchanged; 186 28325/28326. FUZZ_286=1 for fuzzing.
+| Path | Contents |
+|---|---|
+| `include/` | public API (`b86.h`), CPU state, x87 and protected-mode helpers |
+| `src/interp.c`, `src/i386_*.inc` | interpreter; 386 real mode (`rm*`), protected mode (`pm*`), paging (`pg`) |
+| `src/jit.c`, `src/backend.h`, `src/be_t2.c`, `src/be_a64.c` | translator, backend contract, Thumb-2 and AArch64 backends |
+| `src/i386_pj.inc`, `src/b86_v30f_*` | protected-mode native tier |
+| `tests/`, `tools/` | test programs; vector fetch/convert scripts, host-instruction counter, Windows CMake |
+| `b86.bat`, `b86.config.psd1`, `scripts/` | Windows commands |
+| `pico/`, `integration/` | standalone probe sources, copied into microDOS by `b86 sidecar` |
+| `blitzOverview/` | project overview images |

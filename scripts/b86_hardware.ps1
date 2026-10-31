@@ -55,7 +55,7 @@ function Pico {
  Need "$MicroDos\pico\blitz86_target.cmake"
  Need "$MicroDos\pico\blitz86_pico_probe.c"
  Need "$MicroDos\build-pico\out\CMakeCache.txt"
- Need "$Blitz86\b86_hw.ps1"
+ Need "$Blitz86\scripts\b86_hw.ps1"
  if(!$NoBuild){
   Exec 'Pico configure' 'cmake.exe' @('-S',"$MicroDos\pico",'-B',"$MicroDos\build-pico\out",('-DBLITZ86_ROOT=' + $Blitz86.Replace([char]92,[char]47)))
   Verify-Target (Join-Path $MicroDos 'build-pico\out') 'blitz86_pico_probe'
@@ -69,7 +69,7 @@ function Pico {
  if($Port){$params.Port=$Port}
  # b86_hw.ps1 is the already validated microDOS sidecar runner.
  # It handles picotool, USB re-enumeration, DTR and PASS/FAIL logging.
- $runner=Join-Path $Blitz86 'b86_hw.ps1'
+ $runner=Join-Path $Blitz86 'scripts\b86_hw.ps1'
  Note 'BEGIN existing Pico build/flash/capture runner'
  & $runner @params
  if($LASTEXITCODE -ne 0){throw "Pico runner exited $LASTEXITCODE"}
@@ -140,7 +140,7 @@ try{
  Note "blitz86 unified hardware runner $Action"
  switch($Action){
   doctor {
-   foreach($f in @("$MicroDos\pico\blitz86_target.cmake","$MicroDos\pi0w\blitz86_pi_target.cmake","$MicroDos\md_pi0w_run.ps1","$Blitz86\b86_hw.ps1")) {Note "$f : $(Test-Path $f)"}
+   foreach($f in @("$MicroDos\pico\blitz86_target.cmake","$MicroDos\pi0w\blitz86_pi_target.cmake","$MicroDos\md_pi0w_run.ps1","$Blitz86\scripts\b86_hw.ps1")) {Note "$f : $(Test-Path $f)"}
   }
   pico { Pico }
   pi { Pi }

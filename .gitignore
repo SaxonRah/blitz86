@@ -1,5 +1,9 @@
-build/
-sst/
+# build outputs and local data created by make / b86.bat
+/build/
+/build-win/
+/build-arm-win/
+/logs/
+/sst/
 *.log
-/build-win
-/logs
+__pycache__/
+*.pyc
