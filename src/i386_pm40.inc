@@ -294,7 +294,14 @@ static inline void p40_sp_add(B86Cpu *c, uint32_t n)
 /* segment registers (selectors) and checked loads through the PM2 planner,
  * exactly as the stage chain does them (CPL0 only, like PM9/PM26). */
 static inline uint32_t p40_sel(const B86Cpu *c, unsigned s) { return (s <= B86_DS ? c->seg[s] : c->seg386[s - B86_FS]) & 0xFFFFu; }
+#ifndef B86_PJ_V86_SRAM   /* V86: hot runtime functions in SRAM instead of flash */
+#define B86_PJ_V86_SRAM 1
+#endif
+#if B86_PJ_V86_SRAM
+static __attribute__((noinline)) B86_PM_HOT int p40_plan(const B86Cpu *c, unsigned s, uint16_t sel, B86PM2Plan *plan)
+#else
 static int p40_plan(const B86Cpu *c, unsigned s, uint16_t sel, B86PM2Plan *plan)
+#endif
 {
     B86PM2Fault fault;
     if (c->seg[B86_CS] & 3u) return 0;

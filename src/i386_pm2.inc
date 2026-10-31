@@ -5,6 +5,9 @@
 #ifndef B86_PM2_FLASH
 #define B86_PM2_FLASH __attribute__((noinline,cold,section(".text.bb386_flash")))
 #endif
+#ifndef B86_PJ_V86_SRAM   /* V86: hot runtime functions in SRAM instead of flash */
+#define B86_PJ_V86_SRAM 1
+#endif
 
 static B86_PM2_FLASH int b86_pm2_fault(B86PM2Fault *fault,
                                       unsigned vector, unsigned code)
@@ -15,7 +18,11 @@ static B86_PM2_FLASH int b86_pm2_fault(B86PM2Fault *fault,
     return B86_PM2_FAULT;
 }
 
+#if B86_PJ_V86_SRAM
+__attribute__((noinline)) B86_PM_HOT int b86_pm2_plan_segment(const B86Cpu *cpu, unsigned seg,
+#else
 B86_PM2_FLASH int b86_pm2_plan_segment(const B86Cpu *cpu, unsigned seg,
+#endif
                                         uint16_t selector, unsigned cpl,
                                         uint32_t target_eip, B86PM2Plan *plan,
                                         B86PM2Fault *fault)
@@ -97,7 +104,11 @@ B86_PM2_FLASH int b86_pm2_plan_segment(const B86Cpu *cpu, unsigned seg,
     return B86_PM2_OK;
 }
 
+#if B86_PJ_V86_SRAM
+__attribute__((noinline)) B86_PM_HOT int b86_pm2_commit_segment(B86Cpu *cpu,
+#else
 B86_PM2_FLASH int b86_pm2_commit_segment(B86Cpu *cpu,
+#endif
                                           const B86PM2Plan *plan, unsigned cpl)
 {
     if (!cpu || !plan || cpl > 3u || plan->magic != B86_PM2_PLAN_MAGIC ||

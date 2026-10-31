@@ -3,8 +3,15 @@
  */
 #include "b86_pm0.h"
 #define B86_PM0_FLASH __attribute__((noinline,cold,section(".text.bb386_flash")))
+#ifndef B86_PJ_V86_SRAM   /* V86: hot runtime functions in SRAM instead of flash */
+#define B86_PJ_V86_SRAM 1
+#endif
 
+#if B86_PJ_V86_SRAM
+__attribute__((noinline)) B86_PM_HOT int b86_pm0_decode(const uint8_t bytes[8], uint16_t selector,
+#else
 B86_PM0_FLASH int b86_pm0_decode(const uint8_t bytes[8], uint16_t selector,
+#endif
                                  B86PM0Desc *out)
 {
     uint32_t limit, base;

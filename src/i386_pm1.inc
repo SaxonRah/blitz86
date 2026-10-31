@@ -7,6 +7,9 @@
 #ifndef B86_PM1_FLASH
 #define B86_PM1_FLASH __attribute__((noinline,cold,section(".text.bb386_flash")))
 #endif
+#ifndef B86_PJ_V86_SRAM   /* V86: hot runtime functions in SRAM instead of flash */
+#define B86_PJ_V86_SRAM 1
+#endif
 
 static B86_PM1_FLASH int b86_pm1_table(const B86Cpu *cpu, uint16_t selector,
                                       uint32_t *base, uint32_t *limit)
@@ -22,7 +25,11 @@ static B86_PM1_FLASH int b86_pm1_table(const B86Cpu *cpu, uint16_t selector,
     return B86_PM1_OK;
 }
 
+#if B86_PJ_V86_SRAM
+__attribute__((noinline)) B86_PM_HOT int b86_pm1_descriptor(const B86Cpu *cpu,
+#else
 B86_PM1_FLASH int b86_pm1_descriptor(const B86Cpu *cpu,
+#endif
                                       uint16_t selector, B86PM0Desc *out)
 {
     uint32_t base, limit, index;

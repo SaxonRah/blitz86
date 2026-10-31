@@ -352,6 +352,17 @@ static unsigned long pj_v84_skipped;   /* promotions skipped before building the
 #if B86_PJ_V85_TIER_SPLIT
 static unsigned long pj_v85_ent[4], pj_v85_ins[4];   /* flat-psram flat-sram pm16-psram pm16-sram */
 #endif
+/* V87: native FS:/GS: overrides in flat 32-bit code (B86_PJ_V87_FSGS).
+ * 0 preprocesses byte-identically to V86. */
+#ifndef B86_PJ_V87_FSGS
+#define B86_PJ_V87_FSGS 1
+#endif
+#if B86_PJ_V87_FSGS != 0 && B86_PJ_V87_FSGS != 1
+#error B86_PJ_V87_FSGS must be 0 or 1
+#endif
+#if B86_PJ_V87_FSGS
+static unsigned long pj_v87_n[4];   /* guarded-ea, register-form, rolled-back, denied */
+#endif
 /* V80c: F2 SCAS with ECX > 1 returns to the already hardware-working
  * checked REPNE C helper. Only ECX == 1 enters the native single-comparison
  * path, which completes without restarting an unmapped guest EIP. */
@@ -560,6 +571,9 @@ static unsigned long pj_v85_ent[4], pj_v85_ins[4];   /* flat-psram flat-sram pm1
 #endif
 #ifndef B86_PJ_COLD
 #define B86_PJ_COLD __attribute__((noinline,cold))
+#ifndef B86_PJ_V86_SRAM   /* V86: hot runtime functions in SRAM instead of flash */
+#define B86_PJ_V86_SRAM 1
+#endif
 #endif
 
 /* V15 near-Jcc switch: defined even when PM16 tier is disabled, so the
@@ -1198,7 +1212,11 @@ static B86_PJ_COLD void pj_kill_block(B86Cpu *c, B86Pj *j, uint32_t off)
     ++j->smc_kills;
     c->pj_stop = 1u;                              /* leave native code at the next chain point */
 }
+#if B86_PJ_V86_SRAM
+static __attribute__((noinline)) B86_PM_HOT void pj_kill_page_range(B86Cpu *c, B86Pj *j, uint32_t pg, uint32_t lo, uint32_t hi)
+#else
 static B86_PJ_COLD void pj_kill_page_range(B86Cpu *c, B86Pj *j, uint32_t pg, uint32_t lo, uint32_t hi)
+#endif
 {
     const int slot = pj_cps_slot(j, pg);
     uint32_t at = slot ? pj_heads(j)[slot - 1] : 0u;
@@ -1782,6 +1800,9 @@ typedef struct {
     int ikind_clear;                             /* lz_ikind known to be LZ_NONE */
     int creg_ok;                                 /* r12 holds the B86Cpu pointer */
     uint8_t *fuse_at;                            /* r71: ARM flags valid for last_kind if e.p == fuse_at */
+#if B86_PJ_V87_FSGS
+    uint8_t segov, segov_used;                   /* V87: 0 or B86_FS/B86_GS for the current flat insn */
+#endif
 #if B86_PJ_V81_JOIN_SAFE
     struct { uint8_t *at; int lk; uint8_t ik, cr; } br[16];   /* V81: facts on open forward edges */
     unsigned nbr;
@@ -1929,13 +1950,21 @@ static void pjt_addimm(PjT *t, int d, int n, uint32_t v)
 #ifndef BB_PJ_ABS_ADDR_V7
 #define BB_PJ_ABS_ADDR_V7 1
 #endif
+#if B86_PJ_V87_FSGS
+static uint8_t *pjt_bfwd(PjT *t, int cond);       /* V87: used by the FS/GS guard below */
+static void pjt_here(PjT *t, uint8_t *at);
+#endif
 static int pjt_modrm(PjT *t, PjM *m)
 {
     uint32_t sib, disp = 0u;
     PjUnifiedModRM head;
     if (!pjt_unified_modrm(t, &head)) return 0;
     m->mod = head.mod; m->reg = head.reg; m->rm = head.rm;
+#if B86_PJ_V87_FSGS
+    if (m->mod == 3u) { if (t->segov) { t->segov_used = 1u; ++pj_v87_n[1]; } return 1; }
+#else
     if (m->mod == 3u) return 1;
+#endif
     if (m->rm == 4u) {
         unsigned base, idx, sc;
         int have = 0;
@@ -1963,6 +1992,43 @@ static int pjt_modrm(PjT *t, PjM *m)
     if (m->mod == 1u) { if (!pjt_u8(t, &disp)) return 0; disp = (uint32_t)(int32_t)(int8_t)disp; }
     else if (m->mod == 2u) { if (!pjt_u32(t, &disp)) return 0; }
     pjt_addimm(t, R1, R1, disp);
+#if B86_PJ_V87_FSGS
+    if (t->segov) {
+        /* R1 = 32-bit offset. Guard the FS/GS cache, then R1 = base + offset.
+         * Any failure leaves before the instruction ran (interpreter faults). */
+        const unsigned sb = (unsigned)offsetof(B86Cpu, pm386.seg) + (unsigned)sizeof(B86PM1Cache) * t->segov;
+        uint8_t *f[5], *ok;
+        unsigned k;
+        pjt_c(t);                                        /* R12 before the push */
+        pje16(&t->e, 0xB40Cu);                           /* PUSH {r2, r3} */
+        pj_ldst(&t->e, PJ_LDRB, R2, CREG, sb + (unsigned)offsetof(B86PM1Cache, valid));
+        pj_dpi(&t->e, 13u, 1, PC, R2, 0u);
+        f[0] = pjt_bfwd(t, 0 /* EQ: invalid */);
+        pj_ldst(&t->e, PJ_LDRB, R2, CREG, sb + (unsigned)offsetof(B86PM1Cache, reserved));
+        pj_dpi(&t->e, 13u, 1, PC, R2, 0u);
+        f[1] = pjt_bfwd(t, 1 /* NE: reserved */);
+        pj_ldst(&t->e, PJ_LDRB, R2, CREG, sb + (unsigned)offsetof(B86PM1Cache, access));
+        pj_dpi(&t->e, 0u, 0, R2, R2, 0x9Eu);             /* P S code E W */
+        pj_dpi(&t->e, 13u, 1, PC, R2, 0x92u);            /* present writable expand-up data */
+        f[2] = pjt_bfwd(t, 1 /* NE */);
+        pj_dpi(&t->e, 8u, 1, R2, R1, 7u);                /* ADDS r2, r1, #7 */
+        f[3] = pjt_bfwd(t, 2 /* CS: offset wraps */);
+        pj_ldst(&t->e, PJ_LDR, R3, CREG, sb + (unsigned)offsetof(B86PM1Cache, limit));
+        pj_dpr(&t->e, 13u, 1, PC, R2, R3, 0u, 0u);       /* CMP r2, limit */
+        f[4] = pjt_bfwd(t, 8 /* HI: past the limit */);
+        pj_ldst(&t->e, PJ_LDR, R2, CREG, sb + (unsigned)offsetof(B86PM1Cache, base));
+        pj_dpr(&t->e, 8u, 0, R1, R1, R2, 0u, 0u);        /* R1 = linear */
+        pje16(&t->e, 0xBC0Cu);                           /* POP {r2, r3} */
+        ok = pjt_bfwd(t, -1);
+        for (k = 0u; k < 5u; ++k) pjt_here(t, f[k]);
+        pje16(&t->e, 0xBC0Cu);                           /* POP {r2, r3} */
+        pjt_exit_stay(t, -1, t->ip0, t->ninsn - 1u);
+        pjt_here(t, ok);
+        t->fuse_at = NULL;
+        t->segov_used = 1u;
+        ++pj_v87_n[0];
+    }
+#endif
     return 1;
 }
 /* host pointer for linear R1 -> R0 through the shared trampoline:
@@ -2508,6 +2574,13 @@ static int pjt_unified_head(PjT *t, unsigned policy, PjUnifiedHead *h)
             if (op == 0x26u) es_override = 1u;
             segpref = 1u; continue;
         }
+#if B86_PJ_V87_FSGS
+        if (op == 0x64u || op == 0x65u) {         /* V87: one FS:/GS: override */
+            if (t->segov) return 0;
+            t->segov = (uint8_t)(op == 0x64u ? B86_FS : B86_GS);
+            continue;
+        }
+#endif
         if (op == 0xF3u) { repz = 1u; continue; }
         if (op == 0xF2u) { repz = 1u; repne = 1u; continue; }
         break;
@@ -2805,8 +2878,33 @@ static void pjt_v76_div64(PjT *t, int is_signed)
 }
 #endif /* V76 native full 64/32 division emitter */
 
+#if B86_PJ_V87_FSGS
+static B86_PJ_COLD int pjt_insn_v87core(PjT *t);
+/* V87: an FS:/GS: prefix is honoured only by pjt_modrm(); roll back any
+ * prefixed instruction whose emitter addressed memory another way. */
 static B86_PJ_COLD int pjt_insn(PjT *t)
 {
+    const unsigned pos0 = t->pos, nex0 = t->nex, ninsn0 = t->ninsn;
+    uint8_t *const e0 = t->e.p, *const fz0 = t->fuse_at;
+    const int lk0 = t->last_kind, ik0 = t->ikind_clear, cr0 = t->creg_ok;
+    int r;
+    t->segov = 0u; t->segov_used = 0u;
+    r = pjt_insn_v87core(t);
+    if (r > 0 && t->segov && !t->segov_used) {
+        t->ninsn = ninsn0; t->pos = pos0; t->e.p = e0; t->nex = nex0;
+        t->last_kind = lk0; t->ikind_clear = ik0; t->creg_ok = cr0; t->fuse_at = fz0;
+        ++pj_v87_n[2];
+        r = 0;
+    }
+    t->segov = 0u;
+    return r;
+}
+static B86_PJ_COLD int pjt_insn_v87core(PjT *t)
+{
+#else
+static B86_PJ_COLD int pjt_insn(PjT *t)
+{
+#endif
     PjM m;
     PjOp o;
     uint32_t op, imm, op2;
@@ -2827,6 +2925,17 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
         segpref = head.segpref; es_override = head.es_override;
         w = head.operand_width;
     }
+#if B86_PJ_V87_FSGS
+    if (t->segov) {
+        /* LEA has no segment; segment and system loads keep their own paths. */
+        const uint32_t nx = t->pos < t->n ? t->b[t->pos] : 0x100u;
+        if (segpref || op == 0x8Du || op == 0x8Eu || op == 0xC4u || op == 0xC5u || op == 0x62u ||
+            (op == 0x0Fu && (nx == 0x00u || nx == 0x01u || nx == 0xB2u || nx == 0xB4u || nx == 0xB5u || nx >= 0x100u))) {
+            ++pj_v87_n[3];
+            PJ_FAIL();
+        }
+    }
+#endif
     /* BB_PJ_ES_MOV8_V1: exactly one 26h prefix and MOV r8,ES:[r/m].
      * Offset R1 is already calculated by the standard 32-bit ModRM decoder.
      * A checked C helper returns the mapped byte pointer; on failure, exit
@@ -6026,7 +6135,11 @@ static B86_PJ_COLD int pj_v30l_equal(const uint8_t *a,
  * remap at a *host*-aligned 4K boundary through c->pt; a guest 4K boundary
  * need not be host-aligned. Respect both, and B86_MEM_BYTES, so each memcmp
  * sees precisely the bytes the V29 per-byte loop would have read. */
+#if B86_PJ_V86_SRAM
+static __attribute__((noinline)) B86_PM_HOT int pj_v30g_source_equal(B86Cpu *c, uint32_t lin,
+#else
 static B86_PJ_COLD int pj_v30g_source_equal(B86Cpu *c, uint32_t lin,
+#endif
                                uint32_t id0, uint32_t id1,
                                const uint8_t *saved, uint32_t n)
 {
@@ -6060,7 +6173,11 @@ static B86_PJ_COLD int pj_v30g_source_equal(B86Cpu *c, uint32_t lin,
 #endif
 /* Only run once at each RM epoch / TLB epoch / PG mode or CR3 change.
  * A corrupt header or invalid physical provenance fails CLOSED to V27 flush. */
+#if B86_PJ_V86_SRAM
+static __attribute__((noinline)) B86_PM_HOT int pj_v29_walk(B86Cpu *c, B86Pj *j,
+#else
 static B86_PJ_COLD int pj_v29_walk(B86Cpu *c, B86Pj *j,
+#endif
                                   uint32_t lo, uint32_t hi)
 {
     uint32_t off = lo;
@@ -6150,7 +6267,11 @@ static B86_PJ_COLD int pj_v31_unlink_all(B86Pj *j);
 /* Check the block chosen by the ORIGINAL page-list order, never an older
  * duplicate picked from a separate cache. All executable entry paths use
  * this wrapper after the first lazy epoch. */
+#if B86_PJ_V86_SRAM
+static __attribute__((noinline)) B86_PM_HOT uint32_t pj_v31_find(B86Cpu *c, B86Pj *j,
+#else
 static B86_PJ_COLD uint32_t pj_v31_find(B86Cpu *c, B86Pj *j,
+#endif
                                        uint32_t lin, uint32_t eip,
                                        uint32_t pm16)
 {
@@ -9390,7 +9511,11 @@ static B86_PJ_COLD void pj_audit(B86Pj *j, const char *where)
 #if BB_PJ_LINK_SAFE_EVICT_V12
 static uint32_t pj_aud_bw(const uint8_t *at); /* existing audit decoder below */
 static unsigned long pj_v12_stale_link_drops;
+#if B86_PJ_V86_SRAM
+static __attribute__((noinline)) B86_PM_HOT int pj_v12_link_intact(const B86Pj *j, uint32_t so, uint32_t to)
+#else
 static int pj_v12_link_intact(const B86Pj *j, uint32_t so, uint32_t to)
+#endif
 {
     const uint8_t *const stub = j->code + so;
     const uint8_t *const branch = stub + 10u;
@@ -9759,7 +9884,11 @@ static inline int pj_v30j_possible_overlap(uint32_t code_off)
 
 #if B86_PJ_V84_HOT_PRECHECK
 /* Exactly the refusal tests of pj_redirect() below, without side effects. */
+#if B86_PJ_V86_SRAM
+static __attribute__((noinline)) B86_PM_HOT int pj_v84_redirect_feasible(B86Pj *j, uint32_t off)
+#else
 static B86_PJ_COLD int pj_v84_redirect_feasible(B86Pj *j, uint32_t off)
+#endif
 {
     const uint8_t *code = j->code + off + PJ_HDR_BYTES;
     const uint32_t c0 = off + PJ_HDR_BYTES;
@@ -10224,7 +10353,11 @@ static B86_PJ_COLD int pj_v30f_defer(B86Cpu *c, B86Pj *j, uint32_t eip)
 }
 /* Always-on cold telemetry; no eviction policy changes. */
 
+#if B86_PJ_V86_SRAM
+static __attribute__((noinline)) B86_PM_HOT void b86_pj_link(B86Cpu *c)
+#else
 static B86_PJ_COLD void b86_pj_link(B86Cpu *c)
+#endif
 {
     B86Pj *j = b86_pj_state(c);
     uint8_t *stub = (uint8_t *)((c->pj_exit & ~(uintptr_t)1u) - 4u);    /* r71: LR after BL exit_s at +0 */
@@ -11199,6 +11332,10 @@ void b86_pj_mem_profile(const B86Cpu *c, unsigned long out[8])
     printf("[bb386-v82-pm16] push=%lu pop=%lu alu=%lu adc-sbb=%lu movimm=%lu incdec=%lu grp3=%lu shift=%lu shift-cl=%lu segmov=%lu stores=%lu continue=%d\n",
            pj_v82_n[0], pj_v82_n[1], pj_v82_n[2], pj_v82_n[3], pj_v82_n[4], pj_v82_n[5],
            pj_v82_n[6], pj_v82_n[7], pj_v82_n[8], pj_v82_n[9], pj_v82_n[11], B86_PJ_V82_STORE_CONTINUE);
+#endif
+#if B86_PJ_V87_FSGS
+    printf("[bb386-v87-fsgs] guarded-mem=%lu reg-forms=%lu rolled-back=%lu denied=%lu\n",
+           pj_v87_n[0], pj_v87_n[1], pj_v87_n[2], pj_v87_n[3]);
 #endif
 #if B86_PJ_V85_TIER_SPLIT
     printf("[bb386-v85-tier] flat-psram=%lu/%lu flat-sram=%lu/%lu pm16-psram=%lu/%lu pm16-sram=%lu/%lu (entries/retired insns by entry block tier)\n",

@@ -1396,7 +1396,14 @@ B86_HOT static int b86_step_internal(B86Cpu *c)
    directly to 16-bit register slots.  The wrapper is never used by 286.
    A 66h instruction writes the entire 32-bit destination, so skip merge. */
 /* BB_386_RM2_FLASH_SRAM_V1: 386-only upper-register preservation in XIP flash. */
+#ifndef B86_PJ_V86_SRAM   /* V86: hot runtime functions in SRAM instead of flash */
+#define B86_PJ_V86_SRAM 1
+#endif
+#if B86_PJ_V86_SRAM
+static __attribute__((noinline)) B86_PM_HOT int b86_386_step_flash(B86Cpu *c)
+#else
 static __attribute__((noinline, cold, section(".text.bb386_flash"))) int b86_386_step_flash(B86Cpu *c)
+#endif
 {
     uint32_t hi[8];
     for (unsigned i = 0; i < 8; ++i) hi[i] = c->r[i] & 0xFFFF0000u;
