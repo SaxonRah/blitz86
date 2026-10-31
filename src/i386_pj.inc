@@ -363,6 +363,59 @@ static unsigned long pj_v85_ent[4], pj_v85_ins[4];   /* flat-psram flat-sram pm1
 #if B86_PJ_V87_FSGS
 static unsigned long pj_v87_n[4];   /* guarded-ea, register-form, rolled-back, denied */
 #endif
+/* V88: compact per-page block lists (B86_PJ_V88_LISTS). 0 preprocesses
+ * byte-identically to V87. */
+#ifndef B86_PJ_V88_LISTS
+#define B86_PJ_V88_LISTS 1
+#endif
+#if B86_PJ_V88_LISTS != 0 && B86_PJ_V88_LISTS != 1
+#error B86_PJ_V88_LISTS must be 0 or 1
+#endif
+#if B86_PJ_V88_LISTS
+static unsigned long pj_v88_n[6];   /* find-walks find-steps find-unlinked kill-walks kill-steps kill-unlinked */
+#endif
+/* V89: B86_PJ_V89_MTF (move-to-front page lists) and B86_PJ_V89_LINEFILTER
+ * (hashed 64-byte code-line filter in front of the store walk). Both 0
+ * preprocess byte-identically to V88. */
+#ifndef B86_PJ_V89_MTF
+#define B86_PJ_V89_MTF 1
+#endif
+#ifndef B86_PJ_V89_LINEFILTER
+#define B86_PJ_V89_LINEFILTER 1
+#endif
+#if (B86_PJ_V89_MTF != 0 && B86_PJ_V89_MTF != 1) || (B86_PJ_V89_LINEFILTER != 0 && B86_PJ_V89_LINEFILTER != 1)
+#error V89 controls must be 0 or 1
+#endif
+#if B86_PJ_V89_MTF || B86_PJ_V89_LINEFILTER
+static unsigned long pj_v89_n[4];   /* mtf-moves line-skips line-walks line-marks */
+#endif
+#if B86_PJ_V89_LINEFILTER
+static uint32_t pj_v89_lines[1024];                    /* 32768-bit filter, 4 KB SRAM */
+#define PJ_V89_LH(line) ((((uint32_t)(line)) * 0x9E3779B1u) >> 17)
+static inline void pj_v89_mark(uint32_t lin, uint32_t len)
+{
+    uint32_t l = lin >> 6;
+    const uint32_t e = (lin + (len ? len : 1u) - 1u) >> 6;
+    for (;; ++l) {
+        const uint32_t h = PJ_V89_LH(l);
+        pj_v89_lines[h >> 5] |= 1u << (h & 31u);
+        if (l == e) break;
+    }
+    ++pj_v89_n[3];
+}
+/* 1 if any 64-byte line of [lo, hi) may hold translated code */
+static inline int pj_v89_maybe(uint32_t lo, uint32_t hi)
+{
+    uint32_t l = lo >> 6;
+    const uint32_t e = (hi - 1u) >> 6;
+    if (e - l > 64u) return 1;
+    for (;; ++l) {
+        const uint32_t h = PJ_V89_LH(l);
+        if (pj_v89_lines[h >> 5] & (1u << (h & 31u))) return 1;
+        if (l == e) return 0;
+    }
+}
+#endif
 /* V80c: F2 SCAS with ECX > 1 returns to the already hardware-working
  * checked REPNE C helper. Only ECX == 1 enters the native single-comparison
  * path, which completes without restarting an unmapped guest EIP. */
@@ -1181,12 +1234,24 @@ static inline void b86_pj_note_store(B86Cpu *c, uint32_t lin, uint32_t n)
         const uint32_t h = PJ_PGH(a);
         if ((j->cpg[h >> 5] & (1u << (h & 31u))) && pj_cps_has(j, a)) {
             ++j->smc_events;
+#if B86_PJ_V89_LINEFILTER
+            {   /* V89: walk only when the stored bytes of this page may hold code */
+                const uint32_t plo = a << 12, lo = lin > plo ? lin : plo;
+                const uint32_t ph = plo + 0x1000u, end = lin + n, hi = (end - 1u) < (ph - 1u) ? end : ph;
+                if (!pj_v89_maybe(lo, hi)) { ++pj_v89_n[1]; if (a == b) break; continue; }
+                ++pj_v89_n[2];
+            }
+#endif
             pj_kill_page_range(c, j, a, lin, lin + n);   /* r71: only overlapping blocks */
         }
         if (a == b) break;
     }
 }
+#if B86_PJ_V88_LISTS
+static __attribute__((noinline)) B86_PM_HOT void pj_kill_block(B86Cpu *c, B86Pj *j, uint32_t off)
+#else
 static B86_PJ_COLD void pj_kill_block(B86Cpu *c, B86Pj *j, uint32_t off)
+#endif
 {
     uint32_t *hd = pj_hdr(j, off);
     const uint32_t ent = off + PJ_HDR_BYTES + 1u, eip = hd[4];
@@ -1218,6 +1283,23 @@ static __attribute__((noinline)) B86_PM_HOT void pj_kill_page_range(B86Cpu *c, B
 static B86_PJ_COLD void pj_kill_page_range(B86Cpu *c, B86Pj *j, uint32_t pg, uint32_t lo, uint32_t hi)
 #endif
 {
+#if B86_PJ_V88_LISTS
+    const int slot = pj_cps_slot(j, pg);
+    uint32_t *link = slot ? &pj_heads(j)[slot - 1] : NULL;
+    uint32_t at = link ? *link : 0u;
+    ++pj_v88_n[3];
+    while (at) {
+        uint32_t *hd = pj_hdr(j, at - 1u);
+        const uint32_t start = hd[0], len = hd[1] & 0x3FFFFFFFu;
+        uint32_t *nl = (start >> 12) == pg ? &hd[2] : &hd[3];
+        const uint32_t next = *nl;
+        ++pj_v88_n[4];
+        if (!(hd[1] & 0x80000000u) && start < hi && lo < start + len) pj_kill_block(c, j, at - 1u);
+        if (hd[1] & 0x80000000u) { *link = next; ++pj_v88_n[5]; }   /* dead or redirected: unlink */
+        else link = nl;
+        at = next;
+    }
+#else
     const int slot = pj_cps_slot(j, pg);
     uint32_t at = slot ? pj_heads(j)[slot - 1] : 0u;
     while (at) {
@@ -1227,12 +1309,48 @@ static B86_PJ_COLD void pj_kill_page_range(B86Cpu *c, B86Pj *j, uint32_t pg, uin
         if (!(hd[1] & 0x80000000u) && start < hi && lo < start + len) pj_kill_block(c, j, at - 1u);
         at = next;
     }
+#endif
 }
 /* r71: BB_PJ_BLOCK_REFIND_V1. The EIP hash tables are direct-mapped: two hot
  * blocks with colliding hashes used to evict each other and get translated
  * again on every alternation (1.14M translations and 644 buffer refills in
  * 600M demo instructions). On a hash miss, look the block up in its code
  * page's list first; only translate when no live copy exists. */
+#if B86_PJ_V88_LISTS
+/* V88: pj_find_block() that unlinks killed entries from the list it walks. */
+static __attribute__((noinline)) B86_PM_HOT uint32_t pj_v88_find(B86Pj *j, uint32_t lin, uint32_t eip, uint32_t pm16)
+{
+    const uint32_t pg = lin >> 12;
+    const int slot = pj_cps_slot(j, pg);
+    uint32_t *link = slot ? &pj_heads(j)[slot - 1] : NULL;
+    uint32_t at = link ? *link : 0u;
+    ++pj_v88_n[0];
+    while (at) {
+        uint32_t *hd = pj_hdr(j, at - 1u);
+        uint32_t *nl = (hd[0] >> 12) == pg ? &hd[2] : &hd[3];
+        const uint32_t next = *nl;
+        ++pj_v88_n[1];
+        if (hd[1] & 0x80000000u) { *link = next; ++pj_v88_n[2]; at = next; continue; }   /* dead or redirected */
+#if B86_PJ_V89_MTF
+        if (hd[0] == lin && hd[4] == eip && ((hd[1] >> 30) & 1u) == pm16) {
+            if (link != &pj_heads(j)[slot - 1]) {     /* V89: move to the front of this page's list */
+                *link = next;
+                *nl = pj_heads(j)[slot - 1];
+                pj_heads(j)[slot - 1] = at;
+                ++pj_v89_n[0];
+            }
+            return at - 1u + PJ_HDR_BYTES + 1u;
+        }
+#else
+        if (hd[0] == lin && hd[4] == eip && ((hd[1] >> 30) & 1u) == pm16)
+            return at - 1u + PJ_HDR_BYTES + 1u;
+#endif
+        link = nl;
+        at = next;
+    }
+    return 0u;
+}
+#endif
 static B86_PM_HOT uint32_t pj_find_block(const B86Pj *j, uint32_t lin, uint32_t eip, uint32_t pm16)
 {
     const uint32_t pg = lin >> 12;
@@ -6277,7 +6395,11 @@ static B86_PJ_COLD uint32_t pj_v31_find(B86Cpu *c, B86Pj *j,
 {
     unsigned k;
     for (k = 0u; k < 128u; ++k) {
+#if B86_PJ_V88_LISTS
+        const uint32_t ent = pj_v88_find(j, lin, eip, pm16);
+#else
         const uint32_t ent = pj_find_block(j, lin, eip, pm16);
+#endif
         uint32_t off, size, *hd;
         if (!ent || !pj_v31_active) return ent;
         if (ent <= PJ_HDR_BYTES) goto invalid;
@@ -9374,6 +9496,9 @@ static B86_PJ_COLD void pj_rebuild_pages(B86Pj *j, uint32_t lo, uint32_t hi)
 {
     memset(j->cpg, 0, sizeof j->cpg);
     memset(pj_cpsv(j), 0, 2u * B86_PJ_CPS * sizeof(uint32_t));
+#if B86_PJ_V89_LINEFILTER
+    memset(pj_v89_lines, 0, sizeof pj_v89_lines);    /* both rebuild walks below re-mark */
+#endif
     pj_rebuild_walk(j, lo, hi);
     if (j->hot) pj_rebuild_walk(j, j->hot_start, j->hot_used);     /* r72: SRAM blocks stay tracked */
 }
@@ -9396,6 +9521,9 @@ static B86_PJ_COLD void pj_rebuild_walk(B86Pj *j, uint32_t lo, uint32_t hi)
             if (sa && sb) {
                 hd[2] = heads[sa - 1]; heads[sa - 1] = off + 1u;
                 if (pgb != pga) { hd[3] = heads[sb - 1]; heads[sb - 1] = off + 1u; } else hd[3] = 0u;
+#if B86_PJ_V89_LINEFILTER
+                pj_v89_mark(hd[0], hd[1] & 0x3FFFFFFFu);
+#endif
             } else hd[1] |= 0x80000000u;           /* cannot track it: treat as dead */
         }
         off += size;
@@ -10127,6 +10255,9 @@ static B86_PJ_COLD uint32_t b86_pj_translate(B86Cpu *c, uint32_t eip)
 #endif
         hd[2] = heads[sa - 1]; heads[sa - 1] = start_off + 1u;
         if (pgb != pga) { hd[3] = heads[sb - 1]; heads[sb - 1] = start_off + 1u; } else hd[3] = 0u;
+#if B86_PJ_V89_LINEFILTER
+        pj_v89_mark(lin0, t.pos);                    /* V89: these guest bytes now hold code */
+#endif
     }
     j->used = ((uint32_t)(t.e.p - j->code) + 3u) & ~3u;
     pj_hdr(j, start_off)[5] = j->used - start_off;    /* r71: walkable block chain */
@@ -11332,6 +11463,14 @@ void b86_pj_mem_profile(const B86Cpu *c, unsigned long out[8])
     printf("[bb386-v82-pm16] push=%lu pop=%lu alu=%lu adc-sbb=%lu movimm=%lu incdec=%lu grp3=%lu shift=%lu shift-cl=%lu segmov=%lu stores=%lu continue=%d\n",
            pj_v82_n[0], pj_v82_n[1], pj_v82_n[2], pj_v82_n[3], pj_v82_n[4], pj_v82_n[5],
            pj_v82_n[6], pj_v82_n[7], pj_v82_n[8], pj_v82_n[9], pj_v82_n[11], B86_PJ_V82_STORE_CONTINUE);
+#endif
+#if B86_PJ_V89_MTF || B86_PJ_V89_LINEFILTER
+    printf("[bb386-v89] mtf-moves=%lu store-skips=%lu store-walks=%lu line-marks=%lu mtf=%d linefilter=%d\n",
+           pj_v89_n[0], pj_v89_n[1], pj_v89_n[2], pj_v89_n[3], B86_PJ_V89_MTF, B86_PJ_V89_LINEFILTER);
+#endif
+#if B86_PJ_V88_LISTS
+    printf("[bb386-v88-lists] find-walks=%lu find-steps=%lu find-unlinked=%lu kill-walks=%lu kill-steps=%lu kill-unlinked=%lu\n",
+           pj_v88_n[0], pj_v88_n[1], pj_v88_n[2], pj_v88_n[3], pj_v88_n[4], pj_v88_n[5]);
 #endif
 #if B86_PJ_V87_FSGS
     printf("[bb386-v87-fsgs] guarded-mem=%lu reg-forms=%lu rolled-back=%lu denied=%lu\n",
