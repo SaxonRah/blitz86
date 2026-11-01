@@ -211,8 +211,53 @@ static inline void b86_v30m_note_linear(B86Cpu *c, uint32_t lin, uint32_t n);
  * protected-mode store is translated through the TLB; if that is not
  * possible (miss, page crossing) the store is recorded as "unsure" in
  * c->pg_pad and the real-mode cache is flushed on the way back, as before. */
+/* V95: B86_V95_SMC_WALK - resolve a protected-mode store whose page is not in
+ * the TLB (or that crosses a page) by walking the page tables, instead of
+ * forcing a full real-mode JIT flush at the next PM->RM switch. */
+#ifndef B86_V95_SMC_WALK
+#define B86_V95_SMC_WALK 1
+#endif
+#ifndef B86_V95_FLUSHLOG
+#define B86_V95_FLUSHLOG 1
+#endif
+#if B86_V95_SMC_WALK || B86_V95_FLUSHLOG
+unsigned long b86_v95_smc_walked, b86_v95_smc_padded;
+#endif
+#if B86_V95_SMC_WALK && defined(B86_PAGED)
+static void b86_v95_smc_resolve(B86Cpu *c, uint32_t a, uint32_t n);
+#endif
+#if B86_V95_HOSTTLB
+static int b86_v95_codepage(const B86Cpu *c, uint32_t lin);
+#endif
+/* V99: B86_V99_SELECTIVE - see i386_pj.inc. b86_v99_ext_dirty records any write
+ * at/above B86_V99_EXT_START that the precise paging-on code-page tracking
+ * cannot see (real mode or paging off, host writers, task-switch writes). */
+#ifndef B86_V99_SELECTIVE
+#define B86_V99_SELECTIVE 1
+#endif
+#if B86_V99_SELECTIVE
+#define B86_V99_EXT_START ((((uint32_t)B86_MEM_BYTES) + 4095u) & ~4095u)
+volatile uint8_t b86_v99_ext_dirty = 1u;
+unsigned long b86_v99_dirty_cpu, b86_v99_dirty_host;
+static inline int b86_v99_touches_ext(uint32_t a, uint32_t n)
+{
+    return n && (a >= B86_V99_EXT_START || B86_V99_EXT_START - a < n);
+}
+static inline void b86_v99_note_any(uint32_t a, uint32_t n)
+{
+    if (b86_v99_touches_ext(a, n)) { b86_v99_ext_dirty = 1u; ++b86_v99_dirty_host; }
+}
+/* Out of line: smc() is inlined into every store helper. */
+static __attribute__((noinline)) void b86_v99_cpu_store(uint32_t a, uint32_t n)
+{
+    if (b86_v99_touches_ext(a, n)) { b86_v99_ext_dirty = 1u; ++b86_v99_dirty_cpu; }
+}
+#endif
 B86_HOT static inline void smc(B86Cpu *c, uint32_t a, uint32_t n)
 {
+#if B86_V99_SELECTIVE
+    if (!c->pg || !(c->msw & 1u)) b86_v99_cpu_store(a, n);       /* real mode or paging off */
+#endif
 #if B86_PJ_V33_PHYSDIRTY
     /* Covers real-mode and interpreted PM guest stores, plus PJ slow stores.
      * Native PJ fast stores are instrumented in the Thumb emitter instead. */
@@ -230,7 +275,11 @@ B86_HOT static inline void smc(B86Cpu *c, uint32_t a, uint32_t n)
     if ((c->msw & 1u) && c->pg) {
         const unsigned slot = (a >> 12) & 63u;
         if (c->tlb_tag[slot] != ((a & 0xFFFFF000u) | 1u) || (a & 0xFFFu) + n > 0x1000u) {
+#if B86_V95_SMC_WALK && defined(B86_PAGED)
+            b86_v95_smc_resolve(c, a, n);
+#else
             c->pg_pad |= 1u;
+#endif
             return;
         }
         a = c->tlb_phys[slot] + (a & 0xFFFu);
@@ -883,6 +932,28 @@ static uint32_t b86_rm3_segvalue(B86Cpu *c, int which);
 #include "i386_rm3.inc"
 /* BB_386_PM0_V1: GDT descriptor helpers in flash, no PE switch. */
 #include "i386_pg.inc"    /* B86_PG_V1 (r65): 386 paging */
+#if B86_V95_SMC_WALK && defined(B86_PAGED)
+/* V95: same checks smc() does after a TLB hit, for each page of the store. */
+static void b86_v95_smc_part(B86Cpu *c, uint32_t a, uint32_t n)
+{
+    uint32_t phys;
+    if (!b86_pg_walk(c, a, &phys)) { c->pg_pad |= 1u; ++b86_v95_smc_padded; return; }
+    ++b86_v95_smc_walked;
+#if B86_RAM_BYTES > B86_MEM_BYTES
+    if (phys >= B86_MEM_BYTES) return;
+#endif
+    if (c->codemap && (c->codemap[phys >> B86_LINE_SHIFT] |
+                       c->codemap[(phys + n - 1) >> B86_LINE_SHIFT]) && c->smc_hook)
+        c->smc_hook(c, phys, n);
+}
+static __attribute__((noinline)) void b86_v95_smc_resolve(B86Cpu *c, uint32_t a, uint32_t n)
+{
+    uint32_t first = 0x1000u - (a & 0xFFFu);
+    if (first > n) first = n;
+    b86_v95_smc_part(c, a, first);
+    if (n > first) b86_v95_smc_part(c, a + first, n - first);
+}
+#endif
 /* V34 host/BIOS direct writer bridge. Physical GUEST addresses only.
  * Notes happen before writes and are observational, never coherence authority.
  * The existing v31 exact checks remain mandatory. */
@@ -891,11 +962,17 @@ static unsigned long b86_v34_host_calls;
 void b86_v34_note_host_phys(uint32_t phys, uint32_t n)
 {
     ++b86_v34_host_calls;
+#if B86_V99_SELECTIVE
+    b86_v99_note_any(phys, n);
+#endif
     b86_v33_note_physical(phys, n);
 }
 #else
 void b86_v34_note_host_phys(uint32_t phys, uint32_t n)
 {
+#if B86_V99_SELECTIVE
+    b86_v99_note_any(phys, n);
+#endif
     (void)phys; (void)n;
 }
 #endif
@@ -951,6 +1028,9 @@ void b86_v34_note_host_phys(uint32_t phys, uint32_t n)
 #include "i386_pm40.inc"   /* B86_PM40_V1 (r68): flat 32-bit fast path */
 #if defined(B86_PJ) && B86_PJ
 #include "i386_pj.inc"     /* B86_PJ_V1 (r70): native Thumb-2 for flat 32-bit code */
+#endif
+#if B86_V95_HOSTTLB && !(defined(B86_PJ) && B86_PJ)
+static int b86_v95_codepage(const B86Cpu *c, uint32_t lin) { (void)c; (void)lin; return 0; }
 #endif
 
 /* BB_386_STAGE5C3C_V1: model-386-only legacy word memory limit preflight. */
@@ -1752,6 +1832,12 @@ B86_HOT int b86_step(B86Cpu *c)
         const int paged = c->pg != 0u;
         if (paged) { b86_pg_snap(c, &snap); c->pf_pending = 0u; }
         b86_pm_fill_fetch(c);                                     /* r66 */
+#if defined(B86_PJ) && B86_PJ && B86_V90_INTERP_HIST
+        uint8_t v90b[8];
+        const unsigned v90n = c->fb_len < 8u ? c->fb_len : 8u;
+        const unsigned v90m = (c->pm386.seg[B86_CS].flags & 4u) ? 0u : 1u;
+        memcpy(v90b, c->fb, v90n);
+#endif
         int rc = b86_pm_dispatch(c, paged ? &snap : (B86PgSnap *)0);   /* r66 */
 #if defined(B86_PJ) && B86_PJ /* BB_PJ_TLB_0F_V1 */
         unsigned pj_0f_op2 = 256u;
@@ -1780,6 +1866,9 @@ B86_HOT int b86_step(B86Cpu *c)
             return b86_pm32_page_fault(c);
         }
         if (rc == B86_OK || rc == B86_HALT) {
+#if defined(B86_PJ) && B86_PJ && B86_V90_INTERP_HIST
+            if (c->pj) b86_v90_count(v90m, v90b, v90n);    /* V90 */
+#endif
 #if defined(B86_PJ) && B86_PJ
             ++b86_pm_c_guest_insns;
             /* BB_PJ_TLB_0F_V1: retired C-fallback 0F, not aborted by #PF. */
@@ -1794,6 +1883,15 @@ B86_HOT int b86_step(B86Cpu *c)
         }
         return rc;
     }
+#if defined(B86_PJ) && B86_PJ && B86_V90_INTERP_HIST
+    if (c->pj && !(c->msw & 1u)) {                       /* V90: real-mode interpreter */
+        uint8_t v90b[8];
+        unsigned k;
+        const uint32_t base = (uint32_t)c->seg[B86_CS] << 4;
+        for (k = 0u; k < 8u; ++k) v90b[k] = *b86_host(c, (base + ((c->ip + k) & 0xFFFFu)) & c->amask);
+        b86_v90_count(2u, v90b, 8u);
+    }
+#endif
     if (c->model >= B86_CPU_386 && !(c->msw&1u) &&
         c->pm386.seg[B86_CS].reserved==B86_PM29_EXIT_MARKER)
         return b86_pm29_finish_pe_exit(c);

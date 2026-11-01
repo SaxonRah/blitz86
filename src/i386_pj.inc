@@ -416,6 +416,79 @@ static inline int pj_v89_maybe(uint32_t lo, uint32_t hi)
     }
 }
 #endif
+/* V90: B86_V90_INTERP_HIST - measurement only. Histogram of instructions run
+ * by the C interpreter, by mode (pm32 / pm16 / real), 66h prefix and opcode
+ * (0F xx as 256+xx). 12 KB table from B86_CALLOC on first use (PSRAM meta pool
+ * on the Pico). Each stats dump prints the top 16 since the last dump and
+ * clears it. 0 preprocesses byte-identically to V89. */
+#ifndef B86_V90_INTERP_HIST
+#define B86_V90_INTERP_HIST 1
+#endif
+#if B86_V90_INTERP_HIST != 0 && B86_V90_INTERP_HIST != 1
+#error B86_V90_INTERP_HIST must be 0 or 1
+#endif
+#if B86_V90_INTERP_HIST
+#include <stdio.h>
+#include <string.h>
+#ifndef B86_V90_CALLOC
+#ifdef B86_CALLOC
+#define B86_V90_CALLOC B86_CALLOC
+#else
+#define B86_V90_CALLOC calloc
+#endif
+#endif
+void *B86_V90_CALLOC(size_t n, size_t size);
+#define PJ_V90_SLOTS (3u * 2u * 512u)
+static uint32_t *pj_v90_hist;
+static uint32_t pj_v90_total, pj_v90_alloc_failed;
+/* mode: 0 pm32, 1 pm16, 2 real mode; b: instruction bytes from the first prefix */
+static __attribute__((noinline)) B86_PM_HOT void b86_v90_count(unsigned mode, const uint8_t *b, unsigned len)
+{
+    unsigned p = 0u, o66 = 0u, op;
+    if (!pj_v90_hist) {
+        if (pj_v90_alloc_failed) return;
+        pj_v90_hist = (uint32_t *)B86_V90_CALLOC(PJ_V90_SLOTS, sizeof(uint32_t));
+        if (!pj_v90_hist) { pj_v90_alloc_failed = 1u; return; }
+    }
+    while (p < len && p < 6u) {
+        const uint8_t x = b[p];
+        if (x == 0x66u) { o66 = 1u; ++p; continue; }
+        if (x == 0x67u || x == 0xF0u || x == 0xF2u || x == 0xF3u || x == 0x26u || x == 0x2Eu ||
+            x == 0x36u || x == 0x3Eu || x == 0x64u || x == 0x65u) { ++p; continue; }
+        break;
+    }
+    if (p >= len) return;
+    op = b[p];
+    if (op == 0x0Fu) { if (p + 1u >= len) return; op = 256u + b[p + 1u]; }
+    ++pj_v90_hist[(mode * 2u + o66) * 512u + op];
+    ++pj_v90_total;
+}
+static void pj_v90_report(void)
+{
+    static const char *const mname[3] = { "pm32", "pm16", "rm" };
+    unsigned k, r;
+    if (!pj_v90_hist) {
+        printf("[bb386-v90-interp] %s\n", pj_v90_alloc_failed ? "table allocation failed" : "total=0");
+        return;
+    }
+    printf("[bb386-v90-interp] total=%lu top:", (unsigned long)pj_v90_total);
+    for (r = 0u; r < 16u; ++r) {
+        unsigned best = 0u;
+        uint32_t bv = 0u;
+        for (k = 0u; k < PJ_V90_SLOTS; ++k) if (pj_v90_hist[k] > bv) { bv = pj_v90_hist[k]; best = k; }
+        if (!bv) break;
+        {
+            const unsigned mode = best / 1024u, o66 = (best / 512u) & 1u, op = best % 512u;
+            if (op >= 256u) printf(" %s%s:0F%02X=%lu", mname[mode], o66 ? "+66" : "", op - 256u, (unsigned long)bv);
+            else printf(" %s%s:%02X=%lu", mname[mode], o66 ? "+66" : "", op, (unsigned long)bv);
+        }
+        pj_v90_hist[best] = 0u;
+    }
+    printf("\n");
+    memset(pj_v90_hist, 0, PJ_V90_SLOTS * sizeof(uint32_t));
+    pj_v90_total = 0u;
+}
+#endif
 /* V80c: F2 SCAS with ECX > 1 returns to the already hardware-working
  * checked REPNE C helper. Only ECX == 1 enters the native single-comparison
  * path, which completes without restarting an unmapped guest EIP. */
@@ -618,9 +691,21 @@ static inline int pj_v89_maybe(uint32_t lo, uint32_t hi)
 #endif
 /* BB_STAGE4W2_PROFILE: actual production layout, verified from Pico -D flags.
  * Refuse all others; never resize PJ state silently. */
+#if defined(B86_PJ_V96_HASH_OK) && B86_PJ_V96_HASH_OK
+/* V96: explicit opt-in (blitzBUS BB_PJ_HASH): power-of-two dispatch table,
+ * 512..4096 entries; the caller sizes the state buffer for it. */
+#if defined(PICO_ON_DEVICE) && PICO_ON_DEVICE && \
+    ((B86_PJ_HASH < 512u) || (B86_PJ_HASH > 4096u) || ((B86_PJ_HASH & (B86_PJ_HASH - 1u)) != 0u) || (B86_PJ_CPS != 256u))
+#error "V96: B86_PJ_HASH must be a power of two 512..4096 with B86_PJ_CPS=256"
+#endif
+#else
 #if defined(PICO_ON_DEVICE) && PICO_ON_DEVICE && \
     ((B86_PJ_HASH != 512u) || (B86_PJ_CPS != 256u))
 #error "Stage4W2 expected B86_PJ_HASH=512 and B86_PJ_CPS=256"
+#endif
+#endif
+#ifndef B86_PJ_V96_DYN16_SAFE
+#define B86_PJ_V96_DYN16_SAFE 1
 #endif
 #ifndef B86_PJ_COLD
 #define B86_PJ_COLD __attribute__((noinline,cold))
@@ -643,6 +728,17 @@ static inline int pj_v89_maybe(uint32_t lo, uint32_t hi)
 #define BB_PJ_PM16_ADAPTIVE 1
 #endif
 #endif
+/* V94: B86_PJ_V94_SEGS = number of code-cache ring segments (0 = the original
+ * two halves, byte-identical to V93). Each eviction drops only the oldest. */
+#ifndef B86_PJ_V94_SEGS
+#define B86_PJ_V94_SEGS 8
+#endif
+#if B86_PJ_V94_SEGS != 0 && (B86_PJ_V94_SEGS < 2 || B86_PJ_V94_SEGS > 32)
+#error B86_PJ_V94_SEGS must be 0 or 2..32
+#endif
+#if B86_PJ_V94_SEGS
+#define PJ_NSEG ((unsigned)B86_PJ_V94_SEGS)
+#endif
 typedef struct B86Pj {
     uint8_t *code;
     uint32_t cap, used;
@@ -664,7 +760,11 @@ typedef struct B86Pj {
      * When the current half is full the OTHER half is evicted (links into it
      * undone, hash entries dropped, page lists rebuilt from the survivors)
      * instead of flushing everything. */
+#if B86_PJ_V94_SEGS
+    uint32_t shared_end, half, cur_half, half_fill[PJ_NSEG];   /* V94: half = segment size, cur_half = segment */
+#else
     uint32_t shared_end, half, cur_half, half_fill[2];
+#endif
     uint32_t nlinks;                         /* entries in the link log */
     unsigned long evictions, unlinks, gen;
 #if B86_PJ_V55_PM16_DYN && BB_PJ_PM16_REG_TIER
@@ -805,8 +905,71 @@ static b86_v30f_state v30f_admit;
  * translation cache: 3450 flushes in the 10.7M-instruction startup alone.
  * PM16 blocks now live in PJ_PM16_CTX per-segment tables keyed by (CS base,
  * limit, kind); flat blocks and their links survive PM16 visits. */
-#define PJ_PM16_CTX 4u
+#ifndef B86_PJ_V97_PM16_CTX
+#define B86_PJ_V97_PM16_CTX 16u                  /* V97: was 4 (recycled ~205x/s in Descent) */
+#endif
+#if B86_PJ_V97_PM16_CTX < 4 || B86_PJ_V97_PM16_CTX > 32
+#error B86_PJ_V97_PM16_CTX must be 4..32
+#endif
+#define PJ_PM16_CTX B86_PJ_V97_PM16_CTX
+#ifdef B86_PJ_V98_PM16_ENT
+#if B86_PJ_V98_PM16_ENT < 128 || B86_PJ_V98_PM16_ENT > 4096 || (B86_PJ_V98_PM16_ENT & (B86_PJ_V98_PM16_ENT - 1))
+#error B86_PJ_V98_PM16_ENT must be a power of two 128..4096
+#endif
+#define PJ_PM16_ENT ((unsigned)B86_PJ_V98_PM16_ENT)   /* V98: entries per 16-bit context table */
+#else
 #define PJ_PM16_ENT (PJ_SMALL_TAIL ? 128u : 512u)
+#endif
+#ifndef B86_PJ_V98_STATS
+#define B86_PJ_V98_STATS 1
+#endif
+#if B86_PJ_V98_STATS
+/* V98: [0] flat misses [1] 16-bit misses [2] flat conflicts [3] 16-bit conflicts
+ * [4] flat lookups [5] 16-bit lookups (C dispatch path) */
+static unsigned long pj_v98_n[6];
+#endif
+#if B86_V99_SELECTIVE
+/* V99 selective epochs: see make_v99.py / the V99 README for the full argument. */
+#ifndef B86_CALLOC
+#define B86_CALLOC calloc
+#else
+void *B86_CALLOC(size_t n, size_t size);
+#endif
+#define PJ_V99_EXT_FRAME (B86_V99_EXT_START >> 12)
+#define PJ_V99_MAXPT 8u
+#define PJ_V99_M(v) ((v) & ~0x60u)              /* compare PDE/PTE without Accessed/Dirty */
+/* All V99 state lives in the metadata pool (PSRAM on the Pico), NOT in SRAM:
+ * the SRAM heap that follows .bss is small and the real-mode JIT allocates
+ * from it (v1 cost 392 bytes of .bss and the boot panicked: out of memory). */
+typedef struct {
+    uint32_t pde_code[32];                     /* 4 MiB regions holding paged translated code */
+    uint32_t snap_bits[32];                    /* regions captured in the snapshot */
+    uint16_t snap_idx[PJ_V99_MAXPT];
+    uint32_t snap_pde[PJ_V99_MAXPT];
+    uint32_t *snap_pt;                         /* PJ_V99_MAXPT x 1024 masked PTEs (meta heap) */
+    unsigned snap_n;
+    uint8_t snap_ok, snap_stale;
+    /* [0] selective [1] full [2] why-dirty [3] why-map [4] why-stale [5] why-nosnap
+     * [6] links kept [7] links cut [8] entries kept [9] entries cut [10] snapshots [11] too many tables */
+    unsigned long n[12];
+} PjV99;
+static PjV99 *pj_v99;                          /* NULL: V99 unavailable -> always the full epoch */
+#define pj_v99_pde_code  (pj_v99->pde_code)
+#define pj_v99_snap_bits (pj_v99->snap_bits)
+#define pj_v99_snap_idx  (pj_v99->snap_idx)
+#define pj_v99_snap_pde  (pj_v99->snap_pde)
+#define pj_v99_snap_pt   (pj_v99->snap_pt)
+#define pj_v99_snap_n    (pj_v99->snap_n)
+#define pj_v99_snap_ok   (pj_v99->snap_ok)
+#define pj_v99_snap_stale (pj_v99->snap_stale)
+#define pj_v99_n         (pj_v99->n)
+static void pj_v99_reset(void)
+{
+    if (!pj_v99) return;
+    memset(pj_v99_pde_code, 0, sizeof pj_v99_pde_code);
+    pj_v99_snap_ok = 0u; pj_v99_snap_stale = 0u; pj_v99_snap_n = 0u;
+}
+#endif
 #define PJ_PM16_BYTES (PJ_PM16_CTX * 4u * sizeof(uint32_t) + PJ_PM16_CTX * 2u * PJ_PM16_ENT * sizeof(uint32_t))
 #ifndef B86_PJ_LINKS
 #define B86_PJ_LINKS (PJ_SMALL_TAIL ? 1024u : 8192u)   /* link log entries (stub, target) */
@@ -1112,7 +1275,137 @@ static void pj_patch_b(uint8_t *at, uint8_t *to)
 
 /* ---- runtime helpers called from native code --------------------------- */
 #define PJ_PGH(pg) ((((uint32_t)(pg)) * 0x9E3779B1u) >> 20)   /* 4096-bit hashed page filter */
+/* V91: B86_PJ_V91_PM16 - measurement only. Outcome of every native-code try
+ * in 16-bit protected-mode code, length of the 16-bit native runs, and the
+ * opcodes that end or refuse 16-bit translations. Printed and cleared at every
+ * stats dump. 0 preprocesses byte-identically to V90. */
+#ifndef B86_PJ_V91_PM16
+#define B86_PJ_V91_PM16 1
+#endif
+#if B86_PJ_V91_PM16 != 0 && B86_PJ_V91_PM16 != 1
+#error B86_PJ_V91_PM16 must be 0 or 1
+#endif
+#if B86_PJ_V91_PM16
+#include <stdio.h>
+#include <string.h>
+#ifndef B86_V91_CALLOC
+#ifdef B86_CALLOC
+#define B86_V91_CALLOC B86_CALLOC
+#else
+#define B86_V91_CALLOC calloc
+#endif
+#endif
+void *B86_V91_CALLOC(size_t n, size_t size);
+enum { PJ_V91_TRY, PJ_V91_INELIGIBLE, PJ_V91_PG0, PJ_V91_ADAPT, PJ_V91_NEG, PJ_V91_DEFER,
+       PJ_V91_DECLINE_NEW, PJ_V91_NOBLOCK, PJ_V91_FETCH, PJ_V91_RUN, PJ_V91_RETIRED, PJ_V91_N };
+static unsigned long pj_v91_n[PJ_V91_N];
+static unsigned long pj_v91_len[8];      /* retired per run: 0,1,2,3-4,5-8,9-16,17-64,65+ */
+static uint32_t *pj_v91_stop;            /* [0..511] ended a block, [512..1023] refused the first insn,
+                                            [1024..1535] report scratch; allocated once */
+static unsigned pj_v91_stop_failed;
+static B86_PJ_COLD void pj_v91_note_stop(const uint8_t *b, unsigned n, unsigned pos)
+{
+    unsigned k = pos, op;
+    if (!pj_v91_stop) {
+        if (pj_v91_stop_failed) return;
+        pj_v91_stop = (uint32_t *)B86_V91_CALLOC(1536u, sizeof(uint32_t));
+        if (!pj_v91_stop) { pj_v91_stop_failed = 1u; return; }
+    }
+    while (k < n && k < pos + 5u) {
+        const uint8_t x = b[k];
+        if (x == 0x66u || x == 0x67u || x == 0xF0u || x == 0xF2u || x == 0xF3u || x == 0x26u ||
+            x == 0x2Eu || x == 0x36u || x == 0x3Eu || x == 0x64u || x == 0x65u) { ++k; continue; }
+        break;
+    }
+    if (k >= n) return;
+    op = b[k];
+    if (op == 0x0Fu) { if (k + 1u >= n) return; op = 256u + b[k + 1u]; }
+    ++pj_v91_stop[(pos == 0u ? 512u : 0u) + op];
+}
+static inline unsigned pj_v91_bucket(unsigned n)
+{
+    return n == 0u ? 0u : n == 1u ? 1u : n == 2u ? 2u : n <= 4u ? 3u : n <= 8u ? 4u :
+           n <= 16u ? 5u : n <= 64u ? 6u : 7u;
+}
+static void pj_v91_top(const uint32_t *t, uint32_t *tmp)
+{
+    unsigned r, k;
+    memcpy(tmp, t, 512u * sizeof(uint32_t));
+    for (r = 0u; r < 10u; ++r) {
+        unsigned best = 0u;
+        uint32_t bv = 0u;
+        for (k = 0u; k < 512u; ++k) if (tmp[k] > bv) { bv = tmp[k]; best = k; }
+        if (!bv) break;
+        if (best >= 256u) printf(" 0F%02X=%lu", best - 256u, (unsigned long)bv);
+        else printf(" %02X=%lu", best, (unsigned long)bv);
+        tmp[best] = 0u;
+    }
+}
+static void pj_v91_report(void)
+{
+    printf("[bb386-v91-pm16] tries=%lu ineligible=%lu pg0-deopt=%lu adapt-skip=%lu neg-hit=%lu defer=%lu "
+           "declined-new=%lu no-block=%lu fetch-refused=%lu runs=%lu retired=%lu\n",
+           pj_v91_n[PJ_V91_TRY], pj_v91_n[PJ_V91_INELIGIBLE], pj_v91_n[PJ_V91_PG0], pj_v91_n[PJ_V91_ADAPT],
+           pj_v91_n[PJ_V91_NEG], pj_v91_n[PJ_V91_DEFER], pj_v91_n[PJ_V91_DECLINE_NEW], pj_v91_n[PJ_V91_NOBLOCK],
+           pj_v91_n[PJ_V91_FETCH], pj_v91_n[PJ_V91_RUN], pj_v91_n[PJ_V91_RETIRED]);
+    printf("[bb386-v91-pm16len] 0=%lu 1=%lu 2=%lu 3-4=%lu 5-8=%lu 9-16=%lu 17-64=%lu 65+=%lu\n",
+           pj_v91_len[0], pj_v91_len[1], pj_v91_len[2], pj_v91_len[3],
+           pj_v91_len[4], pj_v91_len[5], pj_v91_len[6], pj_v91_len[7]);
+    if (pj_v91_stop) {
+        printf("[bb386-v91-pm16stop] ended:");
+        pj_v91_top(pj_v91_stop, pj_v91_stop + 1024u);
+        printf(" | refused-first:");
+        pj_v91_top(pj_v91_stop + 512u, pj_v91_stop + 1024u);
+        printf("\n");
+        memset(pj_v91_stop, 0, 1024u * sizeof(uint32_t));
+    }
+    memset(pj_v91_n, 0, sizeof pj_v91_n);
+    memset(pj_v91_len, 0, sizeof pj_v91_len);
+}
+#define PJ_V91_COUNT(k) do { if (v91) ++pj_v91_n[k]; } while (0)
+#endif
+/* V92: B86_PJ_V92_PM16 - native 16-bit protected-mode forms the V91 log showed
+ * refused as a block's first instruction: AL/AX-immediate ADD/OR/AND/SUB/XOR/
+ * CMP and TEST, and MOV AL/AX <-> [moffs16]. 0 = byte-identical to V91. */
+#ifndef B86_PJ_V92_PM16
+#define B86_PJ_V92_PM16 1
+#endif
+#if B86_PJ_V92_PM16 != 0 && B86_PJ_V92_PM16 != 1
+#error B86_PJ_V92_PM16 must be 0 or 1
+#endif
+#if B86_PJ_V92_PM16
+static unsigned long pj_v92_n[4];       /* translations: acc-alu, test, moffs-read, moffs-write */
+#endif
+/* V93: B86_PJ_V93_PM16_LINK - chain 16-bit protected-mode blocks (static exits
+ * only, same code-segment context). 0 = byte-identical to V92. */
+#ifndef B86_PJ_V93_PM16_LINK
+#define B86_PJ_V93_PM16_LINK 1
+#endif
+#if B86_PJ_V93_PM16_LINK != 0 && B86_PJ_V93_PM16_LINK != 1
+#error B86_PJ_V93_PM16_LINK must be 0 or 1
+#endif
+#if B86_PJ_V93_PM16_LINK
+static unsigned long pj_v93_n[3];       /* 16-bit link attempts, refused (context changed), links made */
+#endif
 static B86Pj *b86_pj_state(const B86Cpu *c) { return (B86Pj *)c->pj; }
+#if B86_V95_HOSTTLB
+/* V95: does linear page `lin` possibly hold translated PM code? (same hashed
+ * filter the native and C store paths use; a set bit, incl. collisions, = yes) */
+static int b86_v95_codepage(const B86Cpu *c, uint32_t lin)
+{
+    const B86Pj *j = (const B86Pj *)c->pj;
+    uint32_t hh;
+    if (!j || !(c->msw & 1u)) return 0;
+    hh = PJ_PGH(lin >> 12);
+    return (j->cpg[hh >> 5] >> (hh & 31u)) & 1u;
+}
+/* V95: a linear page gained translated code: no TLB entry may stay write-OK. */
+static void pj_v95_tlb_nowrite(B86Cpu *c)
+{
+    unsigned k;
+    for (k = 0u; k < 64u; ++k) c->tlb_host[k] &= ~(uintptr_t)1u;
+}
+#endif
 #if B86_PJ_V31_LAZY_EPOCH
 /* V47: generation-tagged 512-way positive exact-validation memo. Each
  * code-cache/mode epoch changes the tag, so steady RM->PM transitions no
@@ -5745,6 +6038,21 @@ static B86_PJ_COLD void pj_emit_shared_at(B86Pj *j, uint8_t *base, uint8_t *end)
             pje32(&t->e, 0xF850u | R0, (R0 << 12) | (2u << 4) | R3);
             pj_dpr(&t->e, 13u, 1, PC, R0, LR, 0u, 0u);
             miss[nm++] = pj_b(&t->e, 1 /* NE: TLB miss */);
+#if B86_V95_HOSTTLB
+            {   /* V95: extended-memory entry: host = tlb_host + linear */
+                uint8_t *nohost;
+                pjt_addimm(t, R0, CREG, (uint32_t)offsetof(B86Cpu, tlb_host));
+                pje32(&t->e, 0xF850u | R0, (R0 << 12) | (2u << 4) | R3);   /* ldr r0,[r0,r3,lsl #2] */
+                pj_dpi(&t->e, 1u, 1, R0, R0, 1u);                         /* bics r0,r0,#1 */
+                nohost = pj_b(&t->e, 0 /* EQ: no host entry */);
+                pj_dpr(&t->e, 8u, 0, R0, R0, R1, 0u, 0u);                 /* add r0,r0,r1 */
+                pj_ldst(&t->e, PJ_LDR, LR, SP, 12u);
+                pj_dpi(&t->e, 8u, 0, LR, LR, 6u);
+                pje16(&t->e, 0x4700u | (LR << 3));
+                pje16(&t->e, 0xBF00u);
+                pj_patch_b(nohost, t->e.p);
+            }
+#endif
             pjt_addimm(t, R0, CREG, (uint32_t)offsetof(B86Cpu, tlb_phys));
             pje32(&t->e, 0xF850u | R0, (R0 << 12) | (2u << 4) | R3);
             pj_ubfx(&t->e, R3, R1, 0u, 12u);
@@ -5847,6 +6155,22 @@ static B86_PJ_COLD void pj_emit_shared_at(B86Pj *j, uint8_t *base, uint8_t *end)
         pje32(&t->e, 0xF850u | R0, (R0 << 12) | (2u << 4) | R3);
         pj_dpr(&t->e, 13u, 1, PC, R0, LR, 0u, 0u);
         miss[nm++] = pj_b(&t->e, 1); /* NE: TLB miss */
+#if B86_V95_HOSTTLB && !B86_PJ_V33_PHYSDIRTY && !B86_PJ_V30M_OBSERVE
+        {   /* V95: write-OK extended-memory entry: no code on the page, store directly */
+            uint8_t *nowrite;
+            pjt_addimm(t, R0, CREG, (uint32_t)offsetof(B86Cpu, tlb_host));
+            pje32(&t->e, 0xF850u | R0, (R0 << 12) | (2u << 4) | R3);       /* ldr r0,[r0,r3,lsl #2] */
+            pj_dpi(&t->e, 0u, 1, PC, R0, 1u);                             /* tst r0,#1 */
+            nowrite = pj_b(&t->e, 0 /* EQ: not write-OK */);
+            pj_dpi(&t->e, 1u, 0, R0, R0, 1u);                             /* bic r0,r0,#1 */
+            pj_dpr(&t->e, 8u, 0, R0, R0, R1, 0u, 0u);                     /* add r0,r0,r1 */
+            pj_ldst(&t->e, PJ_LDR, LR, SP, 12u);
+            pj_dpi(&t->e, 8u, 0, LR, LR, 6u);
+            pje16(&t->e, 0x4700u | (LR << 3));
+            pje16(&t->e, 0xBF00u);
+            pj_patch_b(nowrite, t->e.p);
+        }
+#endif
         pjt_addimm(t, R0, CREG, (uint32_t)offsetof(B86Cpu, tlb_phys));
         pje32(&t->e, 0xF850u | R0, (R0 << 12) | (2u << 4) | R3);
         pj_ubfx(&t->e, R3, R1, 0u, 12u);
@@ -6068,6 +6392,14 @@ static B86_PJ_COLD void pj_emit_shared_at(B86Pj *j, uint8_t *base, uint8_t *end)
      * is stable until the native run returns to C. All SMC/IRQ/epoch guards
      * stay enabled; a hash hit is never a substitute for C admission. */
     j->dyn16 = t->e.p;               /* r1 = 16-bit target, r0 = retired */
+#if B86_PJ_V96_DYN16_SAFE
+    if (offsetof(B86Pj, pm16_active) > 4095u || offsetof(B86Pj, pm16_cur) > 4095u) {
+        /* V96: these fields are beyond 12-bit LDR offsets: a truncated load would
+         * read an unrelated field. Go back to C (same convention as tail_z:
+         * r1 = target, r0 = retired), which is what the stub effectively did. */
+        pj_patch_b(pj_b(&t->e, -1), j->tail_z);
+    } else
+#endif
     {
         unsigned hb16 = 0u, cs_shift = 0u;
         uint8_t *miss_tag, *miss_ent, *f_irq, *f_budget;
@@ -6125,8 +6457,13 @@ static B86_PJ_COLD void pj_emit_shared_at(B86Pj *j, uint8_t *base, uint8_t *end)
     j->used = (uint32_t)(t->e.p - j->code);
     j->used = (j->used + 3u) & ~3u;
     j->shared_end = j->used;                      /* r71: ring halves follow the shared code */
+#if B86_PJ_V94_SEGS
+    j->half = ((j->cap - j->shared_end) / PJ_NSEG) & ~3u;
+    j->cur_half = 0u; memset(j->half_fill, 0, sizeof j->half_fill);
+#else
     j->half = ((j->cap - j->shared_end) / 2u) & ~3u;
     j->cur_half = 0u; j->half_fill[0] = j->half_fill[1] = 0u;
+#endif
     j->nlinks = 0u;
 #if defined(__linux__)
     __builtin___clear_cache((char *)j->code, (char *)t->e.p);
@@ -6157,6 +6494,9 @@ static B86_PJ_COLD void b86_pj_flush(B86Cpu *c)
     /* A flush destroys all cached code and therefore needs no lazy fence. */
     pj_v31_active = 0u;
     pj_v31_memo_reset(j);
+#endif
+#if B86_V99_SELECTIVE
+    pj_v99_reset();                               /* V99: no code, no snapshot */
 #endif
 }
 
@@ -6197,6 +6537,95 @@ static B86_PJ_COLD int pj_v29_phys_id(B86Cpu *c, uint32_t lin, uint32_t *id)
     *id = (phys >> 12) | (c->pg ? PJ_V29_PAGED : 0u);
     return 1;
 }
+#if B86_V99_SELECTIVE
+static uint32_t pj_v99_rd32(const uint8_t *page, unsigned k)
+{
+    uint32_t v;
+    memcpy(&v, page + 4u * k, 4u);
+    return v;
+}
+/* Capture the PDE and the whole page table of every region holding paged code. */
+static B86_PJ_COLD void pj_v99_snapshot(B86Cpu *c)
+{
+    const uint32_t pd = c->cr3 & 0xFFFFF000u;
+    const uint8_t *pdp;
+    unsigned i, k, n = 0u;
+    if (!pj_v99) return;
+    pj_v99_snap_ok = 0u; pj_v99_snap_stale = 0u; pj_v99_snap_n = 0u;
+    memset(pj_v99_snap_bits, 0, sizeof pj_v99_snap_bits);
+    if (!c->pg || pd > B86_RAM_BYTES - 4096u) return;
+    if (!pj_v99_snap_pt) {
+        pj_v99_snap_pt = (uint32_t *)B86_CALLOC(PJ_V99_MAXPT * 1024u, sizeof(uint32_t));
+        if (!pj_v99_snap_pt) return;
+    }
+    pdp = b86_host_phys(c, pd);
+    for (i = 0u; i < 1024u; ++i) {
+        uint32_t pde;
+        if (!(pj_v99_pde_code[i >> 5] & (1u << (i & 31u)))) continue;
+        if (n >= PJ_V99_MAXPT) { ++pj_v99_n[11]; return; }
+        pde = pj_v99_rd32(pdp, i);
+        pj_v99_snap_idx[n] = (uint16_t)i;
+        pj_v99_snap_pde[n] = PJ_V99_M(pde);
+        if (pde & 1u) {
+            const uint32_t pt = pde & 0xFFFFF000u;
+            const uint8_t *ptp;
+            if (pt > B86_RAM_BYTES - 4096u) return;
+            ptp = b86_host_phys(c, pt);
+            for (k = 0u; k < 1024u; ++k) pj_v99_snap_pt[n * 1024u + k] = PJ_V99_M(pj_v99_rd32(ptp, k));
+        }
+        pj_v99_snap_bits[i >> 5] |= 1u << (i & 31u);
+        ++n;
+    }
+    pj_v99_snap_n = n;
+    pj_v99_snap_ok = 1u;
+    ++pj_v99_n[10];
+}
+/* 1 = every captured PDE and page table is unchanged (ignoring A/D) and no
+ * region with code is missing from the snapshot. */
+static B86_PJ_COLD int pj_v99_unchanged(B86Cpu *c)
+{
+    const uint32_t pd = c->cr3 & 0xFFFFF000u;
+    const uint8_t *pdp;
+    unsigned w, n, k;
+    if (!pj_v99 || !c->pg || pd > B86_RAM_BYTES - 4096u) return 0;
+    for (w = 0u; w < 32u; ++w) if (pj_v99_pde_code[w] & ~pj_v99_snap_bits[w]) return 0;
+    pdp = b86_host_phys(c, pd);
+    for (n = 0u; n < pj_v99_snap_n; ++n) {
+        const uint32_t pde = pj_v99_rd32(pdp, pj_v99_snap_idx[n]);
+        if (PJ_V99_M(pde) != pj_v99_snap_pde[n]) return 0;
+        if (pde & 1u) {
+            const uint32_t pt = pde & 0xFFFFF000u;
+            const uint8_t *ptp;
+            if (pt > B86_RAM_BYTES - 4096u) return 0;
+            ptp = b86_host_phys(c, pt);
+            for (k = 0u; k < 1024u; ++k)
+                if (PJ_V99_M(pj_v99_rd32(ptp, k)) != pj_v99_snap_pt[n * 1024u + k]) return 0;
+        }
+    }
+    return 1;
+}
+/* A paged block was just translated from linear page `lin` = physical id `id`:
+ * remember its region, and mark the snapshot stale unless it already maps
+ * exactly this page. */
+static void pj_v99_note_code(uint32_t lin, uint32_t id)
+{
+    const unsigned i = lin >> 22;
+    unsigned n;
+    if (!pj_v99) return;
+    pj_v99_pde_code[i >> 5] |= 1u << (i & 31u);
+    if (!pj_v99_snap_ok || pj_v99_snap_stale) return;
+    if (!(pj_v99_snap_bits[i >> 5] & (1u << (i & 31u)))) { pj_v99_snap_stale = 1u; return; }
+    for (n = 0u; n < pj_v99_snap_n; ++n) {
+        if (pj_v99_snap_idx[n] != i) continue;
+        {   const uint32_t e = pj_v99_snap_pt[n * 1024u + ((lin >> 12) & 1023u)];
+            if (!(pj_v99_snap_pde[n] & 1u) || !(e & 1u) || (e >> 12) != (id & ~PJ_V29_PAGED))
+                pj_v99_snap_stale = 1u;
+        }
+        return;
+    }
+    pj_v99_snap_stale = 1u;
+}
+#endif
 /* V30G FASTWALK V1: 16-entry scan-local successful page-ID memoization.
  * No guest execution or code writes occur during this single reconciliation
  * walk. We discard the table upon return, never across RM epochs, CR3 changes,
@@ -6382,6 +6811,9 @@ static B86_PJ_COLD int pj_v29_walk(B86Cpu *c, B86Pj *j,
 #if B86_PJ_V31_LAZY_EPOCH
 /* Defined next to the existing V12 exact Thumb link-shape checker. */
 static B86_PJ_COLD int pj_v31_unlink_all(B86Pj *j);
+#if B86_V99_SELECTIVE
+static B86_PJ_COLD int pj_v99_try_selective(B86Cpu *c, B86Pj *j);
+#endif
 /* Check the block chosen by the ORIGINAL page-list order, never an older
  * duplicate picked from a separate cache. All executable entry paths use
  * this wrapper after the first lazy epoch. */
@@ -6412,7 +6844,11 @@ static B86_PJ_COLD uint32_t pj_v31_find(B86Cpu *c, B86Pj *j,
             if (pj_in_hot(j, off)) {
                 if (j->hot_used >= PJ_HDR_BYTES && off >= j->hot_start && off <= j->hot_used - PJ_HDR_BYTES)
                     resident = 1u;
+#if B86_PJ_V94_SEGS
+            } else for (h = 0u; h < PJ_NSEG; ++h) {
+#else
             } else for (h = 0u; h < 2u; ++h) {
+#endif
                 const uint32_t lo = j->shared_end + j->half * h;
                 const uint32_t hi = h == j->cur_half ? j->used :
                                     (j->half_fill[h] ? j->half_fill[h] : lo);
@@ -6429,7 +6865,11 @@ static B86_PJ_COLD uint32_t pj_v31_find(B86Cpu *c, B86Pj *j,
             if (off + size > j->hot_used) goto invalid;
         } else {
             unsigned h, contained = 0u;
+#if B86_PJ_V94_SEGS
+            for (h = 0u; h < PJ_NSEG; ++h) {
+#else
             for (h = 0u; h < 2u; ++h) {
+#endif
                 const uint32_t lo = j->shared_end + j->half * h;
                 const uint32_t hi = h == j->cur_half ? j->used :
                                     (j->half_fill[h] ? j->half_fill[h] : lo);
@@ -6501,6 +6941,22 @@ static B86_PJ_COLD void b86_pj_v27_reconcile(B86Cpu *c, B86Pj *j)
         return;
     }
 #if B86_PJ_V31_LAZY_EPOCH
+#if B86_V99_SELECTIVE
+    /* V99: keep extended-memory blocks when no unseen write and no mapping
+     * change can have touched them; everything else exactly as below. */
+    if (pj_v99_try_selective(c, j)) {
+        c->pj_exit = 0u;
+        pj_v31_active = 1u;
+        pj_v31_memo_reset(j);
+        ++pj_v99_n[0];                           /* (pj_v99 is non-NULL here) */
+        if (j->v30c_parked) {
+            j->v30c_parked = 0u;
+            ++j->v30c_resumes;
+        }
+        return;
+    }
+    if (pj_v99) ++pj_v99_n[1];
+#endif
     /* Native linked exits and the direct C / generated-dyn entry tables
      * must no longer reach unvalidated code. Unlink EVERY logged exit first;
      * an inconsistent log fails to the existing full flush. */
@@ -6516,6 +6972,10 @@ static B86_PJ_COLD void b86_pj_v27_reconcile(B86Cpu *c, B86Pj *j)
     pj_v31_active = 1u;
     pj_v31_memo_reset(j);
     ++pj_v31_epochs;
+#if B86_V99_SELECTIVE
+    b86_v99_ext_dirty = 0u;                       /* V99: all code revalidates lazily from here */
+    pj_v99_snapshot(c);
+#endif
     if (j->v30c_parked) {
         j->v30c_parked = 0u;
         ++j->v30c_resumes;
@@ -6531,7 +6991,11 @@ static B86_PJ_COLD void b86_pj_v27_reconcile(B86Cpu *c, B86Pj *j)
      * still fails closed to the original V27 full flush below.
      * Do NOT bypass this walk on any RM epoch: no universal write journal
      * exists yet for all interpreted / native store paths. */
+#if B86_PJ_V94_SEGS
+    for (h = 0u; h < PJ_NSEG; ++h) {
+#else
     for (h = 0u; h < 2u; ++h) {
+#endif
         const uint32_t lo = j->shared_end + j->half * h;
         const uint32_t hi = h == j->cur_half ? j->used :
                             (j->half_fill[h] ? j->half_fill[h] : lo);
@@ -8033,6 +8497,67 @@ static B86_PJ_COLD int pjt_insn_pm16(PjT *t)
         else if (x == 0x0Fu) BB_PM16_DIAG_INC(pref66_0f);
         else BB_PM16_DIAG_INC(pref66_other);
     }
+#if B86_PJ_V92_PM16
+    /* V92: AL/AX-immediate ALU and TEST (no prefix: 66 forms have their own
+     * path). Mirrors the 80/81 and 84/85 register paths exactly. */
+    if (op < 0x40u && ((op & 7u) == 4u || (op & 7u) == 5u)) {
+        const unsigned alu92 = op >> 3, w92 = (op & 1u) ? 2u : 1u;
+        if (alu92 == 0u || alu92 == 1u || alu92 == 4u || alu92 == 5u || alu92 == 6u || alu92 == 7u) {
+            uint32_t imm92;
+            if (!pjt_imm(t, w92, &imm92)) PJ16_FAIL();
+            pjt_getr(t, R1, 0u, w92);
+            pj_imm32(&t->e, R0, imm92);
+            if (!pjt_alu(t, alu92, w92, alu92 == 7u ? R3 : R1, R1, R0)) PJ16_FAIL();
+            if (alu92 != 7u) pjt_putr(t, 0u, w92, R1);
+            ++pj_v92_n[0];
+            do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0);
+        }
+    }
+    if (op == 0xA8u || op == 0xA9u) {
+        const unsigned w92 = op == 0xA9u ? 2u : 1u;
+        uint32_t imm92;
+        if (!pjt_imm(t, w92, &imm92)) PJ16_FAIL();
+        pjt_getr(t, R1, 0u, w92);
+        pj_imm32(&t->e, R0, imm92);
+        if (!pjt_alu(t, 4u, w92, R3, R1, R0)) PJ16_FAIL();
+        ++pj_v92_n[1];
+        do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0);
+    }
+#if B86_PJ_V82_PM16
+    {   /* MOV AL/AX,[moffs16] / MOV [moffs16],AL/AX; one optional segment prefix */
+        unsigned seg92 = (unsigned)B86_DS, at92 = t->pos;
+        uint32_t op92 = op;
+        if (op == 0x26u || op == 0x2Eu || op == 0x36u || op == 0x3Eu || op == 0x64u || op == 0x65u) {
+            seg92 = op == 0x26u ? (unsigned)B86_ES : op == 0x2Eu ? (unsigned)B86_CS :
+                    op == 0x36u ? (unsigned)B86_SS : op == 0x3Eu ? (unsigned)B86_DS :
+                    op == 0x64u ? (unsigned)B86_FS : (unsigned)B86_GS;
+            op92 = at92 < t->n ? t->b[at92] : 0x100u;
+            ++at92;
+        }
+        if (op92 >= 0xA0u && op92 <= 0xA3u && at92 + 1u < t->n) {
+            const unsigned w92 = (op92 & 1u) ? 2u : 1u, wr92 = op92 >= 0xA2u;
+            uint32_t off92;
+            t->pos = at92;
+            if (!pjt_imm(t, 2u, &off92)) PJ16_FAIL();
+            pj_movw(&t->e, R1, off92 & 0xFFFFu);
+            pjt_v82_ptr(t, seg92, w92, (int)wr92);
+            if (!wr92) {
+                pjt_v82_load(t, R1, R2, w92);
+                pjt_putr(t, 0u, w92, R1);
+                ++pj_v92_n[2];
+                do { BB_PM16_DIAG_INC(emit_ok); return 1; } while (0);
+            }
+            pjt_getr(t, R1, 0u, w92);
+            pjt_v82_store(t, R1, R2, w92);
+            ++pj_v92_n[3];
+            {
+                const int r92 = pjt_v82_after_store(t, (base_ip + (t->pos - start)) & 0xFFFFu);
+                do { BB_PM16_DIAG_INC(emit_ok); return r92; } while (0);
+            }
+        }
+    }
+#endif
+#endif /* V92 */
 #if B86_PJ_V85_PM16 && B86_PJ_V54_NATIVE_CONTROL && BB_PJ_PM16_GS_STACK_V17
     {   /* V85: ENTER imm16,0 (C8) and POP m16 (8F /0 memory, optional segment prefix) */
         unsigned segov = 255u, at = t->pos;
@@ -8754,10 +9279,18 @@ static B86_PJ_COLD int pjt_insn_pm16(PjT *t)
             int armcc;
             if (!pjt_imm(t, 2u, &delta16)) PJ16_FAIL();
             armcc = pjt_flags_for(t, op2 & 15u);
+#if B86_PJ_V93_PM16_LINK
+            /* V93: static exits (as flat pjt_jcc), chained by the 16-bit linker */
+            pjt_exit_cond(t, armcc,
+                          (PJ16_NEXT() + (uint32_t)(int32_t)(int16_t)delta16) & 0xFFFFu,
+                          t->ninsn);
+            pjt_exit(t, PJ16_NEXT(), t->ninsn, 0);
+#else
             pjt_exit_stay(t, armcc,
                           (PJ16_NEXT() + (uint32_t)(int32_t)(int16_t)delta16) & 0xFFFFu,
                           t->ninsn);
             pjt_exit(t, PJ16_NEXT(), t->ninsn, 2);
+#endif
             BB_PM16_DIAG_INC(v15_pm16_near_jcc_native);
             do { BB_PM16_DIAG_INC(emit_ok); return 2; } while (0);
         }
@@ -9436,7 +9969,10 @@ static B86_PJ_COLD int pjt_insn_pm16(PjT *t)
             if (!pjt_imm(t, 2u, &imm)) PJ16_FAIL();
             imm = (uint32_t)(int32_t)(int16_t)imm;
         }
-#if B86_PJ_V56_STACK_CHAIN && B86_PJ_V55_PM16_DYN
+#if B86_PJ_V93_PM16_LINK
+        /* V93: a relative JMP has a fixed target: static exit, chained directly */
+        pjt_exit(t, (PJ16_NEXT() + imm) & 0xFFFFu, t->ninsn, 0);
+#elif B86_PJ_V56_STACK_CHAIN && B86_PJ_V55_PM16_DYN
         /* Relative near and short JMP now probe native PM16 context
          * before returning to C, exactly like v55's computed transfers. */
         pj_movw(&t->e, R1, (PJ16_NEXT() + imm) & 0xFFFFu);
@@ -9452,8 +9988,12 @@ static B86_PJ_COLD int pjt_insn_pm16(PjT *t)
         imm = (uint32_t)(int32_t)(int8_t)imm;
         arm = pjt_flags_for(t, op & 15u);
         pjt_exit_cond(t, arm, (PJ16_NEXT() + imm) & 0xFFFFu, t->ninsn);
+#if B86_PJ_V93_PM16_LINK
+        pjt_exit(t, PJ16_NEXT(), t->ninsn, 0);           /* V93: static, linkable fall-through */
+#else
         /* dyn=2 returns unlinked and uses the specified fallthrough EIP. */
         pjt_exit(t, PJ16_NEXT(), t->ninsn, 2);
+#endif
         do { BB_PM16_DIAG_INC(emit_ok); return 2; } while (0);
     }
     PJ16_FAIL();
@@ -9538,7 +10078,11 @@ static int pj_aud_live(const B86Pj *j, uint32_t off)
 {
     unsigned h;
     if (pj_in_hot(j, off)) return off >= j->hot_start && off < j->hot_used;
+#if B86_PJ_V94_SEGS
+    for (h = 0u; h < PJ_NSEG; ++h) {
+#else
     for (h = 0u; h < 2u; ++h) {
+#endif
         const uint32_t lo = j->shared_end + j->half * h;
         const uint32_t hi = h == j->cur_half ? j->used : (j->half_fill[h] ? j->half_fill[h] : lo);
         if (off >= lo && off < hi) return 1;
@@ -9722,12 +10266,94 @@ static B86_PJ_COLD int pj_v31_unlink_all(B86Pj *j)
     return 1;
 }
 #endif
+#if B86_V99_SELECTIVE
+/* V99: may this block keep its table entries and incoming links? Only a live
+ * block translated with paging on whose every source page is extended memory. */
+static int pj_v99_block_ok(const B86Pj *j, uint32_t off)
+{
+    const uint32_t *hd;
+    uint32_t size, n, sn, id0, id1;
+    const uint8_t *pin;
+    if (off > UINT32_MAX - PJ_HDR_BYTES || !pj_aud_live(j, off) || !pj_aud_live(j, off + PJ_HDR_BYTES - 1u)) return 0;
+    hd = pj_hdr((B86Pj *)j, off);
+    if (hd[1] & 0x80000000u) return 0;                         /* dead or redirected */
+    size = hd[5]; n = hd[1] & 0x3FFFFFFFu;
+    if (!n || n > 192u) return 0;
+    sn = (n + 3u) & ~3u;
+    if (size < PJ_HDR_BYTES + 16u + 8u + sn || !pj_aud_live(j, off + size - 1u)) return 0;
+    pin = (const uint8_t *)hd + size - sn - 8u;
+    memcpy(&id0, pin, 4u); memcpy(&id1, pin + 4u, 4u);
+    if (id0 == PJ_V29_ABSENT || !(id0 & PJ_V29_PAGED) || (id0 & ~PJ_V29_PAGED) < PJ_V99_EXT_FRAME) return 0;
+    if (((hd[0] & 0xFFFu) + n) > 4096u &&
+        (id1 == PJ_V29_ABSENT || !(id1 & PJ_V29_PAGED) || (id1 & ~PJ_V29_PAGED) < PJ_V99_EXT_FRAME)) return 0;
+    return 1;
+}
+static void pj_v99_filter_table(B86Pj *j, uint32_t *tag, uint32_t *ent, uint32_t entries)
+{
+    uint32_t k;
+    for (k = 0u; k < entries; ++k) {
+        if (!tag[k] && !ent[k]) continue;
+        if (ent[k] > PJ_HDR_BYTES && pj_v99_block_ok(j, ent[k] - 1u - PJ_HDR_BYTES)) { ++pj_v99_n[8]; continue; }
+        tag[k] = 0u; ent[k] = 0u; ++pj_v99_n[9];
+    }
+}
+static B86_PJ_COLD int pj_v99_try_selective(B86Cpu *c, B86Pj *j)
+{
+    uint32_t i, keep = 0u, *lk = pj_links(j);
+    unsigned ctx;
+    if (!pj_v99) return 0;
+    if (b86_v99_ext_dirty) { ++pj_v99_n[2]; return 0; }
+    if (!pj_v99_snap_ok) { ++pj_v99_n[5]; return 0; }
+    if (pj_v99_snap_stale) { ++pj_v99_n[4]; return 0; }
+    if (!pj_v99_unchanged(c)) { ++pj_v99_n[3]; return 0; }
+    if (j->nlinks > B86_PJ_LINKS) return 0;
+    /* Preflight every record exactly like pj_v31_unlink_all, before any change. */
+    for (i = 0u; i < j->nlinks; ++i) {
+        const uint32_t so = lk[2u * i], to = lk[2u * i + 1u];
+        if (so > UINT32_MAX - 13u ||
+            !pj_aud_live(j, so) || !pj_aud_live(j, so + 13u) ||
+            !pj_aud_live(j, to) || !pj_v12_link_intact(j, so, to))
+            return 0;
+    }
+    for (i = 0u; i < j->nlinks; ++i) {
+        const uint32_t so = lk[2u * i], to = lk[2u * i + 1u];
+        uint8_t *stub;
+        if (to >= PJ_HDR_BYTES && pj_v99_block_ok(j, to - PJ_HDR_BYTES)) {
+            lk[2u * keep] = so; lk[2u * keep + 1u] = to; ++keep; ++pj_v99_n[6];
+            continue;
+        }
+        stub = j->code + so;                     /* identical to pj_v31_unlink_all */
+        stub[0] = 0x00u; stub[1] = 0xF0u;
+        stub[2] = 0x00u; stub[3] = 0x90u;
+        pj_patch_b(stub, pj_in_hot(j, so) ? j->hsh.exit_s : j->exit_s);
+        stub[3] |= 0x40u;
+#if defined(__linux__)
+        __builtin___clear_cache((char *)stub, (char *)stub + 14);
+#endif
+        ++pj_v99_n[7]; ++pj_v31_unlinked;
+    }
+#if !defined(__linux__)
+    __asm__ volatile("dsb 0xF\n\tisb 0xF" ::: "memory");
+#endif
+    j->nlinks = keep;
+    pj_v99_filter_table(j, j->tag, j->ent, B86_PJ_HASH);
+    for (ctx = 0u; ctx < PJ_PM16_CTX; ++ctx)
+        pj_v99_filter_table(j, pj_pm16_tag(j, ctx), pj_pm16_ent(j, ctx), PJ_PM16_ENT);
+    return 1;
+}
+#endif
 /* r71: the current half is full: empty the other one and continue there. */
 static B86_PJ_COLD void pj_evict_switch(B86Cpu *c, B86Pj *j)
 {
+#if B86_PJ_V94_SEGS
+    const unsigned other = (j->cur_half + 1u) % PJ_NSEG;   /* V94: the oldest segment */
+    const uint32_t lo = j->shared_end + j->half * other, hi = lo + j->half;
+    uint32_t *lk = pj_links(j), i, n = 0u, k;
+#else
     const unsigned other = j->cur_half ^ 1u;
     const uint32_t lo = j->shared_end + j->half * other, hi = lo + j->half;
     uint32_t *lk = pj_links(j), i, n = 0u, k;
+#endif
     /* links: drop those living in the evicted half, undo those pointing into it */
     for (i = 0; i < j->nlinks; ++i) {
         const uint32_t so = lk[2u * i], to = lk[2u * i + 1u];
@@ -9788,6 +10414,13 @@ static B86_PJ_COLD void pj_evict_switch(B86Cpu *c, B86Pj *j)
     {
         const uint32_t clo = j->shared_end + j->half * j->cur_half;
         pj_rebuild_pages(j, clo, j->used);
+#if B86_PJ_V94_SEGS
+        {   unsigned s94;                              /* V94: and every other surviving segment */
+            for (s94 = 0u; s94 < PJ_NSEG; ++s94)
+                if (s94 != j->cur_half && s94 != other && j->half_fill[s94])
+                    pj_rebuild_walk(j, j->shared_end + j->half * s94, j->half_fill[s94]);
+        }
+#endif
     }
     j->half_fill[other] = 0u;
     j->cur_half = other;
@@ -9918,8 +10551,17 @@ static B86_PJ_COLD void pj_hot_reset(B86Cpu *c, B86Pj *j)
     pj_v13_prune_links(j);
 #endif
     j->hot_used = j->hot_start;
+#if B86_PJ_V94_SEGS
+    pj_rebuild_pages(j, j->shared_end + j->half * j->cur_half, j->used);
+    {   unsigned s94;                                  /* V94: every other filled segment */
+        for (s94 = 0u; s94 < PJ_NSEG; ++s94)
+            if (s94 != j->cur_half && j->half_fill[s94])
+                pj_rebuild_walk(j, j->shared_end + j->half * s94, j->half_fill[s94]);
+    }
+#else
     pj_rebuild_pages(j, j->shared_end + j->half * j->cur_half, j->used);
     if (j->half_fill[j->cur_half ^ 1u]) pj_rebuild_walk(j, j->shared_end + j->half * (j->cur_half ^ 1u), j->half_fill[j->cur_half ^ 1u]);
+#endif
 #if !defined(__linux__)
     __asm__ volatile("dsb 0xF\n\tisb 0xF" ::: "memory");
 #endif
@@ -10147,6 +10789,9 @@ static B86_PJ_COLD uint32_t b86_pj_translate(B86Cpu *c, uint32_t eip)
              * 66/segment/REP-prefixed instructions. Never count successes. */
             unsigned k = t.pos, pfx = 0u;
             ++j->stop_op[t.b[t.pos]];
+#if B86_PJ_V91_PM16
+            if (j->pm16_active) pj_v91_note_stop(t.b, t.n, t.pos);
+#endif
             while (k < t.n && pfx < 5u) {
                 const uint8_t b = t.b[k];
                 if (b == 0x66u || b == 0x67u || b == 0xF0u ||
@@ -10171,8 +10816,12 @@ static B86_PJ_COLD uint32_t b86_pj_translate(B86Cpu *c, uint32_t eip)
             }
         }
 #if BB_PJ_PM16_REG_TIER
+#if B86_PJ_V93_PM16_LINK
+        pjt_exit(&t, j->pm16_active ? ((eip + t.pos) & 0xFFFFu) : eip + t.pos, t.ninsn, 0);   /* V93 */
+#else
         pjt_exit(&t, j->pm16_active ? ((eip + t.pos) & 0xFFFFu) : eip + t.pos,
                  t.ninsn, j->pm16_active ? 2 : 0);
+#endif
 #else
         pjt_exit(&t, eip + t.pos, t.ninsn, 0);
 #endif
@@ -10212,6 +10861,12 @@ static B86_PJ_COLD uint32_t b86_pj_translate(B86Cpu *c, uint32_t eip)
         }
         t.e.p = (uint8_t *)aligned;
         memcpy(t.e.p, &p0, 4u); memcpy(t.e.p + 4u, &p1, 4u);
+#if B86_V99_SELECTIVE
+        if (p0 & PJ_V29_PAGED) {
+            pj_v99_note_code(lin0, p0);
+            if (p1 != PJ_V29_ABSENT) pj_v99_note_code((lin0 & ~0xFFFu) + 4096u, p1);
+        }
+#endif
         t.e.p += 8u;
         memcpy(t.e.p, t.b, t.pos);
         if (sn > t.pos) memset(t.e.p + t.pos, 0, sn - t.pos);
@@ -10231,6 +10886,9 @@ static B86_PJ_COLD uint32_t b86_pj_translate(B86Cpu *c, uint32_t eip)
         for (pg = pga; ; ++pg) {
             uint32_t phys, pkey, ph;
             const uint32_t h = PJ_PGH(pg);
+#if B86_V95_HOSTTLB
+            if (!(j->cpg[h >> 5] & (1u << (h & 31u)))) pj_v95_tlb_nowrite(c);   /* V95 */
+#endif
             j->cpg[h >> 5] |= 1u << (h & 31u);
             if (c->pg) { if (!b86_pg_walk(c, pg << 12, &phys)) { b86_pj_flush(c); return 0u; } }
             else phys = pg << 12;
@@ -10493,6 +11151,43 @@ static B86_PJ_COLD void b86_pj_link(B86Cpu *c)
     B86Pj *j = b86_pj_state(c);
     uint8_t *stub = (uint8_t *)((c->pj_exit & ~(uintptr_t)1u) - 4u);    /* r71: LR after BL exit_s at +0 */
     const unsigned long gen = j->flushes + j->gen;
+#if B86_PJ_V93_PM16_LINK && BB_PJ_PM16_REG_TIER
+    /* V93: flat blocks use the flat tables; a 16-bit block (the caller checked
+     * that CS is still its context) uses that context's tables and CS base + IP. */
+    const uint32_t pm16 = j->pm16_active ? 1u : 0u;
+    uint32_t *const tagt = pm16 ? pj_pm16_tag(j, j->pm16_cur) : j->tag;
+    uint32_t *const entt = pm16 ? pj_pm16_ent(j, j->pm16_cur) : j->ent;
+    const uint32_t lin = (pm16 ? j->pm16_base : 0u) + c->ip;
+    uint32_t h = pm16 ? ((c->ip * 2654435761u) >> 16) & (PJ_PM16_ENT - 1u)
+                      : ((c->ip * 2654435761u) >> 16) & (B86_PJ_HASH - 1u), ent;
+    c->pj_exit = 0u;
+#if B86_PJ_V45_DYN2
+    if (!pm16) {
+        if (j->tag[h] != (c->ip | 1u) && j->tag[h ^ 1u] == (c->ip | 1u)) h ^= 1u;
+        if (j->tag[h] != (c->ip | 1u) && j->tag[h] && !j->tag[h ^ 1u]) h ^= 1u;
+    }
+#endif
+    if (j->flush_pending) return;
+    if (!pj_in_hot(j, (uint32_t)(stub - j->code)) && (stub < j->code + j->shared_end || stub + 14u > j->code + j->cap)) return;
+    if (j->nlinks >= B86_PJ_LINKS) return;            /* r71: log full: stop linking until the next eviction */
+    if (tagt[h] != (c->ip | 1u)) {
+        uint32_t e =
+#if B86_PJ_V31_LAZY_EPOCH
+            pj_v31_find(c, j, lin, c->ip, pm16);
+#else
+            pj_find_block(j, lin, c->ip, pm16);
+#endif
+        if (e) ++j->refinds;
+        else {
+            if (pj_v30f_defer(c, j, c->ip)) return;
+            e = b86_pj_translate(c, c->ip);
+        }
+        tagt[h] = c->ip | 1u;
+        entt[h] = e;
+        if (!e) ++j->declines;
+    }
+    ent = entt[h];
+#else
     uint32_t h = ((c->ip * 2654435761u) >> 16) & (B86_PJ_HASH - 1u), ent;
     c->pj_exit = 0u;
 #if B86_PJ_V45_DYN2
@@ -10521,6 +11216,7 @@ static B86_PJ_COLD void b86_pj_link(B86Cpu *c)
         if (!e) ++j->declines;
     }
     ent = j->ent[h];
+#endif
     if (!ent || j->flushes + j->gen != gen) return;  /* translation flushed/evicted: stub may be gone */
     if (pj_in_hot(j, (uint32_t)(stub - j->code)) != pj_in_hot(j, ent - 1u)) return;   /* r72: B.W cannot reach */
     {   /* r73k: never patch a stub that a redirect trampoline (LDR.W pc,[pc,#0]; .word) overlaps */
@@ -10718,6 +11414,10 @@ static B86_PM_HOT unsigned b86_pj_try(B86Cpu *c)
     B86Pj *j = b86_pj_state(c);
     uint32_t h, ent;
     unsigned n;
+#if B86_PJ_V91_PM16
+    const unsigned v91 = (c->msw & 1u) && !(c->flags & 0x20000u) && !(c->pm386.seg[B86_CS].flags & 4u);
+    if (v91) ++pj_v91_n[PJ_V91_TRY];
+#endif
     /* V29: one shared mapping epoch for both PM16 and PM32 native blocks.
      * Only an actual PG/CR3/TLB epoch change incurs a cold reconciliation. */
     if (j && j->v29_map_observed && !j->v27_rm_pending &&
@@ -10737,6 +11437,9 @@ static B86_PM_HOT unsigned b86_pj_try(B86Cpu *c)
      * PG-on reentry above validates dormant code before enabling PJ. */
     if (j && j->v30c_parked && !c->pg) {
         ++j->v30c_deopts;
+#if B86_PJ_V91_PM16
+        PJ_V91_COUNT(PJ_V91_PG0);
+#endif
         return 0u;
     }
     if (B86_PJ_PCS && j && j->hot && pj_pcs_r != pj_pcs_w) pj_pcs_drain(c, j);   /* r72f */
@@ -10754,7 +11457,11 @@ static B86_PM_HOT unsigned b86_pj_try(B86Cpu *c)
             bb5h_note(c, reg16 ? 16u : (flat ? 32u : 0u), 0u);
             if (flat) bb5i_capture_hot_opcodes(c);
         }
+#if B86_PJ_V91_PM16
+        if (!flat && !reg16) { PJ_V91_COUNT(PJ_V91_INELIGIBLE); return 0u; }
+#else
         if (!flat && !reg16) return 0u;
+#endif
 #if BB_PJ_PM16_ADAPTIVE
         /* Skip BEFORE the PM16 cache/mode transition, translation and
          * potential full flush. This deoptimizes to the checked interpreter.
@@ -10763,6 +11470,9 @@ static B86_PM_HOT unsigned b86_pj_try(B86Cpu *c)
         if (reg16 && j->pm16_adapt_cooldown) {
             --j->pm16_adapt_cooldown;
             ++j->pm16_adapt_skips;
+#if B86_PJ_V91_PM16
+            PJ_V91_COUNT(PJ_V91_ADAPT);
+#endif
             return 0u;
         }
 #endif
@@ -10860,7 +11570,14 @@ static B86_PM_HOT unsigned b86_pj_try(B86Cpu *c)
     if (!j->pm16_active && tagt[h] != (c->ip | 1u) &&
         tagt[h ^ 1u] == (c->ip | 1u)) h ^= 1u;
 #endif
+#if B86_PJ_V98_STATS
+    ++pj_v98_n[4u + (j->pm16_active ? 1u : 0u)];
+#endif
     if (tagt[h] != (c->ip | 1u)) {
+#if B86_PJ_V98_STATS
+        ++pj_v98_n[j->pm16_active ? 1u : 0u];
+        if (tagt[h]) ++pj_v98_n[j->pm16_active ? 3u : 2u];
+#endif
 #if B86_PJ_V45_DYN2
         /* Prefer an empty neighbor rather than evicting a live translation.
          * A nonempty pair retains the original primary-victim policy.
@@ -10884,6 +11601,9 @@ static B86_PM_HOT unsigned b86_pj_try(B86Cpu *c)
             (const uint32_t *)(const void *)(j->code + j->cap);
         if (pm16_neg[pm16_slot] == pm16_lin + 1u) {
             ++j->pm16_neg_hits;
+#if B86_PJ_V91_PM16
+            PJ_V91_COUNT(PJ_V91_NEG);
+#endif
             return 0u;
         }
     }
@@ -10905,13 +11625,21 @@ static B86_PM_HOT unsigned b86_pj_try(B86Cpu *c)
             if (e) ++j->refinds;
             else {
                 /* Never cache a negative entry for a temporary defer. */
+#if B86_PJ_V91_PM16
+                if (pj_v30f_defer(c, j, c->ip)) { PJ_V91_COUNT(PJ_V91_DEFER); return 0u; }
+#else
                 if (pj_v30f_defer(c, j, c->ip)) return 0u;
+#endif
                 e = b86_pj_translate(c, c->ip);
             }
             tagt[h] = c->ip | 1u;
             entt[h] = e;
         }
+#if B86_PJ_V91_PM16
+        if (!entt[h]) { ++j->declines; PJ_V91_COUNT(PJ_V91_DECLINE_NEW); }
+#else
         if (!entt[h]) ++j->declines;
+#endif
 /* BB_PJ_PM16_NEGCACHE_V1: record only a failed PM16 translation.
          * It is safe to remember this across code and descriptor changes:
          * later hits always interpret instead of executing old native code. */
@@ -10926,7 +11654,11 @@ static B86_PM_HOT unsigned b86_pj_try(B86Cpu *c)
     }
     ent = entt[h];
     }
+#if B86_PJ_V91_PM16
+    if (!ent) { PJ_V91_COUNT(PJ_V91_NOBLOCK); return 0u; }
+#else
     if (!ent) return 0u;
+#endif
     /* r71: BB_PJ_FETCH_PAGE_V1. Real 386 code fetch walks the code page:
      * it faults when DOS/4GW has paged it out and sets the Accessed bit the
      * VMM uses to pick eviction victims. Translated code never re-reads its
@@ -10946,7 +11678,11 @@ static B86_PM_HOT unsigned b86_pj_try(B86Cpu *c)
             ++j->v30i_tlb_hits;
         } else {
             ++j->v30i_tlb_walks;
+#if B86_PJ_V91_PM16
+            if (!b86_pg_walk(c, lip, &ph)) { ++j->fetch_refusals; PJ_V91_COUNT(PJ_V91_FETCH); return 0u; }
+#else
             if (!b86_pg_walk(c, lip, &ph)) { ++j->fetch_refusals; return 0u; }
+#endif
         }
     }
 #ifdef B86_PJ_VERIFY
@@ -11006,6 +11742,11 @@ static B86_PM_HOT unsigned b86_pj_try(B86Cpu *c)
         }
 #endif /* B86_PJ_V30K_XIP_SPLIT: pre-entry hardware reads */
         n = ((unsigned (*)(B86Cpu *, uintptr_t))(void *)(uintptr_t)((uintptr_t)(hot ? j->hsh.entry : j->entry) | 1u))(c, (uintptr_t)(j->code + ent - 1u) | 1u);
+#if B86_PJ_V91_PM16
+        if (v91 && j->pm16_active) {
+            ++pj_v91_n[PJ_V91_RUN]; pj_v91_n[PJ_V91_RETIRED] += n; ++pj_v91_len[pj_v91_bucket(n)];
+        }
+#endif
 #if B86_PJ_V30K_XIP_SPLIT
         if (j->xacc) {
             const uint32_t a1 = *j->xacc, h1 = *j->xhit, t1 = *j->xus;
@@ -11105,6 +11846,20 @@ static B86_PM_HOT unsigned b86_pj_try(B86Cpu *c)
     }
 #endif
     ++j->runs; j->insns += n;
+#if B86_PJ_V93_PM16_LINK && BB_PJ_PM16_REG_TIER
+    if (c->pj_exit && n && j->pm16_active) {               /* V93: chain 16-bit blocks */
+        const B86PM1Cache *cs93 = &c->pm386.seg[B86_CS];
+        const uint32_t kind93 = (uint32_t)cs93->selector | ((uint32_t)cs93->flags << 16) |
+                                ((uint32_t)cs93->access << 24);
+        ++pj_v93_n[0];
+        if (pj_pm16_reg_ok(c) && cs93->base == j->pm16_base && cs93->limit == j->pm16_limit &&
+            kind93 == j->pm16_kind) {
+            const unsigned long links93 = j->links;
+            b86_pj_link(c);
+            if (j->links != links93) ++pj_v93_n[2];
+        } else ++pj_v93_n[1];
+    } else
+#endif
     if (c->pj_exit && n && pj_flat(c)) b86_pj_link(c);
     if (!n) ++j->exits_mem;
     return n;
@@ -11133,7 +11888,12 @@ void b86_pj_es_skip_stats(const B86Cpu *c, unsigned long out[3])
     out[2] = j->es_skip_marks;
 }
 #if defined(PICO_ON_DEVICE) && PICO_ON_DEVICE
+#if defined(B86_PJ_V96_HASH_OK) && B86_PJ_V96_HASH_OK
+/* V96: the caller's arena is 8 KiB + 8 bytes per entry above 512 (blitzBUS BB_PJ_STATE_BYTES) */
+_Static_assert(sizeof(B86Pj) <= 8192u + 8u * (B86_PJ_HASH - 512u), "PJ state exceeds the V96 arena for B86_PJ_HASH");
+#else
 _Static_assert(sizeof(B86Pj) <= 8192u, "ES skip cache exceeds existing 8 KiB PJ arena");
+#endif
 #endif
 size_t b86_pj_state_bytes(void) { return sizeof(B86Pj); }
 int b86_pj_attach(B86Cpu *c, void *state, size_t state_bytes, void *code, size_t code_bytes)
@@ -11141,6 +11901,11 @@ int b86_pj_attach(B86Cpu *c, void *state, size_t state_bytes, void *code, size_t
     B86Pj *j = (B86Pj *)state;
     if (!c || !state || state_bytes < sizeof(B86Pj) || !code || code_bytes < 16384u + PJ_TAIL_BYTES || (((uintptr_t)code) & 3u)) return 0;
     memset(j, 0, sizeof *j);
+#if B86_V99_SELECTIVE
+    if (!pj_v99) pj_v99 = (PjV99 *)B86_CALLOC(1u, sizeof(PjV99));   /* metadata pool, once */
+    pj_v99_reset();
+    b86_v99_ext_dirty = 1u;
+#endif
     j->code = (uint8_t *)code; j->cap = (uint32_t)(code_bytes - PJ_TAIL_BYTES);
     memset(j->code + j->cap, 0, PJ_TAIL_BYTES); /* negative table, code-page set, block lists: outside emitter bounds */
     {   /* 8-byte aligned candidate table in additional PSRAM tail. */
@@ -11464,9 +12229,37 @@ void b86_pj_mem_profile(const B86Cpu *c, unsigned long out[8])
            pj_v82_n[0], pj_v82_n[1], pj_v82_n[2], pj_v82_n[3], pj_v82_n[4], pj_v82_n[5],
            pj_v82_n[6], pj_v82_n[7], pj_v82_n[8], pj_v82_n[9], pj_v82_n[11], B86_PJ_V82_STORE_CONTINUE);
 #endif
+#if B86_V90_INTERP_HIST
+    pj_v90_report();
+#endif
+#if B86_PJ_V93_PM16_LINK
+    printf("[bb386-v93-pm16link] tries=%lu ctx-refused=%lu linked=%lu\n", pj_v93_n[0], pj_v93_n[1], pj_v93_n[2]);
+#endif
+#if B86_PJ_V92_PM16
+    printf("[bb386-v92-pm16] acc=%lu test=%lu moffs-read=%lu moffs-write=%lu\n",
+           pj_v92_n[0], pj_v92_n[1], pj_v92_n[2], pj_v92_n[3]);
+#endif
+#if B86_PJ_V91_PM16
+    pj_v91_report();
+#endif
 #if B86_PJ_V89_MTF || B86_PJ_V89_LINEFILTER
     printf("[bb386-v89] mtf-moves=%lu store-skips=%lu store-walks=%lu line-marks=%lu mtf=%d linefilter=%d\n",
            pj_v89_n[0], pj_v89_n[1], pj_v89_n[2], pj_v89_n[3], B86_PJ_V89_MTF, B86_PJ_V89_LINEFILTER);
+#endif
+#if B86_V99_SELECTIVE
+    if (!pj_v99) printf("[bb386-v99] unavailable (no metadata memory): every epoch is full\n");
+    else
+    printf("[bb386-v99] selective=%lu full=%lu why: dirty=%lu map=%lu stale=%lu nosnap=%lu too-many-tables=%lu links kept=%lu cut=%lu entries kept=%lu cut=%lu snapshots=%lu dirty-cpu=%lu dirty-host=%lu\n",
+           pj_v99_n[0], pj_v99_n[1], pj_v99_n[2], pj_v99_n[3], pj_v99_n[4], pj_v99_n[5], pj_v99_n[11],
+           pj_v99_n[6], pj_v99_n[7], pj_v99_n[8], pj_v99_n[9], pj_v99_n[10], b86_v99_dirty_cpu, b86_v99_dirty_host);
+#endif
+#if B86_PJ_V98_STATS
+    {   unsigned k, used = 0u;
+        for (k = 0u; k < PJ_PM16_CTX; ++k) if (pj_pm16_desc(j, k)[3]) ++used;
+        printf("[bb386-v98] lookups flat=%lu pm16=%lu misses flat=%lu pm16=%lu conflicts flat=%lu pm16=%lu contexts-used=%u/%u pm16-ent=%u flat-ent=%u\n",
+               pj_v98_n[4], pj_v98_n[5], pj_v98_n[0], pj_v98_n[1], pj_v98_n[2], pj_v98_n[3],
+               used, (unsigned)PJ_PM16_CTX, (unsigned)PJ_PM16_ENT, (unsigned)B86_PJ_HASH);
+    }
 #endif
 #if B86_PJ_V88_LISTS
     printf("[bb386-v88-lists] find-walks=%lu find-steps=%lu find-unlinked=%lu kill-walks=%lu kill-steps=%lu kill-unlinked=%lu\n",
@@ -11685,7 +12478,11 @@ unsigned long b86_pm_c_op_exec[512];   /* harness profile storage */
 int b86_pj_attach_hot(B86Cpu *c, void *buf, size_t bytes)
 {
     B86Pj *j = c ? (B86Pj *)c->pj : NULL;
+#if B86_PJ_V94_SEGS
+    uint32_t sv_used, sv_end, sv_half, sv_cur, sv_nl, sv_fill[PJ_NSEG];
+#else
     uint32_t sv_used, sv_end, sv_half, sv_cur, sv_f0, sv_f1, sv_nl;
+#endif
     if (!j || !buf || bytes < 32768u || (((uintptr_t)buf) & 3u)) return 0;
     j->hot = (uint8_t *)buf;
     j->maxredir = 512u;                              /* 16-byte entries: 8 KiB at the end of the tier */
@@ -11693,7 +12490,11 @@ int b86_pj_attach_hot(B86Cpu *c, void *buf, size_t bytes)
     j->hot_cap = (uint32_t)bytes - j->maxredir * 16u;
     j->hot_base = (uint32_t)((uintptr_t)j->hot - (uintptr_t)j->code);
     sv_used = j->used; sv_end = j->shared_end; sv_half = j->half; sv_cur = j->cur_half;
+#if B86_PJ_V94_SEGS
+    memcpy(sv_fill, j->half_fill, sizeof sv_fill); sv_nl = j->nlinks;
+#else
     sv_f0 = j->half_fill[0]; sv_f1 = j->half_fill[1]; sv_nl = j->nlinks;
+#endif
     {   struct PjSh mainsh;
         pj_sh_get(j, &mainsh);
         pj_emit_shared_at(j, j->hot, j->hot + j->hot_cap);
@@ -11702,7 +12503,11 @@ int b86_pj_attach_hot(B86Cpu *c, void *buf, size_t bytes)
         pj_sh_set(j, &mainsh);
     }
     j->used = sv_used; j->shared_end = sv_end; j->half = sv_half; j->cur_half = sv_cur;
+#if B86_PJ_V94_SEGS
+    memcpy(j->half_fill, sv_fill, sizeof sv_fill); j->nlinks = sv_nl;
+#else
     j->half_fill[0] = sv_f0; j->half_fill[1] = sv_f1; j->nlinks = sv_nl;
+#endif
     j->hot_used = j->hot_start; j->nredir = 0u;
 #ifdef B86_PJ_RANGE_CHECK
     fprintf(stderr, "[pj] main: tail_z+%X tail+%X exit_s+%X chk+%X memtramp+%X entry+%X dyn+%X lzh0+%X memt0+%X\n",

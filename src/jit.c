@@ -2805,8 +2805,36 @@ B86_HOT static void fast_reset(J *j)
     }
 }
 
+#ifndef B86_V95_FLUSHLOG
+#define B86_V95_FLUSHLOG 1
+#endif
+#if B86_V95_FLUSHLOG
+/* V95: why the real-mode JIT flushes (pm-pad: a PM store could not be checked
+ * against real-mode code; pm-evict: first PM->RM switch in region-evict mode;
+ * capacity; tx-limit; zero-delta: page mapping; other). */
+static unsigned long jit_v95_cause[6], jit_v95_n;
+static unsigned jit_v95_last = 5u;
+extern unsigned long b86_v95_smc_walked, b86_v95_smc_padded;
+#define JIT_V95_CAUSE(k) (jit_v95_last = (k), ++jit_v95_cause[(k)])
+static __attribute__((noinline)) void jit_v95_log(void)
+{
+    static const char *const nm[6] = { "pm-pad", "pm-evict", "capacity", "tx-limit", "zero-delta", "other" };
+    ++jit_v95_n;
+    if (jit_v95_last == 5u) ++jit_v95_cause[5];
+    if (jit_v95_n <= 24u || (jit_v95_n & 31u) == 0u)
+        printf("[bb-jit-flush] #%lu cause=%s totals pm-pad=%lu pm-evict=%lu capacity=%lu tx-limit=%lu zero-delta=%lu other=%lu smc-walked=%lu smc-padded=%lu\n",
+               jit_v95_n, nm[jit_v95_last], jit_v95_cause[0], jit_v95_cause[1], jit_v95_cause[2], jit_v95_cause[3],
+               jit_v95_cause[4], jit_v95_cause[5], b86_v95_smc_walked, b86_v95_smc_padded);
+    jit_v95_last = 5u;
+}
+#else
+#define JIT_V95_CAUSE(k) ((void)0)
+#endif
 B86_HOT void b86_jit_flush(J *j)
 {
+#if B86_V95_FLUSHLOG
+    jit_v95_log();
+#endif
     for (uint32_t i = 0; i < j->nblk; ++i) {
         Block *b = &j->blk[i];
         if (!b->host) continue;                       /* recycled slot (r52) */
@@ -3269,7 +3297,11 @@ B86_COLD static Block *translate_ex(J *j, uint32_t cs, uint16_t ip, const Insn *
     uint32_t glo0 = glo, ghi0 = ghi;
 
     if (j->evict) evict_make_room(j);
+#if B86_V95_FLUSHLOG
+    else if (j->nblk >= MAXB || (size_t)(j->buf_end - j->e.p) < 16384) { JIT_V95_CAUSE(2u); b86_jit_flush(j); }
+#else
     else if (j->nblk >= MAXB || (size_t)(j->buf_end - j->e.p) < 16384) b86_jit_flush(j);
+#endif
 
     uint32_t idx = j->nfree ? j->free_idx[j->nfree - 1] : j->nblk;
     Block *b = &j->blk[idx];
@@ -3418,6 +3450,9 @@ B86_COLD static Block *translate_ex(J *j, uint32_t cs, uint16_t ip, const Insn *
             if (maxn > 4) { unsigned m = j->max_insns; j->max_insns = maxn / 2; Block *r = translate_ex(j, cs, ip, pre, npre); j->max_insns = m; return r; }
         }
         /* out of space or an internal limit: flush and retry smaller */
+#if B86_V95_FLUSHLOG
+        JIT_V95_CAUSE(3u);
+#endif
         b86_jit_flush(j);
         if (tx.fail && maxn > 4) { unsigned m = j->max_insns; j->max_insns = maxn / 2; Block *r = translate_ex(j, cs, ip, pre, npre); j->max_insns = m; return r; }
         return translate_ex(j, cs, ip, pre, npre);
@@ -3795,7 +3830,11 @@ int b86_map_range(B86Cpu *c, uint32_t lin, uint32_t len, uint8_t *frame)
     /* r52d: only code that baked a zero delta needs discarding; once a
        page is mapped (A000 in mode 13h) new code always translates, so a
        later mapping (the back buffer) no longer flushes everything */
+#if B86_V95_FLUSHLOG
+    if (j && (j->zero_code & 1)) { JIT_V95_CAUSE(4u); b86_jit_flush(j); }
+#else
     if (j && (j->zero_code & 1)) b86_jit_flush(j);
+#endif
     else if (j && (j->zero_code & 2)) {
         /* CS-absolute accesses baked for unmapped pages: kill the blocks whose
            code segment window overlaps the new mapping (chains fall back
@@ -4271,6 +4310,9 @@ B86_HOT int b86_jit_run(B86Cpu *c, uint64_t max_dispatch)
              * real-mode programs. On the Pico, r73 kept the cache and then
              * evicted regions, and the guest or the host died soon after. */
             if ((c->pg_pad & 1u) || c->jit->evict) {
+#if B86_V95_FLUSHLOG
+                JIT_V95_CAUSE((c->pg_pad & 1u) ? 0u : 1u);
+#endif
                 b86_jit_flush(c->jit); ++c->jit->pm_flushes;
                 if (c->jit->evict) { c->jit->evict = 0; c->jit->e.end = c->jit->buf_end; }
             }

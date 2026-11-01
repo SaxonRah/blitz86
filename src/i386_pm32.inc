@@ -73,6 +73,9 @@ static B86_PM32_FLASH int b86_pm32_step(B86Cpu *c)
                 return B86_UNSUPPORTED;                                         /* #GP / #NP */
             at = c->gdt_base + (sel & 0xFFF8u) + 5u;                             /* mark busy */
             *b86_host(c, at) = (uint8_t)(*b86_host(c, at) | 2u);
+#if B86_V99_SELECTIVE
+            b86_v99_note_any(at, 1u);                                            /* V99: no smc() here */
+#endif
             c->tr_sel = sel; c->tr_base = d.base; c->tr_limit = d.limit;
         }
         if (c->pf_pending) return B86_UNSUPPORTED;
@@ -158,6 +161,9 @@ static uint32_t b86_pm32_rd32(B86Cpu *c, uint32_t a)
 }
 static void b86_pm32_wr32(B86Cpu *c, uint32_t a, uint32_t v)
 {
+#if B86_V99_SELECTIVE
+    b86_v99_note_any(a, 4u);                                                     /* V99: no smc() here */
+#endif
     for (unsigned k = 0u; k < 4u; ++k) *b86_host(c, a + k) = (uint8_t)(v >> (8u * k));
 }
 static B86_PM32_FLASH int b86_pm32_task_switch(B86Cpu *c, uint16_t sel, unsigned kind,
@@ -194,9 +200,15 @@ static B86_PM32_FLASH int b86_pm32_task_switch(B86Cpu *c, uint16_t sel, unsigned
     if (kind == 1u) {                                      /* old task no longer busy */
         uint32_t at = c->gdt_base + (oldtr & 0xFFF8u) + 5u;
         *b86_host(c, at) = (uint8_t)(*b86_host(c, at) & ~2u);
+#if B86_V99_SELECTIVE
+        b86_v99_note_any(at, 1u);
+#endif
     } else {
         uint32_t at = c->gdt_base + (sel & 0xFFF8u) + 5u;
         *b86_host(c, at) = (uint8_t)(*b86_host(c, at) | 2u);
+#if B86_V99_SELECTIVE
+        b86_v99_note_any(at, 1u);
+#endif
         b86_pm32_wr32(c, nb + 0u, oldtr);                  /* back-link */
     }
     /* load the incoming task */

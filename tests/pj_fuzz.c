@@ -229,7 +229,14 @@ static void gen_pm16(int last)
         default: b(0x70 | (rnd() & 15)); b(rnd() & 0x3F); return;
         }
     }
-    switch (rnd() % 29) {
+    switch (rnd() % 31) {
+    case 29: { static const unsigned acc[7] = { 0x04, 0x0C, 0x24, 0x2C, 0x34, 0x3C, 0xA8 };     /* V92: AL/AX, imm */
+        const unsigned o = acc[rnd() % 7] | (rnd() % 2);
+        b(o); b(rnd()); if (o & 1u) b(rnd()); break; }
+    case 30: { static const unsigned pf[7] = { 0, 0, 0x26, 0x36, 0x3E, 0x64, 0x65 };           /* V92: A0-A3 moffs16 */
+        static const unsigned offs[6] = { 0x0000, 0x1234, 0x7FFE, 0x7FFF, 0x8000, 0xFFFF };
+        const unsigned p = pf[rnd() % 7], o = 0xA0 + rnd() % 4, off = rnd() % 3 ? (rnd() & 0x0FFE) : offs[rnd() % 6];
+        if (p) b(p); b(o); b(off & 0xFF); b(off >> 8); break; }
     case 27: { unsigned n = rnd() % 4 == 0 ? 0 : (rnd() & 0x3E); b(0xC8); b(n); b(0); b(0); if (rnd() % 2) b(0xC9); break; }   /* V85: ENTER n,0 [LEAVE] */
     case 28: { static const unsigned pf[6] = { 0, 0x26, 0x36, 0x3E, 0x64, 0x65 }; unsigned p = pf[rnd() % 6];            /* V85: PUSH x; POP m16 */
         b(0x50 + rnd() % 8); if (p) b(p); b(0x8F); modrm_any(0, 1, 1); break; }
@@ -311,6 +318,73 @@ static void gen_pm16(int last)
     }
 }
 static int gen_mode;
+/* V93 mode 13: instructions the program generator must not place in a loop body:
+ * control transfers (the program supplies its own), REP prefixes (retirement
+ * counts), INT/IRET/POPF/HLT and far/indirect branches. */
+/* V95: paging for modes 19/20. Page directory at 0x300000, one table at
+ * 0x301000 covering 0..4 MiB: identity, except linear 0x20000-0x3FFFF ->
+ * physical 0x220000 (extended memory) and, for mode 20, linear 0x1000 ->
+ * physical 0x201000 (the program's code page in extended memory). */
+static void pg_setup(B86Cpu *c, uint8_t *m, int code_ext)
+{
+    uint32_t *pd = (uint32_t *)(void *)(m + 0x300000), *pt = (uint32_t *)(void *)(m + 0x301000), i;
+    memset(pd, 0, 4096);
+    pd[0] = 0x301000u | 7u;
+    for (i = 0; i < 1024u; ++i) {
+        uint32_t ph = i << 12;
+        if (i >= 0x20u && i < 0x40u) ph = (0x220u + (i - 0x20u)) << 12;
+        if (code_ext && i == 1u) ph = 0x201000u;
+        pt[i] = ph | 7u;
+    }
+    c->cr3 = 0x300000u; c->pg = 1u;
+    memset(c->tlb_tag, 0, sizeof c->tlb_tag);
+}
+static int pj13_bad(const uint8_t *p, unsigned n)
+{
+    unsigned k = 0u, op;
+    while (k < n && (p[k] == 0x66u || p[k] == 0x67u || p[k] == 0x26u || p[k] == 0x2Eu || p[k] == 0x36u ||
+                     p[k] == 0x3Eu || p[k] == 0x64u || p[k] == 0x65u || p[k] == 0xF0u || p[k] == 0xF2u || p[k] == 0xF3u)) {
+        if (p[k] == 0xF2u || p[k] == 0xF3u) return 1;
+        ++k;
+    }
+    if (k >= n) return 1;
+    op = p[k];
+    if (op == 0x0Fu) return k + 1u >= n || (p[k + 1u] >= 0x80u && p[k + 1u] <= 0x8Fu);
+    if ((op >= 0x70u && op <= 0x7Fu) || (op >= 0xE0u && op <= 0xE3u) || op == 0xE9u || op == 0xEBu || op == 0xEAu ||
+        op == 0x9Au || op == 0xC2u || op == 0xC3u || op == 0xCAu || op == 0xCBu || op == 0xCCu || op == 0xCDu ||
+        op == 0xCEu || op == 0xCFu || op == 0x9Du || op == 0xF4u || op == 0x6Cu || op == 0x6Du || op == 0x6Eu || op == 0x6Fu ||
+        (op >= 0xA4u && op <= 0xA7u) || (op >= 0xAAu && op <= 0xAFu))
+        return 1;
+    if (op == 0xFFu && k + 1u < n) { const unsigned r = (p[k + 1u] >> 3) & 7u; if (r >= 2u && r <= 5u) return 1; }
+    return 0;
+}
+static unsigned long m13_programs, m13_dispatch, m13_retired, m13_bad, m13_unlinks, m13_smc, m13_evict, m21_act[7], run_to;
+/* V94 mode 18: flat 32-bit native forms (register ALU/MOV, EAX and 83
+ * immediates, MOV r32,imm32) for self-modifying flat programs. */
+static void gen18(void)
+{
+    static const unsigned alu[6] = { 0x01, 0x09, 0x21, 0x29, 0x31, 0x39 };
+    switch (rnd() % 5) {
+    case 0: b(alu[rnd() % 6] | (rnd() % 2 ? 2u : 0u)); b(0xC0 | (rnd() % 64)); if ((P[L - 1] & 0x07) == 4 || (P[L - 1] & 0x38) == 0x20) P[L - 1] = 0xC0 | (P[L - 1] & 0x3B); break;
+    case 1: b((unsigned[]){0x05,0x0D,0x25,0x2D,0x35,0x3D}[rnd() % 6]); d32(rnd()); break;
+    case 2: { unsigned r = rnd() % 8; if (r == 4) r = 3; b(0x83); b(0xC0 | ((unsigned[]){0,1,4,5,6,7}[rnd() % 6] << 3) | r); b(rnd()); break; }
+    case 3: { unsigned d = rnd() % 8, sr = rnd() % 8; if (d == 4) d = 3; b(0x89); b(0xC0 | (sr << 3) | d); break; }
+    default: { unsigned r = rnd() % 8; if (r == 4) r = 3; b(0xB8 + r); d32(rnd()); break; }
+    }
+}
+/* V93 mode 14: only forms the 16-bit tier runs natively (register ALU/MOV,
+ * accumulator and 83 immediates, MOV r16,imm16), so chaining is visible. */
+static void gen14(void)
+{
+    static const unsigned alu[6] = { 0x01, 0x09, 0x21, 0x29, 0x31, 0x39 };
+    switch (rnd() % 5) {
+    case 0: b(alu[rnd() % 6] | (rnd() % 2 ? 2u : 0u)); b(0xC0 | (rnd() % 64)); break;                    /* ALU r16,r16 */
+    case 1: b((unsigned[]){0x05,0x0D,0x25,0x2D,0x35,0x3D}[rnd() % 6]); b(rnd()); b(rnd()); break;          /* ALU AX,imm16 */
+    case 2: b(0x83); b(0xC0 | ((unsigned[]){0,1,4,5,6,7}[rnd() % 6] << 3) | (rnd() % 8)); b(rnd()); break;  /* ALU r16,imm8 */
+    case 3: b(rnd() % 2 ? 0x89 : 0x8B); b(0xC0 | (rnd() % 64)); if ((P[L - 1] & 0x38) == 0x20) P[L - 1] ^= 0x08; break; /* MOV r16,r16 (not to SP) */
+    default: { unsigned r = rnd() % 8; if (r == 4) r = 3; b(0xB8 + r); b(rnd()); b(rnd()); break; }          /* MOV r16,imm16 (not SP) */
+    }
+}
 static unsigned cur_it; static uint8_t *cur_code; static unsigned cur_len; static B86Cpu cur_init;
 static uint32_t initial_seed;
 static void dump_case(const char *why)
@@ -340,7 +414,8 @@ int main(int argc, char **argv)
     static B86Cpu C, D;
     unsigned iters = argc > 1 ? (unsigned)atoi(argv[1]) : 1000, bad = 0, nat = 0, tot = 0, skipped = 0, partial = 0;
     if (argc > 2) rs = (uint32_t)atoi(argv[2]);
-    if (argc > 3) gen_mode = atoi(argv[3]);   /* 0 original, 1 V57+ forms, 2 mixed */
+    if (argc > 3) gen_mode = atoi(argv[3]);
+    const size_t code_bytes = argc > 4 ? (size_t)strtoul(argv[4], NULL, 0) : (size_t)(1u << 20);   /* V94 */   /* 0 original, 1 V57+ forms, 2 mixed */
     initial_seed = rs;
     uint8_t *M = calloc(1, B86_RAM_BYTES + 64), *M2 = calloc(1, B86_RAM_BYTES + 64), *M0 = calloc(1, B86_RAM_BYTES + 64);
     void *code = mmap(NULL, 1 << 20, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -349,14 +424,158 @@ int main(int argc, char **argv)
     for (unsigned it = 0; it < iters; ++it) {
         memset(&C, 0, sizeof C);
         b86_init(&C, M); C.model = B86_CPU_386; C.msw = 1;
-        if (gen_mode >= 10) { pm16(&C, M); g_csbase = 0x10000; } else { flat(&C); g_csbase = 0; }
-        b86_pj_attach(&C, st, b86_pj_state_bytes(), code, 1 << 20);
+        if (gen_mode >= 10 && gen_mode < 17) { pm16(&C, M); g_csbase = 0x10000; } else { flat(&C); g_csbase = 0; }
+        if (!b86_pj_attach(&C, st, b86_pj_state_bytes(), code, code_bytes)) {   /* V99 */
+            printf("b86_pj_attach refused a %lu-byte code buffer (smaller than its tail + 16 KiB)\n", (unsigned long)code_bytes);
+            return 2;
+        }
 #if BB_PJ_PM16_REG_TIER && BB_PJ_PM16_ADAPTIVE
         b86_pj_state(&C)->pm16_adapt_cooldown = 0u;   /* test every case natively */
 #endif
         for (unsigned a = 0x20000; a < 0x32000; ++a) M[a] = (uint8_t)rnd();
         memset(M + g_csbase + 0x1000, 0x90, 512);
         P = M + g_csbase + 0x1000; L = 0;
+        if (gen_mode >= 13 && gen_mode <= 23) {      /* V93: whole programs with loops (V94: 17/18 flat; V95: 19/20 + paging; V99: 21-23 visits) */
+            /* mode 15: DS based just below the code (0x10800), so ordinary stores
+             * modify the running program: SMC kills and unlinks of chained blocks.
+             * mode 16: native forms (mode 14) plus MOV [moffs16],AX stores aimed at
+             * the imm16 of MOV r16,imm16 / ALU AX,imm16 instructions of the loop. */
+            unsigned imm_at[64], n_imm = 0u, st_at[16], n_st = 0u;
+            if (gen_mode == 15 || gen_mode == 16) C.pm386.seg[B86_DS].base = 0x10800u;
+            unsigned bstart[8], blocks = 2u + rnd() % 5u, k, g;
+            for (k = 0; k < blocks; ++k) {
+                unsigned ni = 1u + rnd() % 5u, i;
+                bstart[k] = L;
+                for (i = 0; i < ni; ++i) {
+                    const unsigned l0 = L;
+                    unsigned tries = 0;
+                    if (gen_mode == 16 && n_st < 16u && rnd() % 5u == 0u) {          /* placeholder store */
+                        st_at[n_st++] = L; b(0xA3); b(0); b(0); continue;
+                    }
+                    if ((gen_mode == 18 || gen_mode == 20) && n_st < 16u && rnd() % 5u == 0u) {          /* V94: flat MOV [abs32],EAX placeholder */
+                        st_at[n_st++] = L; b(0xA3); b(0); b(0); b(0); b(0); continue;
+                    }
+                    do { L = l0; if (gen_mode == 14 || gen_mode == 16) gen14(); else if (gen_mode == 18 || gen_mode >= 20) gen18(); else if (gen_mode == 17 || gen_mode == 19) { if (rnd() % 2) gen_new(0); else gen_one(0); } else gen_pm16(0); }
+                    while (++tries < 12u && (pj13_bad(P + l0, L - l0) ||    /* V94: flat chunks may hold several instructions: no REP anywhere */
+                           ((gen_mode == 17 || gen_mode == 19) && (memchr(P + l0, 0xF2, L - l0) || memchr(P + l0, 0xF3, L - l0)))));
+                    if ((gen_mode == 17 || gen_mode == 19) && (memchr(P + l0, 0xF2, L - l0) || memchr(P + l0, 0xF3, L - l0))) L = l0;
+                    if (pj13_bad(P + l0, L - l0)) L = l0;
+                    else if ((gen_mode == 18 || gen_mode >= 20) && n_imm < 64u && L - l0 == 5u &&
+                             ((P[l0] >= 0xB8u && P[l0] <= 0xBFu) || P[l0] == 0x05u || P[l0] == 0x0Du || P[l0] == 0x25u ||
+                              P[l0] == 0x2Du || P[l0] == 0x35u || P[l0] == 0x3Du))
+                        imm_at[n_imm++] = l0 + 1u;
+                    else if (gen_mode == 16 && n_imm < 64u && L - l0 == 3u &&
+                             ((P[l0] >= 0xB8u && P[l0] <= 0xBFu) || P[l0] == 0x05u || P[l0] == 0x0Du || P[l0] == 0x25u ||
+                              P[l0] == 0x2Du || P[l0] == 0x35u || P[l0] == 0x3Du))
+                        imm_at[n_imm++] = l0 + 1u;
+                }
+                if (rnd() % 3 == 0 && k + 1u < blocks) {                 /* forward Jcc over a NOP pad */
+                    const unsigned pad = 1u + rnd() % 4u;
+                    unsigned q;
+                    b(0x70 | (rnd() & 15)); b(pad); for (q = 0; q < pad; ++q) b(0x90);
+                }
+            }
+            {   unsigned q;                                                            /* aim the stores */
+                for (q = 0; q < n_st; ++q) {
+                    if (gen_mode == 18 || gen_mode == 20) {                 /* V94: flat absolute address in the code */
+                        uint32_t a = 0x1000u + (n_imm ? imm_at[rnd() % n_imm] : rnd() % (L ? L : 1u));
+                        if (gen_mode == 20) {                               /* V95: only instructions BEFORE the store */
+                            unsigned e2[64], ne2 = 0u, z;
+                            for (z = 0; z < n_imm; ++z) if (imm_at[z] + 4u <= st_at[q]) e2[ne2++] = imm_at[z];
+                            a = ne2 ? 0x1000u + e2[rnd() % ne2] : 0x20000u + (rnd() & 0xFFCu);
+                        }
+                        P[st_at[q] + 1u] = (uint8_t)a; P[st_at[q] + 2u] = (uint8_t)(a >> 8);
+                        P[st_at[q] + 3u] = (uint8_t)(a >> 16); P[st_at[q] + 4u] = (uint8_t)(a >> 24);
+                        continue;
+                    }
+                    const unsigned off = n_imm ? 0x800u + imm_at[rnd() % n_imm] : 0x800u + (rnd() % (L ? L : 1u));
+                    P[st_at[q] + 1u] = (uint8_t)off; P[st_at[q] + 2u] = (uint8_t)(off >> 8);
+                } }
+            {   const int rel = (int)bstart[rnd() % blocks] - (int)(L + 2u);          /* backward Jcc */
+                if (rel >= -128) { b(0x70 | (rnd() & 15)); b((uint8_t)rel); } }
+            {   const int rel = -(int)(L + 2u);                                       /* JMP to the start */
+                if (rel >= -128) { b(0xEB); b((uint8_t)rel); }
+                else if (gen_mode == 17) { const int r32 = -(int)(L + 5u); b(0xE9); b(r32 & 0xFF); b((r32 >> 8) & 0xFF); b((r32 >> 16) & 0xFF); b((r32 >> 24) & 0xFF); }
+                else { const int r16 = -(int)(L + 3u); b(0xE9); b(r16 & 0xFF); b((r16 >> 8) & 0xFF); } }
+            C.ip = 0x1000; C.r[0] = rnd(); C.r[1] = rnd(); C.r[2] = rnd(); C.r[4] = 0x8000;
+            C.r[3] = 0x20000 + (rnd() & 0xFFF); C.r[5] = 0x22000 + (rnd() & 0xFFF); C.r[6] = 0x24000 + (rnd() & 0xFFF); C.r[7] = 0x26000 + (rnd() & 0xFFF);
+            C.flags = 2 | (rnd() & 0x8D5);
+            if (gen_mode >= 19) {                                   /* V95: paging on (V99: 21-23 too; 23 keeps code low) */
+                pg_setup(&C, M, gen_mode >= 20 && gen_mode <= 22);
+                if (gen_mode >= 20 && gen_mode <= 22) memcpy(M + 0x201000, M + 0x1000, 0x1000);
+                memcpy(M + 0x220000, M + 0x20000, 0x20000);             /* data as the program expects */
+            }
+            memcpy(M2, M, B86_RAM_BYTES); memcpy(M0, M, 0x40000);
+            D = C; D.mem = M2; D.pj = NULL;
+            cur_it = it; cur_code = M0 + g_csbase + 0x1000; cur_len = L; cur_init = C;
+            C.icount = 0; D.icount = 0;
+            run_to = 3000u;
+            if (gen_mode >= 21) {                                   /* V99: two simulated real-mode visits */
+                unsigned visit;
+                for (visit = 0u; visit < 2u; ++visit) {
+                    const unsigned long at = C.icount + 1000u;      /* native runs retire up to 2048 per dispatch */
+                    for (g = 0; C.icount < at && g < 200000u; ++g) { ++m13_dispatch; if (b86_step(&C) != B86_OK) break; }
+                    for (g = 0; D.icount < C.icount && g < 2000000u; ++g) if (b86_step(&D) != B86_OK) break;
+                    {   const unsigned act = !visit ? 0u : gen_mode == 22 ? 5u : gen_mode == 23 ? (rnd() % 2u ? 0u : 6u) : rnd() % 5u;
+                        const uint32_t imm = n_imm ? imm_at[rnd() % n_imm] : 0u;
+                        const uint8_t nb = (uint8_t)(rnd() | 1u);
+                        const uint32_t ms = C.msw; const uint8_t pgv = C.pg;
+                        if (visit) ++m21_act[act];
+                        switch (act) {
+                        case 0: break;                                          /* nothing written */
+                        case 1: if (n_imm) {                                    /* host bridge store into the code */
+                                    M[0x201000u + imm] ^= nb; M2[0x201000u + imm] ^= nb;
+                                    b86_v34_note_host_phys(0x201000u + imm, 1u); }
+                                break;
+                        case 2: if (n_imm) {                                    /* real-mode CPU store into the code */
+                                    M[0x201000u + imm] ^= nb; M2[0x201000u + imm] ^= nb;
+                                    C.msw &= ~1u; C.pg = 0u; smc(&C, 0x201000u + imm, 1u); C.msw = ms; C.pg = pgv; }
+                                break;
+                        case 3: {                                               /* remap the code page to a modified copy */
+                                    uint32_t *pt1 = (uint32_t *)(void *)(M + 0x301000u), *pt2 = (uint32_t *)(void *)(M2 + 0x301000u);
+                                    memcpy(M + 0x203000u, M + 0x201000u, 0x1000u);
+                                    if (n_imm) M[0x203000u + imm] ^= nb;
+                                    memcpy(M2 + 0x203000u, M + 0x203000u, 0x1000u);
+                                    pt1[1] = 0x203000u | 7u; pt2[1] = 0x203000u | 7u;
+                                    b86_pg_flush(&C); b86_pg_flush(&D); }
+                                break;
+                        case 4:                                                 /* real-mode store into low memory */
+                                M[0x9000u] ^= nb; M2[0x9000u] ^= nb;
+                                C.msw &= ~1u; C.pg = 0u; smc(&C, 0x9000u, 1u); C.msw = ms; C.pg = pgv;
+                                break;
+                        case 6: if (n_imm) {                                    /* mode 23: real-mode store into LOW code */
+                                    M[0x1000u + imm] ^= nb; M2[0x1000u + imm] ^= nb;
+                                    C.msw &= ~1u; C.pg = 0u; smc(&C, 0x1000u + imm, 1u); C.msw = ms; C.pg = pgv; }
+                                break;
+                        default: if (n_imm) {                                   /* negative control: unreported code store */
+                                    M[0x201000u + imm] ^= nb; M2[0x201000u + imm] ^= nb; }
+                                break;
+                        }
+                        b86_pj_mark_rm_epoch(&C);
+                    }
+                }
+                run_to = C.icount + 3000u;                          /* keep running well after the event */
+            }
+            for (g = 0; C.icount < run_to && g < 200000u; ++g) { ++m13_dispatch; if (b86_step(&C) != B86_OK) break; }
+            for (g = 0; D.icount < C.icount && g < 2000000u; ++g) if (b86_step(&D) != B86_OK) break;
+            b86_flags_materialize(&C); b86_flags_materialize(&D);
+            { B86Pj *jj93 = b86_pj_state(&C); m13_unlinks += jj93->unlinks; m13_evict += jj93->evictions;
+              m13_smc += jj93->flush_smc + (memcmp(M + (gen_mode == 20 ? 0x201000 : g_csbase + 0x1000), M0 + g_csbase + 0x1000, L) != 0); }
+            ++m13_programs; m13_retired += C.icount; tot += (unsigned)C.icount; nat += (unsigned)C.icount;
+            const int code15 = ((gen_mode == 15 || gen_mode == 16) && memcmp(M + 0x10000, M2 + 0x10000, 0x2000)) ||
+                               (gen_mode == 18 && memcmp(M + 0x1000, M2 + 0x1000, 0x1000)) ||
+                               (gen_mode >= 19 && memcmp(M + 0x220000, M2 + 0x220000, 0x20000)) ||
+                               (gen_mode >= 20 && memcmp(M + 0x201000, M2 + 0x201000, 0x1000)) ||
+                               (gen_mode == 23 && memcmp(M + 0x1000, M2 + 0x1000, 0x1000));
+            if ((C.icount != D.icount || cpu_differs(&C, &D, M, M2) || code15) && ++bad <= 12) {
+                ++m13_bad;
+                printf("MISMATCH13 retired native=%llu interp=%llu ", (unsigned long long)C.icount, (unsigned long long)D.icount); dump_case("");
+                printf("  native eip=%08X fl=%04X", C.ip, C.flags & 0xFFF); for (int i = 0; i < 8; ++i) printf(" %08X", C.r[i]); printf("\n");
+                printf("  interp eip=%08X fl=%04X", D.ip, D.flags & 0xFFF); for (int i = 0; i < 8; ++i) printf(" %08X", D.r[i]); printf("\n");
+                if (memcmp(M + 0x20000, M2 + 0x20000, 0x20000)) printf("  memory differs\n");
+            } else if (C.icount != D.icount || cpu_differs(&C, &D, M, M2) || code15) ++m13_bad;
+            continue;
+        }
         unsigned n = 1 + rnd() % 12;
         for (unsigned i = 0; i < n; ++i) { int last = i == n - 1 && rnd() % 2;
             if (gen_mode == 12) gen_pm16(last);
@@ -410,6 +629,24 @@ int main(int argc, char **argv)
             if (memcmp(M + 0x20000, M2 + 0x20000, 0x20000) || memcmp(M + 0x7000, M2 + 0x7000, 0x1000)) printf("  memory differs\n");
         }
     }
+#if B86_V99_SELECTIVE
+    if (gen_mode >= 21)
+        printf("v99: second-visit events none=%lu host=%lu rm-cpu=%lu remap=%lu low=%lu unreported=%lu low-code=%lu | selective=%lu full=%lu (dirty %lu, map %lu, stale %lu, no snapshot %lu) links kept=%lu cut=%lu entries kept=%lu cut=%lu\n",
+               m21_act[0], m21_act[1], m21_act[2], m21_act[3], m21_act[4], m21_act[5], m21_act[6],
+               pj_v99_n[0], pj_v99_n[1], pj_v99_n[2], pj_v99_n[3], pj_v99_n[4], pj_v99_n[5], pj_v99_n[6], pj_v99_n[7], pj_v99_n[8], pj_v99_n[9]);
+#else
+    if (gen_mode >= 21)
+        printf("v99: off; second-visit events none=%lu host=%lu rm-cpu=%lu remap=%lu low=%lu unreported=%lu low-code=%lu\n",
+               m21_act[0], m21_act[1], m21_act[2], m21_act[3], m21_act[4], m21_act[5], m21_act[6]);
+#endif
+    if (gen_mode >= 13 && gen_mode <= 23)
+        printf("evictions=%lu (code cache %lu bytes)\n", m13_evict, (unsigned long)code_bytes);
+    if (gen_mode >= 13 && gen_mode <= 23)
+        printf("mode%d: programs=%lu dispatches=%lu retired=%lu per-dispatch=%.1f mismatches=%lu unlinks=%lu code-modified-programs=%lu\n",
+               gen_mode, m13_programs, m13_dispatch, m13_retired, m13_dispatch ? (double)m13_retired / m13_dispatch : 0.0, m13_bad, m13_unlinks, m13_smc);
+#if defined(B86_PJ_V93_PM16_LINK) && B86_PJ_V93_PM16_LINK && BB_PJ_PM16_REG_TIER
+    if (gen_mode >= 10) printf("v93 links: tries=%lu ctx-refused=%lu linked=%lu\n", pj_v93_n[0], pj_v93_n[1], pj_v93_n[2]);
+#endif
 #if defined(B86_PJ_V82_PM16) && B86_PJ_V82_PM16 && BB_PJ_PM16_REG_TIER
     if (gen_mode >= 10)
         printf("v82 translations: push=%lu pop=%lu alu=%lu adc-sbb=%lu movimm=%lu incdec=%lu grp3=%lu shift=%lu shift-cl=%lu segmov=%lu stores=%lu\n",

@@ -126,6 +126,9 @@ typedef struct B86PM1State {
     uint8_t ldtr_valid, reserved;
 } B86PM1State;
 
+#ifndef B86_V95_HOSTTLB
+#define B86_V95_HOSTTLB 1
+#endif
 typedef struct B86Cpu {
     /* --- hot block: generated code touches these ------------------------ */
     uint32_t r[8];          /* GPRs; only bits 0..15 are meaningful        */
@@ -227,6 +230,11 @@ typedef struct B86Cpu {
     uint32_t pj_stop;       /* r70: nonzero stops block chaining (code page written) */
 #if defined(B86_X87_EXPERIMENTAL) && B86_X87_EXPERIMENTAL
     B86X87 x87; /* Stage4B: experimental register-only PM x87 state */
+#endif
+#if B86_V95_HOSTTLB
+    /* V95: per TLB slot, host address minus linear page for extended-memory
+     * pages (0 = none); bit 0 = native stores allowed (no translated code). */
+    uintptr_t tlb_host[64];
 #endif
 } B86Cpu;
 

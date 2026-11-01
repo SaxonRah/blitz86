@@ -534,6 +534,19 @@ static B86_PM_HOT int b86_pg_walk(B86Cpu *c, uint32_t lin, uint32_t *phys)
     if ((pte & 0x60u) != 0x60u) b86_pg_wr32(c, ptea, pte | 0x60u);
     c->tlb_tag[slot] = tag;
     c->tlb_phys[slot] = pte & 0xFFFFF000u;
+#if B86_V95_HOSTTLB
+    {   /* V95: host offset for extended-memory pages fully inside guest RAM */
+        const uint32_t pp = pte & 0xFFFFF000u;
+        uintptr_t hv = 0u;
+#if B86_RAM_BYTES > B86_MEM_BYTES
+        if (pp >= B86_MEM_BYTES && pp <= B86_RAM_BYTES - 4096u && !((uintptr_t)c->mem & 3u)) {
+            hv = (uintptr_t)(c->mem + pp) - (uintptr_t)(lin & 0xFFFFF000u);
+            if (!b86_v95_codepage(c, lin)) hv |= 1u;
+        }
+#endif
+        c->tlb_host[slot] = hv;
+    }
+#endif
     *phys = (pte & 0xFFFFF000u) | (lin & 0xFFFu);
     return 1;
 }
