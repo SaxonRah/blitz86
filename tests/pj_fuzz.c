@@ -1,4 +1,5 @@
 /* PJ differential fuzzer: random flat-32 sequences, native block vs interpreter. */
+#define PJ_V103_TEST 1   /* V103: lets mode 26 switch the bulk string path */
 #include "../src/interp.c"
 #include <stdio.h>
 #include <stdlib.h>
@@ -358,6 +359,7 @@ static int pj13_bad(const uint8_t *p, unsigned n)
     if (op == 0xFFu && k + 1u < n) { const unsigned r = (p[k + 1u] >> 3) & 7u; if (r >= 2u && r <= 5u) return 1; }
     return 0;
 }
+static unsigned long m100_promotions, m100_hot_resets;   /* V100: summed over programs */
 static unsigned long m13_programs, m13_dispatch, m13_retired, m13_bad, m13_unlinks, m13_smc, m13_evict, m21_act[7], run_to;
 /* V94 mode 18: flat 32-bit native forms (register ALU/MOV, EAX and 83
  * immediates, MOV r32,imm32) for self-modifying flat programs. */
@@ -370,6 +372,53 @@ static void gen18(void)
     case 2: { unsigned r = rnd() % 8; if (r == 4) r = 3; b(0x83); b(0xC0 | ((unsigned[]){0,1,4,5,6,7}[rnd() % 6] << 3) | r); b(rnd()); break; }
     case 3: { unsigned d = rnd() % 8, sr = rnd() % 8; if (d == 4) d = 3; b(0x89); b(0xC0 | (sr << 3) | d); break; }
     default: { unsigned r = rnd() % 8; if (r == 4) r = 3; b(0xB8 + r); d32(rnd()); break; }
+    }
+}
+/* V103 mode 25: flag producers (IMUL/MUL, logic, ADD/SUB/ADC/INC, CLC/STC)
+ * followed by SHLD/SHRD (imm8 / CL, 16/32-bit, register and [EBX] memory). */
+static void gen25(void)
+{
+    unsigned r = rnd() % 8, s2 = rnd() % 8;
+    if (r == 4) r = 3;
+    if (s2 == 4) s2 = 0;
+    switch (rnd() % 12) {
+    case 0: b(0x0F); b(0xAF); b(0xC0 | (r << 3) | s2); break;                     /* IMUL r32,r32 */
+    case 1: b(0x6B); b(0xC0 | (r << 3) | s2); b(rnd()); break;                    /* IMUL r32,r32,imm8 */
+    case 2: b(0xF7); b(0xC0 | ((rnd() % 2 ? 4u : 5u) << 3) | s2); break;           /* MUL/IMUL r32 */
+    case 3: b((unsigned[]){0x21,0x09,0x31,0x85}[rnd() % 4]); b(0xC0 | (s2 << 3) | r); break;   /* logic */
+    case 4: b((unsigned[]){0x01,0x29,0x11,0x19}[rnd() % 4]); b(0xC0 | (s2 << 3) | r); break;   /* ADD/SUB/ADC/SBB */
+    case 5: b(0x40 + r); break;                                                   /* INC r32 */
+    case 6: b((unsigned[]){0xF8,0xF9,0xF5}[rnd() % 3]); break;                    /* CLC/STC/CMC */
+    case 7: b(0xB8 + r); d32(rnd()); break;
+    case 8: case 9: {                                                             /* SHLD/SHRD r32,r32,imm8 */
+        const unsigned o16 = rnd() % 4u == 0u;
+        if (o16) b(0x66);
+        b(0x0F); b(rnd() % 2 ? 0xA4 : 0xAC); b(0xC0 | (s2 << 3) | r);
+        b(rnd() % 4u == 0u ? rnd() : (o16 ? 1u + rnd() % 16u : 1u + rnd() % 31u)); break; }
+    case 10: b(0x0F); b(rnd() % 2 ? 0xA5 : 0xAD); b(0xC0 | (s2 << 3) | r); break; /* SHLD/SHRD CL */
+    default: b(0x0F); b(rnd() % 2 ? 0xA4 : 0xAC); b(0x03 | (s2 << 3)); b(1u + rnd() % 31u); break;   /* [EBX] */
+    }
+}
+/* V104 mode 28: 32-bit ADD/ADC/SUB/SBB/CMP (register and immediate) and other
+ * producers followed by rotates by immediate (C0/C1, 8/16/32-bit, counts 0..31)
+ * and SHLD/SHRD: the native ADD/SUB-family flag materializer. */
+static void gen28(void)
+{
+    unsigned r = rnd() % 8, s2 = rnd() % 8;
+    if (r == 4) r = 3;
+    if (s2 == 4) s2 = 0;
+    switch (rnd() % 14) {
+    case 0: case 1: b((unsigned[]){0x01,0x29,0x11,0x19,0x39}[rnd() % 5]); b(0xC0 | (s2 << 3) | r); break;   /* ADD/SUB/ADC/SBB/CMP */
+    case 2: b(0x81); b(0xC0 | ((unsigned[]){0,5,2,3,7}[rnd() % 5] << 3) | r); d32(rnd()); break;          /* imm32 forms */
+    case 3: b(0x83); b(0xC0 | ((unsigned[]){0,5,2,3,7}[rnd() % 5] << 3) | r); b(rnd()); break;             /* imm8 forms */
+    case 4: b(rnd() % 2 ? 0x40 + r : 0x48 + r); break;                                                    /* INC/DEC overlay */
+    case 5: b(rnd() % 2 ? 0x21 : 0x31); b(0xC0 | (s2 << 3) | r); break;                                   /* AND/XOR */
+    case 6: case 7: b((unsigned[]){0xF8,0xF9,0xF5,0x9F,0x9F,0x9F}[rnd() % 6]); break;                     /* CLC/STC/CMC, LAHF (AF -> AH) */
+    case 8: b(0xB8 + r); d32(rnd() % 4u == 0u ? (rnd() % 3u == 0u ? 0u : 0x80000000u + rnd() % 4u) : rnd()); break;
+    case 9: case 10: b(0xC1); b(0xC0 | ((rnd() % 4u) << 3) | r); b(rnd() % 6u == 0u ? rnd() : rnd() % 32u); break;  /* ROL/ROR/RCL/RCR r32 */
+    case 11: b(0xC0); b(0xC0 | ((rnd() % 4u) << 3) | (rnd() % 8u)); b(rnd() % 32u); break;                  /* r8 */
+    case 12: b(0x66); b(0xC1); b(0xC0 | ((rnd() % 4u) << 3) | r); b(rnd() % 32u); break;                   /* r16 */
+    default: b(0x0F); b(rnd() % 2 ? 0xA4 : 0xAC); b(0xC0 | (s2 << 3) | r); b(1u + rnd() % 31u); break;     /* SHLD/SHRD */
     }
 }
 /* V93 mode 14: only forms the 16-bit tier runs natively (register ALU/MOV,
@@ -409,18 +458,190 @@ static int cpu_differs(const B86Cpu *C, const B86Cpu *D, const uint8_t *M, const
     return memcmp(C->r, D->r, sizeof C->r) || C->ip != D->ip || ((C->flags ^ D->flags) & ~(uint32_t)B86_AF & 0xFFF) ||
            memcmp(M + 0x20000, M2 + 0x20000, 0x20000) || memcmp(M + 0x7000, M2 + 0x7000, 0x1000);
 }
+#if B86_V103_DESC8
+/* V103 mode 27: b86_pm1_descriptor (one-lookup fast path) against the original
+ * byte loop, with paging on: random GDT/LDT bases (mapped, remapped, unmapped,
+ * page-crossing descriptors), cold or warm TLB, random selectors. Return code,
+ * decoded descriptor, page-fault state and the whole TLB must match. */
+static int m27_ref(B86Cpu *cpu, uint16_t selector, B86PM0Desc *out)
+{
+    uint32_t base, limit, index;
+    uint64_t address;
+    uint8_t bytes[8];
+    int rc;
+    if ((selector & 0xFFF8u) == 0u) return B86_PM1_SELECTOR;
+    rc = b86_pm1_table(cpu, selector, &base, &limit);
+    if (rc != B86_PM1_OK) return rc;
+    index = selector & 0xFFF8u;
+    if (index > limit || limit - index < 7u) return B86_PM1_TABLE_LIMIT;
+    address = (uint64_t)base + (uint64_t)index;
+    if (!cpu->pg && address + 8u > B86_RAM_BYTES) return B86_PM1_MEMORY_LIMIT;
+    for (unsigned i = 0; i < 8u; ++i) bytes[i] = *b86_host(cpu, (uint32_t)address + i);
+    rc = b86_pm0_decode(bytes, selector, out);
+    if (rc == B86_PM0_NOT_PRESENT) return B86_PM1_NOT_PRESENT;
+    return rc == B86_PM0_OK ? B86_PM1_OK : B86_PM1_ARGUMENT;
+}
+static uint32_t m27_base(void)
+{
+    switch (rnd() % 5) {
+    case 0: return 0x3FF000u + (rnd() % 0x1000u);            /* runs into the unmapped 4 MiB+ */
+    case 1: return 0x20000u + (rnd() % 0x20000u);             /* remapped pages */
+    case 2: return 0x400000u + (rnd() % 0x10000u);            /* unmapped */
+    default: return rnd() % 0x2F0000u;                        /* identity, below the page tables */
+    }
+}
+static int m27_run(unsigned iters, uint32_t seed)
+{
+    static B86Cpu A, B;
+    uint8_t *M = calloc(1, B86_RAM_BYTES + 64);
+    unsigned it, bad = 0u, ok = 0u, faults = 0u, k;
+    const uint32_t f0 = b86_v103_desc[1];
+    rs = seed;
+    for (k = 0; k < 0x300000u; ++k) M[k] = (uint8_t)rnd();
+    for (it = 0; it < iters; ++it) {
+        B86PM0Desc da, db;
+        uint16_t sel = (uint16_t)rnd();
+        int ra, rb;
+        memset(&A, 0, sizeof A);
+        b86_init(&A, M); A.model = B86_CPU_386; A.msw = 1; flat(&A);
+        pg_setup(&A, M, 0);
+        A.gdt_base = m27_base(); A.gdt_limit = rnd() % 4u ? 0xFFFFu : rnd() % 0x400u;
+        A.pm386.ldtr_valid = rnd() % 4u != 0u; A.pm386.ldtr_base = m27_base(); A.pm386.ldtr_limit = 0xFFFFu;
+        for (k = rnd() % 4u; k; --k) {                           /* warm some TLB entries */
+            uint32_t ph, at = (rnd() % 2u ? A.gdt_base : A.pm386.ldtr_base) + (rnd() % 0x10000u);
+            (void)b86_pg_walk(&A, at, &ph);
+        }
+        if (rnd() % 3u == 0u) sel = (uint16_t)((sel & 7u) | ((0xFF8u - (A.gdt_base & 0xFFFu) + (rnd() % 16u)) & 0xFFF8u));   /* near a page end */
+        if (rnd() % 3u == 0u) {                                   /* warm exactly the descriptor's page */
+            uint32_t ph;
+            (void)b86_pg_walk(&A, ((sel & 4u) ? A.pm386.ldtr_base : A.gdt_base) + (sel & 0xFFF8u), &ph);
+        }
+        A.pf_pending = 0u;
+        B = A;
+        memset(&da, 0, sizeof da); memset(&db, 0, sizeof db);
+        ra = b86_pm1_descriptor(&A, sel, &da);
+        rb = m27_ref(&B, sel, &db);
+        faults += B.pf_pending != 0u;
+        ok += ra == B86_PM1_OK;
+        if (ra != rb || (ra == B86_PM1_OK && memcmp(&da, &db, sizeof da)) || A.pf_pending != B.pf_pending ||
+            (A.pf_pending && A.pf_lin != B.pf_lin) || memcmp(A.tlb_tag, B.tlb_tag, sizeof A.tlb_tag) ||
+            memcmp(A.tlb_phys, B.tlb_phys, sizeof A.tlb_phys)) {
+            if (bad < 10u) printf("MISMATCH mode27 it=%u sel=%04X gdt=%08X rc %d/%d pf %u/%u\n", it, sel, A.gdt_base, ra, rb, A.pf_pending, B.pf_pending);
+            ++bad;
+        }
+    }
+    printf("mode27: %u descriptor reads (paging on), %u mismatches, %u valid, %u with a page fault, %u by one lookup\n",
+           iters, bad, ok, faults, b86_v103_desc[1] - f0);
+    return bad ? 1 : 0;
+}
+#endif
+#if B86_V103_STRBULK
+/* V103 mode 26: REP MOVS/STOS through b86_pj_str with the bulk path on and off,
+ * and a plain reference; random sizes, alignments, overlaps, DF, and an injected
+ * 'kill' (smc_kills++ when a chosen byte is about to be written, once). After a
+ * refusal (return 0) the rest is completed by the reference, as the interpreter
+ * would. Final memory and registers must be identical in all three runs. */
+static uint32_t m26_poison, m26_armed;
+static void m26_hook(B86Cpu *c, uint32_t a, uint32_t n)
+{
+    if (m26_armed && m26_poison - a < n) { m26_armed = 0u; ++b86_pj_state(c)->smc_kills; }
+}
+static void m26_ref(B86Cpu *c, unsigned op, unsigned w)
+{
+    const unsigned kind = op <= 0xA5u ? 0u : 1u;
+    const uint32_t step = (c->flags & B86_DF) ? (uint32_t)0u - w : w;
+    while (c->r[B86_CX]) {
+        uint32_t v = c->r[0], k;
+        if (kind == 0u) { v = 0u; for (k = 0; k < w; ++k) v |= (uint32_t)c->mem[c->r[B86_SI] + k] << (8u * k); }
+        for (k = 0; k < w; ++k) c->mem[c->r[B86_DI] + k] = (uint8_t)(v >> (8u * k));
+        if (kind == 0u) c->r[B86_SI] += step;
+        c->r[B86_DI] += step; --c->r[B86_CX];
+    }
+}
+static int m26_run(unsigned iters, uint32_t seed, void *st, void *code)
+{
+    static B86Cpu A, B, R;
+    uint8_t *MA = calloc(1, B86_RAM_BYTES + 64), *MB = calloc(1, B86_RAM_BYTES + 64), *MR = calloc(1, B86_RAM_BYTES + 64);
+    uint8_t *cm = calloc(1, (B86_MEM_BYTES >> B86_LINE_SHIFT) + 2u);
+    unsigned it, bad = 0u, refused = 0u, injected = 0u;
+#if B86_V103_STATS
+#define M26_BULK() (pj_v103s ? pj_v103s->n[9] : 0u)
+#else
+#define M26_BULK() 0u                        /* statistics off: bulk runs not counted */
+#endif
+    const uint32_t bulk0 = M26_BULK();
+    rs = seed;
+    for (it = 0; it < iters; ++it) {
+        const unsigned op = (unsigned[]){0xA4,0xA5,0xAA,0xAB}[rnd() % 4], w = (op & 1u) ? (rnd() % 2 ? 4u : 2u) : 1u;
+        const uint32_t desc = op | (1u << 8) | (w << 9);
+        uint32_t si = 0x20000u + (rnd() % 0x80000u), di, k, cx, eax = rnd(), fl, poison;
+        unsigned run, inject;
+        B86Cpu *cs[3] = { &A, &B, &R };
+        uint8_t *ms[3] = { MA, MB, MR };
+        switch (rnd() % 4) {                      /* overlaps in both directions, or apart */
+        case 0: di = si + (rnd() % 64u) - 32u; break;
+        case 1: di = si + (rnd() % 4096u); break;
+        default: di = 0x20000u + (rnd() % 0x80000u); break;
+        }
+        if (rnd() % 3u) { si &= ~(w - 1u); di &= ~(w - 1u); }
+        cx = rnd() % 2u ? rnd() % 3000u : rnd() % 40u;
+        fl = 2u | (rnd() % 8u == 0u ? (uint32_t)B86_DF : 0u);
+        inject = rnd() % 3u == 0u;
+        poison = cx ? ((fl & B86_DF) ? di - rnd() % (cx * w) : di + rnd() % (cx * w)) : di;
+        injected += inject;
+        for (k = 0x1F000u; k < 0xB0000u; ++k) MA[k] = (uint8_t)rnd();
+        memcpy(MB, MA, B86_RAM_BYTES); memcpy(MR, MA, B86_RAM_BYTES);
+        memset(cm, 0, (B86_MEM_BYTES >> B86_LINE_SHIFT) + 2u);
+        cm[poison >> B86_LINE_SHIFT] = 1u;
+        for (run = 0; run < 3; ++run) {
+            B86Cpu *c = cs[run];
+            memset(c, 0, sizeof *c);
+            b86_init(c, ms[run]); c->model = B86_CPU_386; c->msw = 1; flat(c);
+            c->r[0] = eax; c->r[B86_SI] = si; c->r[B86_DI] = di; c->r[B86_CX] = cx; c->flags = fl;
+            if (run < 2) {                         /* 0: bulk on, 1: bulk off (original loop) */
+                if (!b86_pj_attach(c, st, b86_pj_state_bytes(), code, 1u << 20)) return 2;
+                c->codemap = cm; c->smc_hook = m26_hook;
+                m26_poison = poison; m26_armed = inject;
+                pj_v103_bulk_on = run == 0;
+                if (!b86_pj_str(c, desc)) { ++refused; m26_ref(c, op, w); }   /* the interpreter's replay */
+                m26_armed = 0u;
+            } else m26_ref(c, op, w);              /* 2: plain reference */
+        }
+        pj_v103_bulk_on = 1u;
+        for (run = 1; run < 3; ++run) {
+            if (memcmp(MA + 0x1F000u, ms[run] + 0x1F000u, 0x91000u) ||
+                A.r[0] != cs[run]->r[0] || A.r[B86_SI] != cs[run]->r[B86_SI] || A.r[B86_DI] != cs[run]->r[B86_DI] || A.r[B86_CX] != cs[run]->r[B86_CX]) {
+                if (bad < 10u) printf("MISMATCH mode26 it=%u vs-run=%u op=%02X w=%u si=%05X di=%05X cx=%u df=%u inject=%u\n",
+                                      it, run, op, w, si, di, cx, (fl & B86_DF) != 0u, inject);
+                ++bad;
+            }
+        }
+    }
+    printf("mode26: %u cases, %u mismatches, %u injected kills, %u refusals replayed, %u bulk runs\n",
+           iters, bad, injected, refused, M26_BULK() - bulk0);
+    return bad ? 1 : 0;
+}
+#endif
 int main(int argc, char **argv)
 {
     static B86Cpu C, D;
     unsigned iters = argc > 1 ? (unsigned)atoi(argv[1]) : 1000, bad = 0, nat = 0, tot = 0, skipped = 0, partial = 0;
     if (argc > 2) rs = (uint32_t)atoi(argv[2]);
     if (argc > 3) gen_mode = atoi(argv[3]);
-    const size_t code_bytes = argc > 4 ? (size_t)strtoul(argv[4], NULL, 0) : (size_t)(1u << 20);   /* V94 */   /* 0 original, 1 V57+ forms, 2 mixed */
+    const size_t code_bytes = argc > 4 ? (size_t)strtoul(argv[4], NULL, 0) : (size_t)(1u << 20);   /* V94 */
+    const size_t hot_bytes = argc > 5 ? (size_t)strtoul(argv[5], NULL, 0) : 0u;                      /* V100 */
+    uint8_t *hot_buf = NULL;   /* 0 original, 1 V57+ forms, 2 mixed */
     initial_seed = rs;
     uint8_t *M = calloc(1, B86_RAM_BYTES + 64), *M2 = calloc(1, B86_RAM_BYTES + 64), *M0 = calloc(1, B86_RAM_BYTES + 64);
     void *code = mmap(NULL, 1 << 20, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     void *st = calloc(1, b86_pj_state_bytes());
     signal(SIGSEGV, on_crash); signal(SIGILL, on_crash); signal(SIGBUS, on_crash);
+#if B86_V103_STRBULK
+    if (gen_mode == 26) return m26_run(iters, rs, st, code);
+#endif
+#if B86_V103_DESC8
+    if (gen_mode == 27) return m27_run(iters, rs);
+#endif
     for (unsigned it = 0; it < iters; ++it) {
         memset(&C, 0, sizeof C);
         b86_init(&C, M); C.model = B86_CPU_386; C.msw = 1;
@@ -429,13 +650,29 @@ int main(int argc, char **argv)
             printf("b86_pj_attach refused a %lu-byte code buffer (smaller than its tail + 16 KiB)\n", (unsigned long)code_bytes);
             return 2;
         }
+        if (hot_bytes && !hot_buf) {   /* V100: like the Pico (SRAM vs PSRAM ~244 MiB apart): far beyond B.W/BL reach */
+            uintptr_t at;
+            for (at = (uintptr_t)code + 0x10000000u; !hot_buf && at; at += 0x01000000u) {
+                void *h = mmap((void *)at, hot_bytes, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                if (h == MAP_FAILED) continue;
+                if ((uintptr_t)h - (uintptr_t)code < 0x08000000u && (uintptr_t)code - (uintptr_t)h < 0x08000000u) { munmap(h, hot_bytes); continue; }
+                hot_buf = h;
+            }
+            if (!hot_buf) { printf("could not map the hot tier far from the code cache\n"); return 2; }
+            printf("hot tier at %p, code cache at %p (distance %ld MiB)\n", (void *)hot_buf, (void *)code,
+                   (long)(((intptr_t)hot_buf - (intptr_t)code) / (1 << 20)));
+        }
+        if (hot_bytes && !b86_pj_attach_hot(&C, hot_buf, hot_bytes)) {             /* V100 */
+            printf("b86_pj_attach_hot refused %lu bytes\n", (unsigned long)hot_bytes);
+            return 2;
+        }
 #if BB_PJ_PM16_REG_TIER && BB_PJ_PM16_ADAPTIVE
         b86_pj_state(&C)->pm16_adapt_cooldown = 0u;   /* test every case natively */
 #endif
         for (unsigned a = 0x20000; a < 0x32000; ++a) M[a] = (uint8_t)rnd();
         memset(M + g_csbase + 0x1000, 0x90, 512);
         P = M + g_csbase + 0x1000; L = 0;
-        if (gen_mode >= 13 && gen_mode <= 23) {      /* V93: whole programs with loops (V94: 17/18 flat; V95: 19/20 + paging; V99: 21-23 visits) */
+        if (gen_mode >= 13 && gen_mode <= 28) {      /* V93: whole programs with loops (V94: 17/18 flat; V95: 19/20 + paging; V99: 21-23 visits; V100: 24) */
             /* mode 15: DS based just below the code (0x10800), so ordinary stores
              * modify the running program: SMC kills and unlinks of chained blocks.
              * mode 16: native forms (mode 14) plus MOV [moffs16],AX stores aimed at
@@ -455,7 +692,7 @@ int main(int argc, char **argv)
                     if ((gen_mode == 18 || gen_mode == 20) && n_st < 16u && rnd() % 5u == 0u) {          /* V94: flat MOV [abs32],EAX placeholder */
                         st_at[n_st++] = L; b(0xA3); b(0); b(0); b(0); b(0); continue;
                     }
-                    do { L = l0; if (gen_mode == 14 || gen_mode == 16) gen14(); else if (gen_mode == 18 || gen_mode >= 20) gen18(); else if (gen_mode == 17 || gen_mode == 19) { if (rnd() % 2) gen_new(0); else gen_one(0); } else gen_pm16(0); }
+                    do { L = l0; if (gen_mode == 28) gen28(); else if (gen_mode == 25) gen25(); else if (gen_mode == 14 || gen_mode == 16) gen14(); else if (gen_mode == 18 || gen_mode >= 20) gen18(); else if (gen_mode == 17 || gen_mode == 19) { if (rnd() % 2) gen_new(0); else gen_one(0); } else gen_pm16(0); }
                     while (++tries < 12u && (pj13_bad(P + l0, L - l0) ||    /* V94: flat chunks may hold several instructions: no REP anywhere */
                            ((gen_mode == 17 || gen_mode == 19) && (memchr(P + l0, 0xF2, L - l0) || memchr(P + l0, 0xF3, L - l0)))));
                     if ((gen_mode == 17 || gen_mode == 19) && (memchr(P + l0, 0xF2, L - l0) || memchr(P + l0, 0xF3, L - l0))) L = l0;
@@ -495,14 +732,14 @@ int main(int argc, char **argv)
                 if (rel >= -128) { b(0x70 | (rnd() & 15)); b((uint8_t)rel); } }
             {   const int rel = -(int)(L + 2u);                                       /* JMP to the start */
                 if (rel >= -128) { b(0xEB); b((uint8_t)rel); }
-                else if (gen_mode == 17) { const int r32 = -(int)(L + 5u); b(0xE9); b(r32 & 0xFF); b((r32 >> 8) & 0xFF); b((r32 >> 16) & 0xFF); b((r32 >> 24) & 0xFF); }
+                else if (gen_mode == 17 || gen_mode == 25 || gen_mode == 28) { const int r32 = -(int)(L + 5u); b(0xE9); b(r32 & 0xFF); b((r32 >> 8) & 0xFF); b((r32 >> 16) & 0xFF); b((r32 >> 24) & 0xFF); }
                 else { const int r16 = -(int)(L + 3u); b(0xE9); b(r16 & 0xFF); b((r16 >> 8) & 0xFF); } }
             C.ip = 0x1000; C.r[0] = rnd(); C.r[1] = rnd(); C.r[2] = rnd(); C.r[4] = 0x8000;
             C.r[3] = 0x20000 + (rnd() & 0xFFF); C.r[5] = 0x22000 + (rnd() & 0xFFF); C.r[6] = 0x24000 + (rnd() & 0xFFF); C.r[7] = 0x26000 + (rnd() & 0xFFF);
             C.flags = 2 | (rnd() & 0x8D5);
-            if (gen_mode >= 19) {                                   /* V95: paging on (V99: 21-23 too; 23 keeps code low) */
-                pg_setup(&C, M, gen_mode >= 20 && gen_mode <= 22);
-                if (gen_mode >= 20 && gen_mode <= 22) memcpy(M + 0x201000, M + 0x1000, 0x1000);
+            if (gen_mode >= 19 && gen_mode != 25 && gen_mode != 28) { /* V95: paging on (V99: 21-23 too; 23 keeps code low) */
+                pg_setup(&C, M, (gen_mode >= 20 && gen_mode <= 22) || gen_mode == 24);
+                if ((gen_mode >= 20 && gen_mode <= 22) || gen_mode == 24) memcpy(M + 0x201000, M + 0x1000, 0x1000);
                 memcpy(M + 0x220000, M + 0x20000, 0x20000);             /* data as the program expects */
             }
             memcpy(M2, M, B86_RAM_BYTES); memcpy(M0, M, 0x40000);
@@ -510,13 +747,13 @@ int main(int argc, char **argv)
             cur_it = it; cur_code = M0 + g_csbase + 0x1000; cur_len = L; cur_init = C;
             C.icount = 0; D.icount = 0;
             run_to = 3000u;
-            if (gen_mode >= 21) {                                   /* V99: two simulated real-mode visits */
+            if (gen_mode >= 21 && gen_mode != 25 && gen_mode != 28) { /* V99: two simulated real-mode visits (V100: 24 = 21 + forced hot resets) */
                 unsigned visit;
                 for (visit = 0u; visit < 2u; ++visit) {
                     const unsigned long at = C.icount + 1000u;      /* native runs retire up to 2048 per dispatch */
                     for (g = 0; C.icount < at && g < 200000u; ++g) { ++m13_dispatch; if (b86_step(&C) != B86_OK) break; }
                     for (g = 0; D.icount < C.icount && g < 2000000u; ++g) if (b86_step(&D) != B86_OK) break;
-                    {   const unsigned act = !visit ? 0u : gen_mode == 22 ? 5u : gen_mode == 23 ? (rnd() % 2u ? 0u : 6u) : rnd() % 5u;
+                    {   const unsigned act = !visit ? 0u : gen_mode == 22 ? 5u : gen_mode == 23 ? (rnd() % 2u ? 0u : 6u) : gen_mode == 24 ? 0u : rnd() % 5u;
                         const uint32_t imm = n_imm ? imm_at[rnd() % n_imm] : 0u;
                         const uint8_t nb = (uint8_t)(rnd() | 1u);
                         const uint32_t ms = C.msw; const uint8_t pgv = C.pg;
@@ -551,6 +788,12 @@ int main(int argc, char **argv)
                                     M[0x201000u + imm] ^= nb; M2[0x201000u + imm] ^= nb; }
                                 break;
                         }
+                        if (gen_mode == 24 && hot_bytes) {                      /* V100: forced hot reset, freed space reused */
+                            B86Pj *jh = b86_pj_state(&C);
+                            pj_hot_reset(&C, jh);
+                            memset(jh->code + jh->hot_start, 0xDE, jh->hot_base + jh->hot_cap - jh->hot_start);   /* UDF traps */
+                            __builtin___clear_cache((char *)(jh->code + jh->hot_start), (char *)(jh->code + jh->hot_base + jh->hot_cap));
+                        }
                         b86_pj_mark_rm_epoch(&C);
                     }
                 }
@@ -560,6 +803,7 @@ int main(int argc, char **argv)
             for (g = 0; D.icount < C.icount && g < 2000000u; ++g) if (b86_step(&D) != B86_OK) break;
             b86_flags_materialize(&C); b86_flags_materialize(&D);
             { B86Pj *jj93 = b86_pj_state(&C); m13_unlinks += jj93->unlinks; m13_evict += jj93->evictions;
+              m100_promotions += jj93->promotions; m100_hot_resets += jj93->hot_resets;
               m13_smc += jj93->flush_smc + (memcmp(M + (gen_mode == 20 ? 0x201000 : g_csbase + 0x1000), M0 + g_csbase + 0x1000, L) != 0); }
             ++m13_programs; m13_retired += C.icount; tot += (unsigned)C.icount; nat += (unsigned)C.icount;
             const int code15 = ((gen_mode == 15 || gen_mode == 16) && memcmp(M + 0x10000, M2 + 0x10000, 0x2000)) ||
@@ -639,9 +883,40 @@ int main(int argc, char **argv)
         printf("v99: off; second-visit events none=%lu host=%lu rm-cpu=%lu remap=%lu low=%lu unreported=%lu low-code=%lu\n",
                m21_act[0], m21_act[1], m21_act[2], m21_act[3], m21_act[4], m21_act[5], m21_act[6]);
 #endif
-    if (gen_mode >= 13 && gen_mode <= 23)
+#if B86_V103_STATS
+    if (gen_mode >= 13 && pj_v103s) {
+        unsigned q;
+        printf("v103: mat-sites");
+        for (q = 1u; q < 13u; ++q) printf("%c%u", q == 1u ? '=' : ',', pj_v103s->site[q]);
+        printf(" kinds");
+        for (q = 0u; q < (unsigned)LZ_COUNT; ++q) if (pj_v103s->kind[q]) printf(" %u:%u", q, pj_v103s->kind[q]);
+        printf(" | mem slow=%u from-psram=%u code-writes=%u | desc %u, one-lookup %u\n", pj_v103s->n[1], pj_v103s->n[7], pj_v103s->n[6],
+               b86_v103_desc[0] + b86_v103_desc[1], b86_v103_desc[1]);
+    }
+#endif
+#if B86_V104_LINKSKIP
+    if (gen_mode >= 13)
+        printf("v104: link passes=%lu skipped=%lu skipcheck missed=%lu\n", pj_v104_n[0], pj_v104_n[1], pj_v104_n[2]);
+#endif
+#if B86_V102_KILLFAST || B86_V102_POOL_RESTART
+    if (gen_mode >= 13)
+        printf("v102: targeted kills=%lu killcheck missed=%lu pool restarts=%lu restart unlinks=%lu\n",
+               pj_v102_n[0], pj_v102_n[1], pj_v102_n[2], pj_v102_n[3]);
+#endif
+#if B86_V101_FAST
+    if (gen_mode >= 13)
+        printf("v101: veneers reused=%lu class bits=%lu masked PTE compares=%lu crosscheck: live disagreements=%lu dead targets kept=%lu\n",
+               pj_v101_n[0], pj_v101_n[3], pj_v101_n[4], pj_v101_n[1], pj_v101_n[2]);
+#endif
+#if B86_V100_XTIER || B86_V100_SMC_EXIT
+    if (gen_mode >= 13)
+        printf("v100: hot tier %lu bytes | links made=%lu cross-tier=%lu pool-full=%lu pool-restarts=%lu | smc-exits=%lu | hot promotions=%lu resets=%lu\n",
+               (unsigned long)hot_bytes, pj_v100_n[3], pj_v100_n[0], pj_v100_n[1], pj_v100_n[4], pj_v100_n[5],
+               m100_promotions, m100_hot_resets);
+#endif
+    if (gen_mode >= 13 && gen_mode <= 24)
         printf("evictions=%lu (code cache %lu bytes)\n", m13_evict, (unsigned long)code_bytes);
-    if (gen_mode >= 13 && gen_mode <= 23)
+    if (gen_mode >= 13 && gen_mode <= 24)
         printf("mode%d: programs=%lu dispatches=%lu retired=%lu per-dispatch=%.1f mismatches=%lu unlinks=%lu code-modified-programs=%lu\n",
                gen_mode, m13_programs, m13_dispatch, m13_retired, m13_dispatch ? (double)m13_retired / m13_dispatch : 0.0, m13_bad, m13_unlinks, m13_smc);
 #if defined(B86_PJ_V93_PM16_LINK) && B86_PJ_V93_PM16_LINK && BB_PJ_PM16_REG_TIER

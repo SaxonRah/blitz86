@@ -7,6 +7,12 @@
 #ifndef B86_PM1_FLASH
 #define B86_PM1_FLASH __attribute__((noinline,cold,section(".text.bb386_flash")))
 #endif
+#ifndef B86_V103_DESC8
+#define B86_V103_DESC8 1
+#endif
+#if B86_V103_DESC8
+static uint32_t b86_v103_desc[2];   /* V103: [0] byte-loop reads [1] one-lookup reads */
+#endif
 #ifndef B86_PJ_V86_SRAM   /* V86: hot runtime functions in SRAM instead of flash */
 #define B86_PJ_V86_SRAM 1
 #endif
@@ -45,8 +51,30 @@ B86_PM1_FLASH int b86_pm1_descriptor(const B86Cpu *cpu,
     if (index > limit || limit - index < 7u) return B86_PM1_TABLE_LIMIT;
     address = (uint64_t)base + (uint64_t)index;
     if (!cpu->pg && address + 8u > B86_RAM_BYTES) return B86_PM1_MEMORY_LIMIT;   /* r65 */
+#if B86_V103_DESC8
+    {   /* V103: one page, TLB hit (or paging off): the same 8 bytes the loop reads */
+        const uint32_t a32 = (uint32_t)address;
+        const uint8_t *src = NULL;
+        if (address <= 0xFFFFFFF8u && (a32 & 0xFFFu) <= 0xFF8u) {
+            if (!cpu->pg) src = b86_host_phys(cpu, a32);
+            else {
+                const unsigned slot = (a32 >> 12) & 63u;
+                if (cpu->tlb_tag[slot] == ((a32 & 0xFFFFF000u) | 1u)) {
+                    const uint32_t ph = cpu->tlb_phys[slot] | (a32 & 0xFFFu);
+                    if (ph <= B86_RAM_BYTES - 8u) src = b86_host_phys(cpu, ph);
+                }
+            }
+        }
+        ++b86_v103_desc[src != NULL];               /* [0] byte loop [1] one lookup */
+        if (src) memcpy(bytes, src, 8u);
+        else
+            for (unsigned i=0; i<8u; ++i)
+                bytes[i] = *b86_host(cpu, (uint32_t)address + i);
+    }
+#else
     for (unsigned i=0; i<8u; ++i)
         bytes[i] = *b86_host(cpu, (uint32_t)address + i);
+#endif
     rc = b86_pm0_decode(bytes, selector, out);
     if (rc == B86_PM0_NOT_PRESENT) return B86_PM1_NOT_PRESENT;
     return rc == B86_PM0_OK ? B86_PM1_OK : B86_PM1_ARGUMENT;

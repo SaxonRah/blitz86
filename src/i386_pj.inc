@@ -928,6 +928,140 @@ static b86_v30f_state v30f_admit;
  * [4] flat lookups [5] 16-bit lookups (C dispatch path) */
 static unsigned long pj_v98_n[6];
 #endif
+#ifndef B86_V100_XTIER
+#define B86_V100_XTIER 1
+#endif
+#ifndef B86_V100_SMC_EXIT
+#define B86_V100_SMC_EXIT 1
+#endif
+#ifndef B86_V101_FAST
+#define B86_V101_FAST 1
+#endif
+#ifndef B86_V102_KILLFAST
+#define B86_V102_KILLFAST 1
+#endif
+#ifndef B86_V103_SHIFTD
+#define B86_V103_SHIFTD 1
+#endif
+#ifndef B86_V103_STRBULK
+#define B86_V103_STRBULK 1
+#endif
+#ifndef B86_V103_STATS
+#define B86_V103_STATS 0                       /* V104: measurement builds set 1 */
+#endif
+#ifndef B86_V104_LINKSKIP
+#define B86_V104_LINKSKIP 1
+#endif
+#ifndef B86_V104_MAT
+#define B86_V104_MAT 1
+#endif
+#if B86_V104_LINKSKIP
+static uint8_t pj_v104_cut_pending = 1u;       /* a logged link may target a non-kept block */
+static unsigned long pj_v104_n[3];             /* [0] link passes run [1] skipped [2] skipcheck misses */
+#endif
+#if B86_V103_STATS
+/* V103: [site] native flag-materialization calls; [kind] pending main record at those calls
+ * n: [0] (unused) [1] mem slow entries [2] walks [3] page-cross refusals [4] (unused)
+ * [5] writes [6] writes that hit a code page [7] slow entries from PSRAM code [8] from hot code
+ * [9] bulk string runs [10] bulk elements [11] per-element string elements [12] overlay pending */
+typedef struct { uint32_t site[16], kind[LZ_COUNT], n[13]; } PjV103;
+static PjV103 *pj_v103s;                       /* metadata pool (PSRAM); SRAM holds only this pointer */
+#define PJ_V103_INC(f) do { if (pj_v103s) ++pj_v103s->f; } while (0)
+#endif
+#if B86_V103_STRBULK
+#ifdef PJ_V103_TEST
+static uint8_t pj_v103_bulk_on = 1u;          /* test builds: mode 26 switches it */
+#else
+#define pj_v103_bulk_on 1u
+#endif
+#endif
+#ifndef B86_V102_POOL_RESTART
+#define B86_V102_POOL_RESTART 1
+#endif
+#if B86_V102_KILLFAST || B86_V102_POOL_RESTART
+/* V102: [0] targeted kill cleanups [1] killcheck: entries the targeted cleanup missed
+ * [2] veneer pool restarts [3] links undone by pool restarts */
+static unsigned long pj_v102_n[4];
+#endif
+#if B86_V101_FAST
+/* V101: [0] veneers reused [1] crosscheck: live disagreements [2] crosscheck: dead targets kept
+ * [3] class bits written [4] masked PTE compares */
+static unsigned long pj_v101_n[5];
+#endif
+#if B86_V100_XTIER || B86_V100_SMC_EXIT
+/* V100: [0] cross-tier links made [1] refused: veneer pool full [2] link calls
+ * [3] links made [4] veneer pool restarts [5] smc exits (store killed code) */
+static unsigned long pj_v100_n[6];
+#endif
+#if B86_V100_XTIER
+#ifndef PJ_V100_PS_VENEERS
+#define PJ_V100_PS_VENEERS 2048u                 /* 16 KiB of the PSRAM code cache */
+#endif
+#ifndef PJ_V100_HOT_VENEERS
+#if B86_V101_FAST
+#define PJ_V100_HOT_VENEERS 512u                 /* V101: 4 KiB of the SRAM hot tier (256 filled up) */
+#else
+#define PJ_V100_HOT_VENEERS 256u                 /* 2 KiB of the SRAM hot tier */
+#endif
+#endif
+static uint32_t pj_v100_ps_pool, pj_v100_ps_n, pj_v100_ps_next;
+#if B86_V102_POOL_RESTART
+static B86_PJ_COLD int pj_v102_pool_restart(B86Pj *j, int hot);   /* defined after pj_v12_link_intact */
+#endif
+static uint32_t pj_v100_hot_pool, pj_v100_hot_n, pj_v100_hot_next;
+/* A veneer in the given tier's pool that jumps to `target`, or NULL (pool full). */
+#if B86_V101_FAST
+static __attribute__((noinline, cold)) uint8_t *pj_v100_veneer(B86Pj *j, int hot, const uint8_t *target)
+#else
+static uint8_t *pj_v100_veneer(B86Pj *j, int hot, const uint8_t *target)
+#endif
+{
+    uint32_t *const next = hot ? &pj_v100_hot_next : &pj_v100_ps_next;
+    const uint32_t n = hot ? pj_v100_hot_n : pj_v100_ps_n;
+    const uint32_t pool = hot ? pj_v100_hot_pool : pj_v100_ps_pool;
+    uint8_t *v;
+    uint32_t w;
+#if B86_V101_FAST
+    {   /* V101: reuse a veneer of this pool that already jumps to `target` */
+        const uint32_t want = (uint32_t)(uintptr_t)target | 1u, used = *next;
+        uint32_t k = used, lim = hot ? used : (used > 128u ? used - 128u : 0u);
+        while (k > lim) {
+            uint32_t lit;
+            --k;
+            memcpy(&lit, j->code + pool + 8u * k + 4u, 4u);
+            if (lit == want) { ++pj_v101_n[0]; return j->code + pool + 8u * k; }
+        }
+    }
+#endif
+#if B86_V102_POOL_RESTART
+    if (*next >= n && !(n && pj_v102_pool_restart(j, hot) && *next < n)) { ++pj_v100_n[1]; return NULL; }
+#else
+    if (*next >= n) { ++pj_v100_n[1]; return NULL; }
+#endif
+    v = j->code + pool + 8u * (*next)++;
+    v[0] = 0xDFu; v[1] = 0xF8u; v[2] = 0x00u; v[3] = 0xF0u;      /* LDR.W pc, [pc, #0] */
+    w = (uint32_t)(uintptr_t)target | 1u;
+    memcpy(v + 4, &w, 4u);
+#if defined(__linux__)
+    __builtin___clear_cache((char *)v, (char *)v + 8);
+#endif
+    return v;
+}
+/* Is `addr` a veneer of one of the pools that jumps exactly to code offset `to`? */
+static int pj_v100_is_veneer(const B86Pj *j, uint32_t addr, uint32_t to)
+{
+    const uint32_t off = addr - (uint32_t)(uintptr_t)j->code;
+    const uint8_t *v;
+    uint32_t w;
+    if (off & 7u) return 0;
+    if (!(off - pj_v100_ps_pool < pj_v100_ps_n * 8u) &&
+        !(j->hot && off - pj_v100_hot_pool < pj_v100_hot_n * 8u)) return 0;
+    v = j->code + off;
+    if (v[0] != 0xDFu || v[1] != 0xF8u || v[2] != 0x00u || v[3] != 0xF0u) return 0;
+    memcpy(&w, v + 4, 4u);
+    return w == (((uint32_t)(uintptr_t)(j->code + to)) | 1u);
+}
+#endif
 #if B86_V99_SELECTIVE
 /* V99 selective epochs: see make_v99.py / the V99 README for the full argument. */
 #ifndef B86_CALLOC
@@ -952,6 +1086,11 @@ typedef struct {
     /* [0] selective [1] full [2] why-dirty [3] why-map [4] why-stale [5] why-nosnap
      * [6] links kept [7] links cut [8] entries kept [9] entries cut [10] snapshots [11] too many tables */
     unsigned long n[12];
+#if B86_V101_FAST
+    uint32_t snap_mask[PJ_V99_MAXPT][32];      /* V101: pages of each region that hold code */
+    uint32_t *cls_ps, *cls_hot;                /* V101: 1 bit per 32-byte granule: block may be kept */
+    uint32_t cls_ps_bits, cls_hot_bits;
+#endif
 } PjV99;
 static PjV99 *pj_v99;                          /* NULL: V99 unavailable -> always the full epoch */
 #define pj_v99_pde_code  (pj_v99->pde_code)
@@ -1540,6 +1679,36 @@ static inline void b86_pj_note_store(B86Cpu *c, uint32_t lin, uint32_t n)
         if (a == b) break;
     }
 }
+#if B86_V100_SMC_EXIT
+/* V100: a store made by a running native block can kill that very block. Its
+ * entry (first 16 bytes) may hold the store's own call site and return
+ * address, so it is patched only after the native run has returned to C. */
+static uint8_t pj_v100_in_native;
+static uint32_t pj_v100_defer[16];
+static unsigned pj_v100_ndefer;
+static void pj_v100_entry_patch(B86Pj *j, uint32_t off)
+{
+    const uint32_t eip = pj_hdr(j, off)[4];
+    uint8_t *code = j->code + off + PJ_HDR_BYTES;
+    PjE e;
+    e.p = code; e.end = code + 16; e.bad = 0;
+    pj_movw(&e, R1, eip & 0xFFFFu); pj_movt(&e, R1, eip >> 16);
+    pj_movw(&e, R0, 0u);
+    pj_patch_b(pj_b(&e, -1), pj_in_hot(j, off) ? j->hsh.tail_z : j->tail_z);
+#if defined(__linux__)
+    __builtin___clear_cache((char *)code, (char *)code + 16);
+#else
+    __asm__ volatile("dsb 0xF\n\tisb 0xF" ::: "memory");
+#endif
+}
+static void pj_v100_apply_deferred(B86Pj *j)
+{
+    unsigned i;
+    for (i = 0u; i < pj_v100_ndefer; ++i)
+        if (pj_hdr(j, pj_v100_defer[i])[1] & 0x80000000u) pj_v100_entry_patch(j, pj_v100_defer[i]);
+    pj_v100_ndefer = 0u;
+}
+#endif
 #if B86_PJ_V88_LISTS
 static __attribute__((noinline)) B86_PM_HOT void pj_kill_block(B86Cpu *c, B86Pj *j, uint32_t off)
 #else
@@ -1552,6 +1721,13 @@ static B86_PJ_COLD void pj_kill_block(B86Cpu *c, B86Pj *j, uint32_t off)
     PjE e;
     unsigned k;
     hd[1] |= 0x80000000u;
+#if B86_V100_SMC_EXIT
+    (void)code; (void)eip; (void)&e;
+    if (pj_v100_in_native) {                       /* V100: patched when the run returns */
+        if (pj_v100_ndefer < 16u) pj_v100_defer[pj_v100_ndefer++] = off;
+        else j->flush_pending = 1;                 /* too many: the next dispatch flushes */
+    } else pj_v100_entry_patch(j, off);
+#else
     /* entry -> MOVW/MOVT r1,eip; MOVW r0,#0; B.W tail_z (back to C at eip) */
     e.p = code; e.end = code + 16; e.bad = 0;
     pj_movw(&e, R1, eip & 0xFFFFu); pj_movt(&e, R1, eip >> 16);
@@ -1562,11 +1738,34 @@ static B86_PJ_COLD void pj_kill_block(B86Cpu *c, B86Pj *j, uint32_t off)
 #else
     __asm__ volatile("dsb 0xF\n\tisb 0xF" ::: "memory");
 #endif
+#endif
+#if B86_V102_KILLFAST
+    {   /* V102: every table stores a block under hash(its EIP): flat slot h or h^1,
+         * 16-bit slot h in any context. Only those slots can point to this block. */
+        const uint32_t hf = ((eip * 2654435761u) >> 16) & (B86_PJ_HASH - 1u);
+        const uint32_t h16 = ((eip * 2654435761u) >> 16) & (PJ_PM16_ENT - 1u);
+        if (j->ent[hf] == ent) { j->ent[hf] = 0u; j->tag[hf] = 0u; }
+        if (j->ent[hf ^ 1u] == ent) { j->ent[hf ^ 1u] = 0u; j->tag[hf ^ 1u] = 0u; }
+        for (k = 0; k < PJ_PM16_CTX; ++k) {
+            uint32_t *tg = pj_pm16_tag(j, k), *en = pj_pm16_ent(j, k);
+            if (en[h16] == ent) { en[h16] = 0u; tg[h16] = 0u; }
+        }
+        ++pj_v102_n[0];
+#ifdef PJ_V102_KILLCHECK
+        for (k = 0; k < B86_PJ_HASH; ++k) if (j->ent[k] == ent) { j->ent[k] = 0u; j->tag[k] = 0u; ++pj_v102_n[1]; }
+        for (k = 0; k < PJ_PM16_CTX * PJ_PM16_ENT; ++k) {
+            uint32_t *tg = pj_pm16_tag(j, k / PJ_PM16_ENT), *en = pj_pm16_ent(j, k / PJ_PM16_ENT);
+            if (en[k % PJ_PM16_ENT] == ent) { en[k % PJ_PM16_ENT] = 0u; tg[k % PJ_PM16_ENT] = 0u; ++pj_v102_n[1]; }
+        }
+#endif
+    }
+#else
     for (k = 0; k < B86_PJ_HASH; ++k) if (j->ent[k] == ent) { j->ent[k] = 0u; j->tag[k] = 0u; }
     for (k = 0; k < PJ_PM16_CTX * PJ_PM16_ENT; ++k) {
         uint32_t *tg = pj_pm16_tag(j, k / PJ_PM16_ENT), *en = pj_pm16_ent(j, k / PJ_PM16_ENT);
         if (en[k % PJ_PM16_ENT] == ent) { en[k % PJ_PM16_ENT] = 0u; tg[k % PJ_PM16_ENT] = 0u; }
     }
+#endif
     ++j->smc_kills;
     c->pj_stop = 1u;                              /* leave native code at the next chain point */
 }
@@ -1710,6 +1909,28 @@ static inline int pj_v30i_entry_tlb_hit(const B86Cpu *c, uint32_t lin)
 #ifndef BB_PJ_READ_TLB_LEAN
 #define BB_PJ_READ_TLB_LEAN 1
 #endif
+#if B86_V103_STATS
+/* V103: slow-path statistics, out of line in flash (SRAM budget). */
+static B86_PJ_COLD void pj_v103_mem_slow(const B86Cpu *c, const B86Pj *j, uint32_t ra, uint32_t lin, uint32_t size)
+{
+    ++pj_v103s->n[1];
+    if ((lin & 0xFFFu) + size > 0x1000u) ++pj_v103s->n[3];                  /* page-cross refusal */
+    else if (c->pg && c->tlb_tag[(lin >> 12) & 63u] != ((lin & 0xFFFFF000u) | 1u)) ++pj_v103s->n[2];   /* walk */
+    if (j) {
+        ra -= (uint32_t)(uintptr_t)j->code;
+        if (ra < j->cap) ++pj_v103s->n[7];
+        else if (pj_in_hot(j, ra)) ++pj_v103s->n[8];
+    }
+}
+static B86_PJ_COLD void pj_v103_mem_write(const B86Pj *j, uint32_t lin)
+{
+    ++pj_v103s->n[5];
+    if (j) {   /* a code page of the native tier (same test as b86_pj_note_store) */
+        const uint32_t pa = lin >> 12, hpa = PJ_PGH(pa);
+        if ((j->cpg[hpa >> 5] & (1u << (hpa & 31u))) && pj_cps_has(j, pa)) ++pj_v103s->n[6];
+    }
+}
+#endif
 static B86_PM_HOT uint8_t *b86_pj_mem(B86Cpu *c, uint32_t lin, uint32_t sw)
 {
     const uint32_t size = sw & 0xFFu;
@@ -1728,6 +1949,9 @@ static B86_PM_HOT uint8_t *b86_pj_mem(B86Cpu *c, uint32_t lin, uint32_t sw)
     }
 #endif
     uint32_t phys;
+#if B86_V103_STATS
+    if (pj_v103s) pj_v103_mem_slow(c, j, (uint32_t)(uintptr_t)__builtin_return_address(0), lin, size);
+#endif
     if (BB_PJ_MEMSTATS && j) ++j->prof_mem_calls;
     if ((lin & 0xFFFu) + size > 0x1000u) {
         if (BB_PJ_MEMSTATS && j) ++j->prof_mem_cross;
@@ -1761,11 +1985,24 @@ static B86_PM_HOT uint8_t *b86_pj_mem(B86Cpu *c, uint32_t lin, uint32_t sw)
     }
     if (sw & 0x100u) {
         if (BB_PJ_MEMSTATS && j) ++j->prof_mem_writes;
+#if B86_V103_STATS
+        if (pj_v103s) pj_v103_mem_write(j, lin);
+#endif
         /* STAGE4Y: smc() itself calls b86_pj_note_store() under PE.
          * The previous explicit call doubled every native-write code-page
          * lookup. Keep the common SMC handler for both PJ and RM JIT.
          * Installer validates the common handler before changing this file. */
+#if B86_V100_SMC_EXIT
+        {   /* V100: if this store killed translated code, refuse it: the native
+             * block exits at this instruction and the interpreter replays it, so
+             * no instruction rewritten by the store runs stale. */
+            const unsigned long k0 = j ? j->smc_kills : 0ul;
+            smc(c, lin, size);
+            if (j && j->smc_kills != k0) { ++pj_v100_n[5]; return NULL; }
+        }
+#else
         smc(c, lin, size);
+#endif
     }
 #ifdef B86_PJ_VERIFY
     if (sw & 0x100u) pj_vlog(b86_host_phys(c, phys), size);
@@ -1815,6 +2052,85 @@ static B86_PM_HOT uint32_t b86_pj_div(uint32_t lo, uint32_t hi, uint32_t d, uint
 /* MOVS/STOS/LODS (desc = op | rep<<8 | width<<9), guest registers already in
  * c->r. 1 = instruction completed; 0 = stop here (nothing or part done --
  * REP is restartable at any element). */
+#if B86_V103_STRBULK && !defined(B86_PJ_STR_MAX)
+/* V103: forward REP MOVS/STOS in page runs (flash: runs once per instruction).
+ * Per 64-byte line of the destination: smc() for exactly the bytes about to be
+ * written, BEFORE they are written; a store that kills translated code (V100)
+ * returns 0 with the registers at that line, and the interpreter replays the
+ * rest. MOVS only without upward overlap (memmove-equivalent otherwise).
+ * Returns 1 with *np elements left for the per-element loop (0: all done). */
+static B86_PJ_COLD uint32_t pj_v103_str_bulk(B86Cpu *c, unsigned kind, unsigned w, uint32_t *np)
+{
+    B86Pj *jb = b86_pj_state(c);
+    uint32_t n = *np;
+    while (n >= 2u) {
+        const uint32_t di = c->r[B86_DI], si = c->r[B86_SI];
+        uint32_t room = (0x1000u - (di & 0xFFFu)) / w, bytes, done = 0u;
+        uint8_t *sp = NULL, *dp;
+        if (kind == 0u) {
+            const uint32_t rs = (0x1000u - (si & 0xFFFu)) / w;
+            if (rs < room) room = rs;
+        }
+        if (room > n) room = n;
+        if (room < 2u) {   /* an element at a page end: exactly the per-element step, then bulk again */
+            uint8_t *s1 = NULL, *d1;
+            uint32_t v1 = c->r[0], q;
+            if (kind == 0u && !(s1 = b86_pj_mem(c, si, w))) { *np = n; return 0u; }
+            if (!(d1 = b86_pj_mem(c, di, w | 0x100u))) { *np = n; return 0u; }
+            if (kind == 0u) { v1 = 0u; for (q = 0u; q < w; ++q) v1 |= (uint32_t)s1[q] << (8u * q); }
+            for (q = 0u; q < w; ++q) d1[q] = (uint8_t)(v1 >> (8u * q));
+            if (kind == 0u) c->r[B86_SI] += w;
+            c->r[B86_DI] += w;
+            c->r[B86_CX] = --n;
+#if B86_V103_STATS
+            PJ_V103_INC(n[11]);
+#endif
+            continue;
+        }
+        bytes = room * w;
+        if (kind == 0u && !(sp = b86_pj_mem(c, si, w))) break;
+        if (!(dp = b86_pj_mem(c, di, w))) break;            /* mapping + bounds; smc below */
+        if (dp + bytes > c->mem + B86_RAM_BYTES) break;
+        if (kind == 0u && sp + bytes > c->mem + B86_RAM_BYTES) break;
+#ifndef PJ_V103_NEG_OVERLAP  /* test-only negative control: ignore upward overlap */
+        if (kind == 0u && dp > sp && dp < sp + bytes) break; /* overlap upward: per element */
+#endif
+        while (done < bytes) {
+            const uint32_t a = di + done;
+            uint32_t len = 64u - (a & 63u);
+            const unsigned long k0 = jb ? jb->smc_kills : 0ul;
+            if (len > bytes - done) len = bytes - done;
+            smc(c, a, len);
+            if (jb && jb->smc_kills != k0) {                 /* refuse: nothing of this line written */
+#if B86_V100_SMC_EXIT
+                ++pj_v100_n[5];
+#endif
+                *np = n;
+                return 0u;
+            }
+            if (kind == 0u) memmove(dp + done, sp + done, len);
+            else if (w == 1u) memset(dp + done, (int)(c->r[0] & 0xFFu), len);
+            else {
+                uint32_t q;
+                for (q = 0u; q < len; q += w) {
+                    dp[done + q] = (uint8_t)c->r[0]; dp[done + q + 1u] = (uint8_t)(c->r[0] >> 8);
+                    if (w == 4u) { dp[done + q + 2u] = (uint8_t)(c->r[0] >> 16); dp[done + q + 3u] = (uint8_t)(c->r[0] >> 24); }
+                }
+            }
+            done += len;
+            if (kind == 0u) c->r[B86_SI] += len;
+            c->r[B86_DI] += len;
+            n -= len / w;
+            c->r[B86_CX] = n;
+        }
+#if B86_V103_STATS
+        if (pj_v103s) { ++pj_v103s->n[9]; pj_v103s->n[10] += room; }
+#endif
+    }
+    *np = n;
+    return 1u;
+}
+#endif
 static B86_PM_HOT uint32_t b86_pj_str(B86Cpu *c, uint32_t desc)
 {
     const unsigned op = desc & 0xFFu, rep = (desc >> 8) & 1u, w = (desc >> 9) & 7u;
@@ -1835,9 +2151,18 @@ static B86_PM_HOT uint32_t b86_pj_str(B86Cpu *c, uint32_t desc)
         }
     }
 #endif
+#if B86_V103_STRBULK && !defined(B86_PJ_STR_MAX)
+    if (rep && kind != 2u && step == w && n >= 2u && pj_v103_bulk_on && !(c->r[B86_DI] & (w - 1u))) {
+        if (!pj_v103_str_bulk(c, kind, w, &n)) return 0u;
+        if (!n) return 1u;
+    }
+#endif
     while (n) {
         uint8_t *sp = NULL, *dp = NULL;
         uint32_t v;
+#if B86_V103_STATS
+        PJ_V103_INC(n[11]);
+#endif
         if (kind != 1u && !(sp = b86_pj_mem(c, c->r[B86_SI], w))) return 0u;
         if (kind != 2u && !(dp = b86_pj_mem(c, c->r[B86_DI], w | 0x100u))) return 0u;
         v = kind == 1u ? c->r[0] : w == 4u ? (uint32_t)sp[0] | ((uint32_t)sp[1] << 8) | ((uint32_t)sp[2] << 16) | ((uint32_t)sp[3] << 24)
@@ -2226,6 +2551,119 @@ typedef struct {
 static uint32_t b86_pj_es_runtime_check(B86Cpu *c, uint32_t eip);
 static void pjt_c(PjT *t) { if (!t->creg_ok) { pj_ldst(&t->e, PJ_LDR, CREG, SP, 0u); t->creg_ok = 1; } }
 static void pjt_call(PjT *t, const void *fn) { pj_call(&t->e, fn); t->creg_ok = 0; }
+#if B86_V104_MAT
+#if B86_V103_STATS
+static void pjt_v103_mat(PjT *t, unsigned site);
+#endif
+static void pjt_c(PjT *t);
+static uint8_t *pjt_bfwd(PjT *t, int cond);
+static void pjt_here(PjT *t, uint8_t *at);
+/* V104: materialize pending lazy flags (something IS pending). A lone 32-bit
+ * ADD/ADC/SUB/SBB record is resolved natively with exactly lazy_eval's formulas;
+ * anything else calls the C materializer. Uses R0-R3 and LR (all clobbered by
+ * the C call anyway); CREG (R12) is preserved. */
+static void pjt_v104_mat(PjT *t, unsigned site)
+{
+    uint8_t *ov, *k_add, *k_adc, *k_sub, *k_other, *to_sub, *to_add, *to_common, *done;
+    (void)site;
+    pjt_c(t);
+    pj_ldst(&t->e, PJ_LDR, R0, CREG, (unsigned)offsetof(B86Cpu,lz_ikind));
+    pj_dpi(&t->e, 13u, 1, PC, R0, 0u);
+    ov = pjt_bfwd(t, 1 /* NE: INC/DEC overlay pending */);
+    pj_ldst(&t->e, PJ_LDR, R0, CREG, (unsigned)offsetof(B86Cpu,lz_kind));
+    pj_ldst(&t->e, PJ_LDR, R1, CREG, (unsigned)offsetof(B86Cpu,lz_res));     /* r */
+    pj_ldst(&t->e, PJ_LDR, R2, CREG, (unsigned)offsetof(B86Cpu,lz_a));       /* a */
+    pj_dpi(&t->e, 13u, 1, PC, R0, LZ_ADD32); k_add = pjt_bfwd(t, 0);
+    pj_dpi(&t->e, 13u, 1, PC, R0, LZ_ADC32); k_adc = pjt_bfwd(t, 0);
+    pj_dpi(&t->e, 13u, 1, PC, R0, LZ_SUB32); k_sub = pjt_bfwd(t, 0);
+    pj_dpi(&t->e, 13u, 1, PC, R0, LZ_SBB32); k_other = pjt_bfwd(t, 1);
+    pj_ldst(&t->e, PJ_LDR, R3, CREG, (unsigned)offsetof(B86Cpu,lz_b));       /* SBB: b explicit */
+    to_sub = pjt_bfwd(t, -1);
+    pjt_here(t, k_sub);
+    pj_dpr(&t->e, 13u, 0, R3, R2, R1, 0u, 0u);                               /* SUB: b = a - r */
+    pjt_here(t, to_sub);
+    /* sub, sbb: CF = ((~a & b) | (~(a ^ b) & r)) >> 31 ; OF = (a ^ b) & (a ^ r) */
+    pj_dpr(&t->e, 1u, 0, LR, R3, R2, 0u, 0u);                                /* b & ~a */
+    pj_dpr(&t->e, 4u, 0, R0, R2, R3, 0u, 0u);                                /* a ^ b */
+    pj_dpr(&t->e, 1u, 0, R0, R1, R0, 0u, 0u);                                /* r & ~(a ^ b) */
+    pj_dpr(&t->e, 2u, 0, LR, LR, R0, 0u, 0u);
+    pj_shift(&t->e, LR, LR, 1u, 31u);                                        /* LR = CF */
+    pj_dpr(&t->e, 4u, 0, R3, R2, R3, 0u, 0u);                                /* R3 = a ^ b */
+    pj_dpr(&t->e, 4u, 0, R0, R2, R1, 0u, 0u);                                /* a ^ r */
+    pj_dpr(&t->e, 0u, 0, R0, R0, R3, 0u, 0u);                                /* OF in bit 31 */
+    to_common = pjt_bfwd(t, -1);
+    pjt_here(t, k_adc);
+    pj_ldst(&t->e, PJ_LDR, R3, CREG, (unsigned)offsetof(B86Cpu,lz_b));       /* ADC: b explicit */
+    to_add = pjt_bfwd(t, -1);
+    pjt_here(t, k_add);
+    pj_dpr(&t->e, 13u, 0, R3, R1, R2, 0u, 0u);                               /* ADD: b = r - a */
+    pjt_here(t, to_add);
+    /* add, adc: CF = ((a & b) | ((a | b) & ~r)) >> 31 ; OF = (a ^ r) & (b ^ r) = (a ^ r) & ~(a ^ b) */
+    pj_dpr(&t->e, 2u, 0, LR, R2, R3, 0u, 0u);                                /* a | b */
+    pj_dpr(&t->e, 1u, 0, LR, LR, R1, 0u, 0u);                                /* & ~r */
+    pj_dpr(&t->e, 0u, 0, R0, R2, R3, 0u, 0u);                                /* a & b */
+    pj_dpr(&t->e, 2u, 0, LR, LR, R0, 0u, 0u);
+    pj_shift(&t->e, LR, LR, 1u, 31u);                                        /* LR = CF */
+    pj_dpr(&t->e, 4u, 0, R3, R2, R3, 0u, 0u);                                /* R3 = a ^ b */
+    pj_dpr(&t->e, 4u, 0, R0, R2, R1, 0u, 0u);                                /* a ^ r */
+    pj_dpr(&t->e, 1u, 0, R0, R0, R3, 0u, 0u);                                /* OF in bit 31 */
+    pjt_here(t, to_common);
+    pj_shift(&t->e, R0, R0, 1u, 31u);
+    pj_dpr(&t->e, 2u, 0, LR, LR, R0, 0u, 11u);                               /* OF (bit 11) */
+#ifndef PJ_V104_NEG_MAT
+    pj_dpr(&t->e, 4u, 0, R0, R3, R1, 0u, 0u);                                /* a ^ b ^ r */
+    pj_dpi(&t->e, 0u, 0, R0, R0, B86_AF);
+    pj_dpr(&t->e, 2u, 0, LR, LR, R0, 0u, 0u);                                /* AF */
+#endif
+    pj_shift(&t->e, R0, R1, 1u, 31u);
+    pj_dpr(&t->e, 2u, 0, LR, LR, R0, 0u, 7u);                                /* SF (bit 7) */
+    pje32(&t->e, 0xFAB0u | R1, 0xF080u | (R0 << 8) | R1);                    /* CLZ R0, r */
+    pj_shift(&t->e, R0, R0, 1u, 5u);                                         /* 1 iff r == 0 */
+    pj_dpr(&t->e, 2u, 0, LR, LR, R0, 0u, 6u);                                /* ZF (bit 6) */
+    pj_ubfx(&t->e, R0, R1, 0u, 8u);
+    pj_dpr(&t->e, 4u, 0, R0, R0, R0, 1u, 4u);
+    pj_dpr(&t->e, 4u, 0, R0, R0, R0, 1u, 2u);
+    pj_dpr(&t->e, 4u, 0, R0, R0, R0, 1u, 1u);                                /* bit 0: odd parity */
+    pj_dpi(&t->e, 4u, 0, R0, R0, 1u);
+    pj_dpi(&t->e, 0u, 0, R0, R0, 1u);
+    pj_dpr(&t->e, 2u, 0, LR, LR, R0, 0u, 2u);                                /* PF (bit 2) */
+    pj_ldst(&t->e, PJ_LDR, R0, CREG, (unsigned)offsetof(B86Cpu,flags));
+    pj_movw(&t->e, R1, (uint32_t)B86_ARITH);
+    pj_dpr(&t->e, 1u, 0, R0, R0, R1, 0u, 0u);
+    pj_dpr(&t->e, 2u, 0, R0, R0, LR, 0u, 0u);
+    pj_ldst(&t->e, PJ_STR, R0, CREG, (unsigned)offsetof(B86Cpu,flags));
+    pj_movw(&t->e, R1, LZ_NONE);
+    pj_ldst(&t->e, PJ_STR, R1, CREG, (unsigned)offsetof(B86Cpu,lz_kind));
+    done = pjt_bfwd(t, -1);
+    pjt_here(t, ov); pjt_here(t, k_other);
+    pjt_c(t);
+    pj_mov(&t->e, R0, CREG);
+#if B86_V103_STATS
+    pjt_v103_mat(t, site);
+#else
+    pjt_call(t, (const void *)b86_flags_materialize);
+#endif
+    pjt_c(t);
+    pjt_here(t, done);
+}
+#endif
+#if B86_V103_STATS
+/* V103: native flag materialization, counted by call site and pending kind. */
+static B86_PJ_COLD void b86_v103_mat(B86Cpu *c, uint32_t site)   /* flash: SRAM budget */
+{
+    if (pj_v103s) {
+        ++pj_v103s->site[site & 15u];
+        ++pj_v103s->kind[c->lz_kind < (uint32_t)LZ_COUNT ? c->lz_kind : 0u];
+        if (c->lz_ikind != LZ_NONE) ++pj_v103s->n[12];
+    }
+    b86_flags_materialize(c);
+}
+static void pjt_v103_mat(PjT *t, unsigned site)
+{
+    pj_movw(&t->e, R1, site);
+    pjt_call(t, (const void *)b86_v103_mat);
+}
+#endif
 static void pjt_exit(PjT *t, uint32_t ip, unsigned n, int dyn)
 { if (t->nex < 96u) { PjExit *x = &t->ex[t->nex++]; x->at = pj_b(&t->e, -1); x->ip = ip; x->n = n; x->dyn = dyn; } else t->e.bad = 1; }
 static void pjt_exit_cond(PjT *t, int cond, uint32_t ip, unsigned n)
@@ -2704,9 +3142,62 @@ static int pjt_v69_shiftd(PjT *t, const PjM *m, unsigned w,
     pj_ldst(&t->e, PJ_LDR, R0, CREG, (unsigned)offsetof(B86Cpu,lz_ikind));
     pj_dpr(&t->e, 2u, 1, R2, R2, R0, 0u, 0u);
     ready = pjt_bfwd(t, 0 /* EQ */);
+#if B86_V103_SHIFTD
+    {   /* V103: only AF and (count > 1) OF survive this instruction. A lone
+         * SZPC record (multiply / shift-by-1 RCL/RCR: AF=0, OF=lz_b&OF) or logic
+         * record (AF=0, OF=0) is resolved here exactly as lazy_eval would;
+         * every other record takes the exact C materializer. */
+        uint8_t *to_slow1, *to_slow2, *lg1, *lg2, *lg3, *sz1, *sz2, *done;
+        pj_dpi(&t->e, 13u, 1, PC, R0, 0u);                     /* CMP lz_ikind,#0 */
+        to_slow1 = pjt_bfwd(t, 1 /* NE: INC/DEC overlay pending */);
+        pj_ldst(&t->e, PJ_LDR, R2, CREG, (unsigned)offsetof(B86Cpu,lz_kind));
+        pj_movw(&t->e, R0, 0u);                                 /* OF kept = 0 (logic) */
+        pj_dpi(&t->e, 13u, 1, PC, R2, LZ_LOG32); lg1 = pjt_bfwd(t, 0);
+        pj_dpi(&t->e, 13u, 1, PC, R2, LZ_LOG16); lg2 = pjt_bfwd(t, 0);
+        pj_dpi(&t->e, 13u, 1, PC, R2, LZ_LOG8);  lg3 = pjt_bfwd(t, 0);
+        pj_dpi(&t->e, 13u, 1, PC, R2, LZ_SZPC32); sz1 = pjt_bfwd(t, 0);
+        pj_dpi(&t->e, 13u, 1, PC, R2, LZ_SZPC16); sz2 = pjt_bfwd(t, 0);
+        pj_dpi(&t->e, 13u, 1, PC, R2, LZ_SZPC8);
+        to_slow2 = pjt_bfwd(t, 1 /* NE: any other record */);
+        pjt_here(t, sz1); pjt_here(t, sz2);                     /* SZPC: OF from lz_b */
+        pj_ldst(&t->e, PJ_LDR, R0, CREG, (unsigned)offsetof(B86Cpu,lz_b));
+        pj_dpi(&t->e, 0u, 0, R0, R0, B86_OF);
+        pjt_here(t, lg1); pjt_here(t, lg2); pjt_here(t, lg3);
+        pjt_c(t);
+        pj_movw(&t->e, R2, (uint32_t)B86_ARITH);
+        pj_ldst(&t->e, PJ_LDR, R3, CREG, (unsigned)offsetof(B86Cpu,flags));
+#ifndef PJ_V103_NEG_SHIFTD   /* test-only negative control: keep stale arithmetic bits */
+        pj_dpr(&t->e, 1u, 0, R3, R3, R2, 0u, 0u);              /* BIC arithmetic flags */
+#endif
+        pj_dpr(&t->e, 2u, 0, R3, R3, R0, 0u, 0u);              /* ORR kept OF (AF = 0) */
+        pj_ldst(&t->e, PJ_STR, R3, CREG, (unsigned)offsetof(B86Cpu,flags));
+        pj_movw(&t->e, R2, LZ_NONE);
+        pj_ldst(&t->e, PJ_STR, R2, CREG, (unsigned)offsetof(B86Cpu,lz_kind));
+        done = pjt_bfwd(t, -1);
+        pjt_here(t, to_slow1); pjt_here(t, to_slow2);
+#if B86_V104_MAT
+        pjt_v104_mat(t, 1u);
+#else
+        pjt_c(t);
+        pj_mov(&t->e, R0, CREG);
+#if B86_V103_STATS
+        pjt_v103_mat(t, 1u);
+#else
+        pjt_call(t, (const void *)b86_flags_materialize);
+#endif
+        pjt_c(t);
+#endif
+        pjt_here(t, done);
+    }
+#else
     pj_mov(&t->e, R0, CREG);
+#if B86_V103_STATS
+    pjt_v103_mat(t, 1u);
+#else
     pjt_call(t, (const void *)b86_flags_materialize);
+#endif
     pjt_c(t);
+#endif /* V103 lazy fast path */
     pjt_here(t, ready);
     pj_ldst(&t->e, PJ_LDR, R1, SP, 16u);
     pjt_getr(t, R2, m->reg, w);
@@ -2718,6 +3209,20 @@ static int pjt_v69_shiftd(PjT *t, const PjM *m, unsigned w,
     else pj_movw(&t->e, R3, imm);
     pj_ubfx(&t->e, R0, R1, bits - 1u, 1u);
     pj_ldst(&t->e, PJ_STR, R0, SP, 16u);
+#if B86_V103_SHIFTD
+    if (!use_cl) {   /* V103: closed form; LR = CF (last bit out), R1 = result (1 <= imm <= bits) */
+        if (left) {
+            pj_ubfx(&t->e, LR, R1, bits - imm, 1u);
+            pj_shift(&t->e, R1, R1, 0u, imm);
+            pj_shift(&t->e, R0, R2, imm == bits ? 0u : 1u, imm == bits ? 0u : bits - imm);
+        } else {
+            pj_ubfx(&t->e, LR, R1, imm - 1u, 1u);
+            pj_shift(&t->e, R1, R1, 1u, imm);
+            pj_shift(&t->e, R0, R2, 0u, bits - imm);
+        }
+        pj_dpr(&t->e, 2u, 0, R1, R1, R0, 0u, 0u);
+    } else {
+#endif
     loop = t->e.p;
     if (left) {
         pj_ubfx(&t->e, LR, R1, bits - 1u, 1u);
@@ -2735,6 +3240,9 @@ static int pjt_v69_shiftd(PjT *t, const PjM *m, unsigned w,
     }
     pj_dpi(&t->e, 13u, 1, R3, R3, 1u); /* SUBS remaining */
     pj_patch_b(pj_b(&t->e, 1 /* NE */), loop);
+#if B86_V103_SHIFTD
+    }
+#endif
     if (w == 2u) pj_ubfx(&t->e, R1, R1, 0u, 16u);
     pj_ldst(&t->e, PJ_LDR, R2, CREG, (unsigned)offsetof(B86Cpu,flags));
     pj_movw(&t->e, R0, B86_CF | B86_PF | B86_ZF | B86_SF);
@@ -3123,7 +3631,11 @@ static void pjt_v70_flags_if_lazy(PjT *t)
     pj_dpr(&t->e, 2u, 1, R2, R2, R3, 0u, 0u); /* ORRS: flags pending? */
     ready = pjt_bfwd(t, 0 /* EQ: no prior lazy flags */);
     pj_mov(&t->e, R0, CREG);
+#if B86_V103_STATS
+    pjt_v103_mat(t, 2u);
+#else
     pjt_call(t, (const void *)b86_flags_materialize);
+#endif
     pjt_c(t);
     pjt_here(t, ready);
     t->last_kind = -1; t->ikind_clear = 1; t->fuse_at = NULL;
@@ -3459,7 +3971,11 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
         pj_dpr(&t->e, 2u, 1, R2, R2, R3, 0u, 0u); /* ORRS lazy kinds */
         ready64 = pjt_bfwd(t, 0 /* EQ: flags already materialized */);
         pj_mov(&t->e, R0, CREG);
+#if B86_V103_STATS
+        pjt_v103_mat(t, 3u);
+#else
         pjt_call(t, (const void *)b86_flags_materialize);
+#endif
         pjt_c(t);
         pjt_here(t, ready64);
         pj_ldst(&t->e, PJ_LDR, R0, CREG,
@@ -3557,7 +4073,11 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
             pj_dpr(&t->e, 2u, 1, R2, R2, R3, 0u, 0u); /* ORRS lazy kinds */
             ready62 = pjt_bfwd(t, 0);        /* already materialized */
             pj_mov(&t->e, R0, CREG);
+#if B86_V103_STATS
+            pjt_v103_mat(t, 4u);
+#else
             pjt_call(t, (const void *)b86_flags_materialize);
+#endif
             pjt_c(t);
             pjt_here(t, ready62);
             pj_ldst(&t->e, PJ_LDR, R0, CREG, (unsigned)offsetof(B86Cpu, flags));
@@ -4584,7 +5104,11 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
             pj_dpr(&t->e, 2u, 1, R2, R2, R3, 0u, 0u); /* ORRS */
             ready63 = pjt_bfwd(t, 0 /* EQ: previous flags already materialized */);
             pj_mov(&t->e, R0, CREG);
+#if B86_V103_STATS
+            pjt_v103_mat(t, 5u);
+#else
             pjt_call(t, (const void *)b86_flags_materialize);
+#endif
             pjt_c(t);
             pjt_here(t, ready63);
             pj_ldst(&t->e, PJ_LDR, R0, CREG,
@@ -4679,7 +5203,11 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
                 pj_dpr(&t->e, 2u, 1, R2, R2, R3, 0u, 0u); /* ORRS / test either */
                 flags_ready = pjt_bfwd(t, 0 /* EQ: no lazy flags */);
                 pj_mov(&t->e, R0, CREG);
+#if B86_V103_STATS
+                pjt_v103_mat(t, 6u);
+#else
                 pjt_call(t, (const void *)b86_flags_materialize);
+#endif
                 pjt_c(t);
                 pjt_here(t, flags_ready);
                 /* All other x86 arithmetic flags must be preserved. */
@@ -4757,9 +5285,17 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
                         (unsigned)offsetof(B86Cpu, lz_ikind));
                 pj_dpr(&t->e, 2u, 1, R2, R2, R3, 0u, 0u);
                 ready61 = pjt_bfwd(t, 0 /* EQ */);
+#if B86_V104_MAT
+                pjt_v104_mat(t, 7u);
+#else
                 pj_mov(&t->e, R0, CREG);
+#if B86_V103_STATS
+                pjt_v103_mat(t, 7u);
+#else
                 pjt_call(t, (const void *)b86_flags_materialize);
+#endif
                 pjt_c(t);
+#endif
                 pjt_here(t, ready61);
                 pj_ldst(&t->e, PJ_LDR, R0, CREG,
                         (unsigned)offsetof(B86Cpu, flags));
@@ -5317,7 +5853,11 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
             pj_dpr(&t->e, 2u, 1, R2, R2, R3, 0u, 0u);
             ready67 = pjt_bfwd(t, 0 /* EQ: flags materialized */);
             pj_mov(&t->e, R0, CREG);
+#if B86_V103_STATS
+            pjt_v103_mat(t, 8u);
+#else
             pjt_call(t, (const void *)b86_flags_materialize);
+#endif
             pjt_c(t);
             pjt_here(t, ready67);
             pj_ldst(&t->e, PJ_LDR, R1, SP, 16u);
@@ -5393,7 +5933,11 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
             pj_dpr(&t->e, 2u, 1, R2, R2, R3, 0u, 0u);
             ready65 = pjt_bfwd(t, 0 /* EQ: no pending lazy flags */);
             pj_mov(&t->e, R0, CREG);
+#if B86_V103_STATS
+            pjt_v103_mat(t, 9u);
+#else
             pjt_call(t, (const void *)b86_flags_materialize);
+#endif
             pjt_c(t);
             pjt_here(t, ready65);
             pj_ldst(&t->e, PJ_LDR, R0, CREG,
@@ -5488,7 +6032,11 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
             pj_dpr(&t->e, 2u, 1, R2, R2, R3, 0u, 0u);
             ready66 = pjt_bfwd(t, 0 /* EQ: flags already materialized */);
             pj_mov(&t->e, R0, CREG);
+#if B86_V103_STATS
+            pjt_v103_mat(t, 10u);
+#else
             pjt_call(t, (const void *)b86_flags_materialize);
+#endif
             pjt_c(t);
             pjt_here(t, ready66);
             pj_ldst(&t->e, PJ_LDR, R0, CREG,
@@ -5575,7 +6123,11 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
                 pj_dpr(&t->e, 2u, 1, R2, R2, R3, 0u, 0u);
                 ready68 = pjt_bfwd(t, 0 /* EQ: flags already materialized */);
                 pj_mov(&t->e, R0, CREG);
+#if B86_V103_STATS
+                pjt_v103_mat(t, 11u);
+#else
                 pjt_call(t, (const void *)b86_flags_materialize);
+#endif
                 pjt_c(t);
                 pjt_here(t, ready68);
                 pjt_getr(t, R1, m.rm, 4u);       /* original destination */
@@ -6456,6 +7008,19 @@ static B86_PJ_COLD void pj_emit_shared_at(B86Pj *j, uint8_t *base, uint8_t *end)
 #endif /* V55 native PM16 dynamic chaining */
     j->used = (uint32_t)(t->e.p - j->code);
     j->used = (j->used + 3u) & ~3u;
+#if B86_V100_XTIER
+    {   /* V100: this region's veneer pool (8-aligned), before its first block */
+        const int hot = base != j->code;
+        const uint32_t want = hot ? PJ_V100_HOT_VENEERS : PJ_V100_PS_VENEERS;
+        uint32_t room, n;
+        j->used = (j->used + 7u) & ~7u;
+        room = (uint32_t)(end - (j->code + j->used));
+        n = room > want * 8u + 16384u ? want : 0u;
+        if (hot) { pj_v100_hot_pool = j->used; pj_v100_hot_n = n; pj_v100_hot_next = 0u; }
+        else { pj_v100_ps_pool = j->used; pj_v100_ps_n = n; pj_v100_ps_next = 0u; }
+        j->used += n * 8u;
+    }
+#endif
     j->shared_end = j->used;                      /* r71: ring halves follow the shared code */
 #if B86_PJ_V94_SEGS
     j->half = ((j->cap - j->shared_end) / PJ_NSEG) & ~3u;
@@ -6489,6 +7054,9 @@ static B86_PJ_COLD void b86_pj_flush(B86Cpu *c)
     if (B86_PJ_PCS) memset(pj_gidx(j), 0, PJ_GIDX_BYTES);           /* r72f */
     pj_emit_shared(j);
     if (j->hot) { j->hot_used = j->hot_start; j->nredir = 0u; }
+#if B86_V100_XTIER
+    pj_v100_hot_next = 0u;
+#endif
     ++j->flushes;
 #if B86_PJ_V31_LAZY_EPOCH
     /* A flush destroys all cached code and therefore needs no lazy fence. */
@@ -6566,6 +7134,14 @@ static B86_PJ_COLD void pj_v99_snapshot(B86Cpu *c)
         pde = pj_v99_rd32(pdp, i);
         pj_v99_snap_idx[n] = (uint16_t)i;
         pj_v99_snap_pde[n] = PJ_V99_M(pde);
+#if B86_V101_FAST
+        {   /* V101: the pages of this region that hold translated code */
+            const B86Pj *jv = (const B86Pj *)c->pj;
+            memset(pj_v99->snap_mask[n], 0, sizeof pj_v99->snap_mask[n]);
+            for (k = 0u; k < 1024u; ++k)
+                if (jv && pj_cps_has(jv, (i << 10) | k)) pj_v99->snap_mask[n][k >> 5] |= 1u << (k & 31u);
+        }
+#endif
         if (pde & 1u) {
             const uint32_t pt = pde & 0xFFFFF000u;
             const uint8_t *ptp;
@@ -6598,12 +7174,68 @@ static B86_PJ_COLD int pj_v99_unchanged(B86Cpu *c)
             const uint8_t *ptp;
             if (pt > B86_RAM_BYTES - 4096u) return 0;
             ptp = b86_host_phys(c, pt);
+#if B86_V101_FAST
+            {   unsigned w2;                         /* V101: only the pages that hold code */
+                for (w2 = 0u; w2 < 32u; ++w2) {
+                    uint32_t mk = pj_v99->snap_mask[n][w2];
+                    while (mk) {
+                        const unsigned b = (unsigned)__builtin_ctz(mk);
+                        mk &= mk - 1u;
+                        k = w2 * 32u + b;
+                        ++pj_v101_n[4];
+                        if (PJ_V99_M(pj_v99_rd32(ptp, k)) != pj_v99_snap_pt[n * 1024u + k]) return 0;
+                    }
+                }
+            }
+#else
             for (k = 0u; k < 1024u; ++k)
                 if (PJ_V99_M(pj_v99_rd32(ptp, k)) != pj_v99_snap_pt[n * 1024u + k]) return 0;
+#endif
         }
     }
     return 1;
 }
+#if B86_V101_FAST
+/* V101: classification bit of the block starting at code offset `off`. */
+#if B86_V104_LINKSKIP
+static inline int pj_v101_bit(const B86Pj *j, uint32_t off, uint32_t **word, uint32_t *mask)
+#else
+static __attribute__((noinline, cold)) int pj_v101_bit(const B86Pj *j, uint32_t off, uint32_t **word, uint32_t *mask)
+#endif
+{
+    uint32_t i;
+    if (!pj_v99) return 0;
+    if (pj_in_hot(j, off)) {
+        i = (off - j->hot_base) >> 5;
+        if (i >= pj_v99->cls_hot_bits) return 0;
+        *word = &pj_v99->cls_hot[i >> 5];
+    } else {
+        i = off >> 5;
+        if (off >= j->cap || i >= pj_v99->cls_ps_bits) return 0;
+        *word = &pj_v99->cls_ps[i >> 5];
+    }
+    *mask = 1u << (i & 31u);
+    return 1;
+}
+#if B86_V104_LINKSKIP
+static inline int pj_v101_kept(const B86Pj *j, uint32_t off)
+#else
+static __attribute__((noinline, cold)) int pj_v101_kept(const B86Pj *j, uint32_t off)
+#endif
+{
+    uint32_t *w, m;
+    return pj_v101_bit(j, off, &w, &m) && (*w & m);
+}
+static __attribute__((noinline, cold)) void pj_v101_classify(const B86Pj *j, uint32_t off, uint32_t p0, uint32_t p1)
+{
+    uint32_t *w, m;
+    const int keep = (p0 & PJ_V29_PAGED) && (p0 & ~PJ_V29_PAGED) >= PJ_V99_EXT_FRAME &&
+                     (p1 == PJ_V29_ABSENT || ((p1 & PJ_V29_PAGED) && (p1 & ~PJ_V29_PAGED) >= PJ_V99_EXT_FRAME));
+    if (!pj_v101_bit(j, off, &w, &m)) return;
+    if (keep) *w |= m; else *w &= ~m;
+    ++pj_v101_n[3];
+}
+#endif
 /* A paged block was just translated from linear page `lin` = physical id `id`:
  * remember its region, and mark the snapshot stale unless it already maps
  * exactly this page. */
@@ -6620,6 +7252,11 @@ static void pj_v99_note_code(uint32_t lin, uint32_t id)
         {   const uint32_t e = pj_v99_snap_pt[n * 1024u + ((lin >> 12) & 1023u)];
             if (!(pj_v99_snap_pde[n] & 1u) || !(e & 1u) || (e >> 12) != (id & ~PJ_V29_PAGED))
                 pj_v99_snap_stale = 1u;
+#if B86_V101_FAST
+            {   const unsigned k = (lin >> 12) & 1023u;   /* V101: compare this page from now on */
+                pj_v99->snap_mask[n][k >> 5] |= 1u << (k & 31u);
+            }
+#endif
         }
         return;
     }
@@ -8135,7 +8772,11 @@ static void pjt_v83_materialize(PjT *t)
     pj_dpr(&t->e, 2u, 1, R2, R2, R3, 0u, 0u);            /* ORRS: either pending? */
     ready = pjt_bfwd(t, 0 /* EQ: nothing pending */);
     pj_mov(&t->e, R0, CREG);
+#if B86_V103_STATS
+    pjt_v103_mat(t, 12u);
+#else
     pjt_call(t, (const void *)b86_flags_materialize);
+#endif
     pjt_c(t);
     pjt_here(t, ready);
 }
@@ -10199,7 +10840,55 @@ static int pj_v12_link_intact(const B86Pj *j, uint32_t so, uint32_t to)
     if ((bl1 & 0xF800u) != 0xF000u || (bl2 & 0xD000u) != 0xD000u ||
         (bw1 & 0xF800u) != 0xF000u || (bw2 & 0xD000u) != 0x9000u)
         return 0;
+#if B86_V100_XTIER
+    {   const uint32_t d = pj_aud_bw(branch);   /* V100: direct, or through its tier's veneer */
+        return d == (uint32_t)(uintptr_t)(j->code + to) || pj_v100_is_veneer(j, d, to);
+    }
+#else
     return pj_aud_bw(branch) == (uint32_t)(uintptr_t)(j->code + to);
+#endif
+}
+#endif
+#if B86_V100_XTIER && B86_V102_POOL_RESTART
+/* V102: empty a full veneer pool. Every link record whose stub (in this pool's
+ * tier) branches into the pool is undone - only after pj_v12_link_intact proves
+ * the stub is still that linked exit; a stale record is dropped without touching
+ * code (it is no link any more). Links to other targets are kept. */
+static B86_PJ_COLD int pj_v102_pool_restart(B86Pj *j, int hot)
+{
+    const uint32_t pool = hot ? pj_v100_hot_pool : pj_v100_ps_pool;
+    const uint32_t bytes = 8u * (hot ? pj_v100_hot_n : pj_v100_ps_n);
+    uint32_t *lk = pj_links(j), i, keep = 0u;
+    if (!bytes || j->nlinks > B86_PJ_LINKS) return 0;
+    for (i = 0u; i < j->nlinks; ++i) {
+        const uint32_t so = lk[2u * i], to = lk[2u * i + 1u];
+        if ((pj_in_hot(j, so) != 0) == (hot != 0) && so <= UINT32_MAX - 13u &&
+            pj_aud_live(j, so) && pj_aud_live(j, so + 13u)) {
+            const uint32_t d = pj_aud_bw(j->code + so + 10u) - (uint32_t)(uintptr_t)j->code;
+            if (d - pool < bytes) {
+                if (pj_v12_link_intact(j, so, to)) {
+#ifndef PJ_V102_NO_RESTART_UNLINK
+                    uint8_t *stub = j->code + so;
+                    stub[0] = 0x00u; stub[1] = 0xF0u; stub[2] = 0x00u; stub[3] = 0x90u;
+                    pj_patch_b(stub, hot ? j->hsh.exit_s : j->exit_s); stub[3] |= 0x40u;
+#if defined(__linux__)
+                    __builtin___clear_cache((char *)stub, (char *)stub + 14);
+#endif
+#endif
+                    ++j->unlinks; ++pj_v102_n[3];
+                }
+                continue;                              /* the record goes */
+            }
+        }
+        lk[2u * keep] = so; lk[2u * keep + 1u] = to; ++keep;
+    }
+#if !defined(__linux__)
+    __asm__ volatile("dsb 0xF\n\tisb 0xF" ::: "memory");
+#endif
+    j->nlinks = keep;
+    if (hot) pj_v100_hot_next = 0u; else pj_v100_ps_next = 0u;
+    ++pj_v102_n[2];
+    return 1;
 }
 #endif
 /* v48: one-pass verified native-link unchaining. Any malformed link
@@ -10263,12 +10952,16 @@ static B86_PJ_COLD int pj_v31_unlink_all(B86Pj *j)
 #endif
     pj_v31_unlinked += j->nlinks;
     j->nlinks = 0u;
+#if B86_V100_XTIER
+    pj_v100_ps_next = 0u; pj_v100_hot_next = 0u; ++pj_v100_n[4];   /* V100: no link uses a veneer now */
+#endif
     return 1;
 }
 #endif
 #if B86_V99_SELECTIVE
 /* V99: may this block keep its table entries and incoming links? Only a live
  * block translated with paging on whose every source page is extended memory. */
+#if !B86_V101_FAST || defined(PJ_V101_CROSSCHECK)
 static int pj_v99_block_ok(const B86Pj *j, uint32_t off)
 {
     const uint32_t *hd;
@@ -10288,15 +10981,47 @@ static int pj_v99_block_ok(const B86Pj *j, uint32_t off)
         (id1 == PJ_V29_ABSENT || !(id1 & PJ_V29_PAGED) || (id1 & ~PJ_V29_PAGED) < PJ_V99_EXT_FRAME)) return 0;
     return 1;
 }
+#endif
+#if B86_V101_FAST
+/* V101: keep decision = classification bit (PJ_V101_CROSSCHECK: compare with V99's rule). */
+static __attribute__((noinline, cold)) int pj_v101_keep(B86Pj *j, uint32_t off)
+{
+    const int k = pj_v101_kept(j, off);
+#ifdef PJ_V101_CROSSCHECK
+    {   const int old = pj_v99_block_ok(j, off);
+        if (k != old) {
+            if (k && !old && pj_aud_live(j, off) && (pj_hdr(j, off)[1] & 0x80000000u)) ++pj_v101_n[2];
+            else ++pj_v101_n[1];
+        }
+    }
+#endif
+    return k;
+}
+#endif
 static void pj_v99_filter_table(B86Pj *j, uint32_t *tag, uint32_t *ent, uint32_t entries)
 {
     uint32_t k;
     for (k = 0u; k < entries; ++k) {
         if (!tag[k] && !ent[k]) continue;
+#if B86_V101_FAST
+        if (ent[k] > PJ_HDR_BYTES && pj_v101_keep(j, ent[k] - 1u - PJ_HDR_BYTES)) { ++pj_v99_n[8]; continue; }
+#else
         if (ent[k] > PJ_HDR_BYTES && pj_v99_block_ok(j, ent[k] - 1u - PJ_HDR_BYTES)) { ++pj_v99_n[8]; continue; }
+#endif
         tag[k] = 0u; ent[k] = 0u; ++pj_v99_n[9];
     }
 }
+#if B86_V104_LINKSKIP
+/* V104: called once per appended link while no cut is pending (flash). */
+static B86_PJ_COLD __attribute__((noinline)) void pj_v104_note_link(const B86Pj *j, uint32_t to)
+{
+#ifndef PJ_V104_NEG_SKIP   /* test-only negative control: never flag a non-kept target */
+    if (!(to >= PJ_HDR_BYTES && pj_v101_kept(j, to - PJ_HDR_BYTES))) pj_v104_cut_pending = 1u;
+#else
+    (void)j; (void)to;
+#endif
+}
+#endif
 static B86_PJ_COLD int pj_v99_try_selective(B86Cpu *c, B86Pj *j)
 {
     uint32_t i, keep = 0u, *lk = pj_links(j);
@@ -10307,6 +11032,31 @@ static B86_PJ_COLD int pj_v99_try_selective(B86Cpu *c, B86Pj *j)
     if (pj_v99_snap_stale) { ++pj_v99_n[4]; return 0; }
     if (!pj_v99_unchanged(c)) { ++pj_v99_n[3]; return 0; }
     if (j->nlinks > B86_PJ_LINKS) return 0;
+#if B86_V104_LINKSKIP
+    if (!pj_v104_cut_pending) {                  /* V104: every logged link targets a kept block */
+        ++pj_v104_n[1];
+#ifdef PJ_V104_SKIPCHECK
+        for (i = 0u; i < j->nlinks; ++i) {
+            const uint32_t to = lk[2u * i + 1u];
+            if (!(to >= PJ_HDR_BYTES && pj_v101_kept(j, to - PJ_HDR_BYTES))) ++pj_v104_n[2];
+        }
+#endif
+        goto v104_tables;
+    }
+    ++pj_v104_n[0];
+#endif
+#if B86_V101_FAST
+    /* V101: links that stay are not modified, so only the ones to be cut are
+     * validated - all of them, exactly as before, BEFORE any change. */
+    for (i = 0u; i < j->nlinks; ++i) {
+        const uint32_t so = lk[2u * i], to = lk[2u * i + 1u];
+        if (to >= PJ_HDR_BYTES && pj_v101_keep(j, to - PJ_HDR_BYTES)) continue;
+        if (so > UINT32_MAX - 13u ||
+            !pj_aud_live(j, so) || !pj_aud_live(j, so + 13u) ||
+            !pj_aud_live(j, to) || !pj_v12_link_intact(j, so, to))
+            return 0;
+    }
+#else
     /* Preflight every record exactly like pj_v31_unlink_all, before any change. */
     for (i = 0u; i < j->nlinks; ++i) {
         const uint32_t so = lk[2u * i], to = lk[2u * i + 1u];
@@ -10315,10 +11065,15 @@ static B86_PJ_COLD int pj_v99_try_selective(B86Cpu *c, B86Pj *j)
             !pj_aud_live(j, to) || !pj_v12_link_intact(j, so, to))
             return 0;
     }
+#endif
     for (i = 0u; i < j->nlinks; ++i) {
         const uint32_t so = lk[2u * i], to = lk[2u * i + 1u];
         uint8_t *stub;
+#if B86_V101_FAST
+        if (to >= PJ_HDR_BYTES && pj_v101_kept(j, to - PJ_HDR_BYTES)) {
+#else
         if (to >= PJ_HDR_BYTES && pj_v99_block_ok(j, to - PJ_HDR_BYTES)) {
+#endif
             lk[2u * keep] = so; lk[2u * keep + 1u] = to; ++keep; ++pj_v99_n[6];
             continue;
         }
@@ -10336,9 +11091,19 @@ static B86_PJ_COLD int pj_v99_try_selective(B86Cpu *c, B86Pj *j)
     __asm__ volatile("dsb 0xF\n\tisb 0xF" ::: "memory");
 #endif
     j->nlinks = keep;
+#if B86_V104_LINKSKIP
+    pj_v104_cut_pending = 0u;                    /* only kept targets remain in the log */
+v104_tables:                                     /* both dispatch-table passes always run */
+#endif
     pj_v99_filter_table(j, j->tag, j->ent, B86_PJ_HASH);
+#if B86_V101_FAST
+    for (ctx = 0u; ctx < PJ_PM16_CTX; ++ctx)
+        if (pj_pm16_desc(j, ctx)[3])                 /* V101: unused contexts are cleared on allocation */
+            pj_v99_filter_table(j, pj_pm16_tag(j, ctx), pj_pm16_ent(j, ctx), PJ_PM16_ENT);
+#else
     for (ctx = 0u; ctx < PJ_PM16_CTX; ++ctx)
         pj_v99_filter_table(j, pj_pm16_tag(j, ctx), pj_pm16_ent(j, ctx), PJ_PM16_ENT);
+#endif
     return 1;
 }
 #endif
@@ -10371,7 +11136,11 @@ static B86_PJ_COLD void pj_evict_switch(B86Cpu *c, B86Pj *j)
         if (to >= lo && to < hi) {
             uint8_t *stub = j->code + so;
             stub[0] = 0x00u; stub[1] = 0xF0u; stub[2] = 0x00u; stub[3] = 0x90u;
+#if B86_V100_XTIER && !defined(PJ_V100_OLD_EVICT_EXIT)   /* the define: test-only negative control */
+            pj_patch_b(stub, pj_in_hot(j, so) ? j->hsh.exit_s : j->exit_s); stub[3] |= 0x40u;   /* V100: stub's own tier */
+#else
             pj_patch_b(stub, j->exit_s); stub[3] |= 0x40u;              /* BL exit_s again */
+#endif
 #if defined(__linux__)
             __builtin___clear_cache((char *)stub, (char *)stub + 14);
 #endif
@@ -10542,6 +11311,30 @@ static B86_PJ_COLD void pj_hot_reset(B86Cpu *c, B86Pj *j)
     j->promo_at_reset = j->promotions;
     j->nredir = 0u;
     for (k = 0; k < B86_PJ_HASH; ++k) if (j->ent[k] && pj_in_hot(j, j->ent[k] - 1u)) { j->ent[k] = 0u; j->tag[k] = 0u; }
+#if B86_V100_XTIER
+    /* V100: a PSRAM stub linked into the tier (through a PSRAM veneer) must exit
+     * to C again before the tier is reused. Stale records are left alone.
+     * (PJ_V100_NO_RESET_UNLINK: test-only negative control, never in firmware.) */
+#ifndef PJ_V100_NO_RESET_UNLINK
+    for (i = 0; i < j->nlinks; ++i) {
+        const uint32_t so = lk[2u * i], to = lk[2u * i + 1u];
+        if (!pj_in_hot(j, so) && pj_in_hot(j, to) && so <= UINT32_MAX - 13u &&
+            pj_aud_live(j, so) && pj_aud_live(j, so + 13u) && pj_v12_link_intact(j, so, to)) {
+            uint8_t *stub = j->code + so;
+            stub[0] = 0x00u; stub[1] = 0xF0u; stub[2] = 0x00u; stub[3] = 0x90u;
+            pj_patch_b(stub, j->exit_s); stub[3] |= 0x40u;
+#if defined(__linux__)
+            __builtin___clear_cache((char *)stub, (char *)stub + 14);
+#endif
+            ++j->unlinks;
+        }
+    }
+#endif
+#if !defined(__linux__)
+    __asm__ volatile("dsb 0xF\n\tisb 0xF" ::: "memory");
+#endif
+    pj_v100_ps_next = 0u; pj_v100_hot_next = 0u; ++pj_v100_n[4];
+#endif
     for (i = 0; i < j->nlinks; ++i) {
         if (pj_in_hot(j, lk[2u * i]) || pj_in_hot(j, lk[2u * i + 1u])) continue;
         lk[2u * n] = lk[2u * i]; lk[2u * n + 1u] = lk[2u * i + 1u]; ++n;
@@ -10861,6 +11654,9 @@ static B86_PJ_COLD uint32_t b86_pj_translate(B86Cpu *c, uint32_t eip)
         }
         t.e.p = (uint8_t *)aligned;
         memcpy(t.e.p, &p0, 4u); memcpy(t.e.p + 4u, &p1, 4u);
+#if B86_V101_FAST
+        pj_v101_classify(j, start_off, p0, p1);         /* V101: every block, kept or not */
+#endif
 #if B86_V99_SELECTIVE
         if (p0 & PJ_V29_PAGED) {
             pj_v99_note_code(lin0, p0);
@@ -11151,6 +11947,11 @@ static B86_PJ_COLD void b86_pj_link(B86Cpu *c)
     B86Pj *j = b86_pj_state(c);
     uint8_t *stub = (uint8_t *)((c->pj_exit & ~(uintptr_t)1u) - 4u);    /* r71: LR after BL exit_s at +0 */
     const unsigned long gen = j->flushes + j->gen;
+#if B86_V100_XTIER
+    uint8_t *v100_dest;
+    int v100_xt;
+    ++pj_v100_n[2];
+#endif
 #if B86_PJ_V93_PM16_LINK && BB_PJ_PM16_REG_TIER
     /* V93: flat blocks use the flat tables; a 16-bit block (the caller checked
      * that CS is still its context) uses that context's tables and CS base + IP. */
@@ -11218,7 +12019,12 @@ static B86_PJ_COLD void b86_pj_link(B86Cpu *c)
     ent = j->ent[h];
 #endif
     if (!ent || j->flushes + j->gen != gen) return;  /* translation flushed/evicted: stub may be gone */
+#if B86_V100_XTIER
+    /* V100: tiers differ -> branch through a veneer of the stub's own tier */
+    v100_xt = pj_in_hot(j, (uint32_t)(stub - j->code)) != pj_in_hot(j, ent - 1u);
+#else
     if (pj_in_hot(j, (uint32_t)(stub - j->code)) != pj_in_hot(j, ent - 1u)) return;   /* r72: B.W cannot reach */
+#endif
     {   /* r73k: never patch a stub that a redirect trampoline (LDR.W pc,[pc,#0]; .word) overlaps */
         int k;
         for (k = -6; k <= 0; k += 2) {
@@ -11226,18 +12032,39 @@ static B86_PJ_COLD void b86_pj_link(B86Cpu *c)
             if (t >= j->code && t[0] == 0xDFu && t[1] == 0xF8u && t[2] == 0x00u && t[3] == 0xF0u) { ++pj_link_tramp; return; }
         }
     }
+#if B86_V100_XTIER
+    v100_dest = j->code + ent - 1u;
+    if (v100_xt) {
+        v100_dest = pj_v100_veneer(j, pj_in_hot(j, (uint32_t)(stub - j->code)), v100_dest);
+        if (!v100_dest) return;                    /* pool full: refused, as before V100 */
+        ++pj_v100_n[0];
+    }
+#endif
     {
         /* r71: +10: B.W target body first, then +0: BL chk */
         stub[10] = 0x00u; stub[11] = 0xF0u; stub[12] = 0x00u; stub[13] = 0x90u;
+#if B86_V100_XTIER
+        pj_patch_b(stub + 10, v100_dest);
+#else
         pj_patch_b(stub + 10, j->code + ent - 1u);
+#endif
         stub[0] = 0x00u; stub[1] = 0xF0u; stub[2] = 0x00u; stub[3] = 0x90u;
         pj_patch_b(stub, pj_in_hot(j, (uint32_t)(stub - j->code)) ? j->hsh.chk : j->chk); stub[3] |= 0x40u;   /* B.W -> BL; r72: the stub's own region */
         ++j->links;
+#if B86_V100_XTIER
+        ++pj_v100_n[3];
+#endif
         { uint32_t *lk = pj_links(j); const uint32_t so = (uint32_t)(stub - j->code); lk[2u * j->nlinks] = so; lk[2u * j->nlinks + 1u] = ent - 1u;
 #if B86_PJ_V30J_LINK_FILTER
           pj_v30j_mark_link(so); /* before record becomes visible */
 #endif
+#if B86_V104_LINKSKIP
+          ++j->nlinks;
+          if (!pj_v104_cut_pending) pj_v104_note_link(j, ent - 1u);
+        }
+#else
           ++j->nlinks; }
+#endif
 #if defined(__linux__)
         __builtin___clear_cache((char *)stub, (char *)stub + 14);
 #else
@@ -11741,7 +12568,14 @@ static B86_PM_HOT unsigned b86_pj_try(B86Cpu *c)
             }
         }
 #endif /* B86_PJ_V30K_XIP_SPLIT: pre-entry hardware reads */
+#if B86_V100_SMC_EXIT
+        pj_v100_in_native = 1u;
+#endif
         n = ((unsigned (*)(B86Cpu *, uintptr_t))(void *)(uintptr_t)((uintptr_t)(hot ? j->hsh.entry : j->entry) | 1u))(c, (uintptr_t)(j->code + ent - 1u) | 1u);
+#if B86_V100_SMC_EXIT
+        pj_v100_in_native = 0u;
+        if (pj_v100_ndefer) pj_v100_apply_deferred(j);
+#endif
 #if B86_PJ_V91_PM16
         if (v91 && j->pm16_active) {
             ++pj_v91_n[PJ_V91_RUN]; pj_v91_n[PJ_V91_RETIRED] += n; ++pj_v91_len[pj_v91_bucket(n)];
@@ -11903,6 +12737,17 @@ int b86_pj_attach(B86Cpu *c, void *state, size_t state_bytes, void *code, size_t
     memset(j, 0, sizeof *j);
 #if B86_V99_SELECTIVE
     if (!pj_v99) pj_v99 = (PjV99 *)B86_CALLOC(1u, sizeof(PjV99));   /* metadata pool, once */
+#if B86_V103_STATS
+    if (!pj_v103s) pj_v103s = (PjV103 *)B86_CALLOC(1u, sizeof(PjV103));   /* V103: metadata pool, once */
+#endif
+#if B86_V101_FAST
+    if (pj_v99 && !pj_v99->cls_ps) {             /* V101: 1 MiB per bitmap (4 KiB each) */
+        pj_v99->cls_ps = (uint32_t *)B86_CALLOC(1024u, sizeof(uint32_t));
+        pj_v99->cls_hot = (uint32_t *)B86_CALLOC(1024u, sizeof(uint32_t));
+        pj_v99->cls_ps_bits = pj_v99->cls_ps ? 32768u : 0u;
+        pj_v99->cls_hot_bits = pj_v99->cls_hot ? 32768u : 0u;
+    }
+#endif
     pj_v99_reset();
     b86_v99_ext_dirty = 1u;
 #endif
@@ -12245,6 +13090,47 @@ void b86_pj_mem_profile(const B86Cpu *c, unsigned long out[8])
 #if B86_PJ_V89_MTF || B86_PJ_V89_LINEFILTER
     printf("[bb386-v89] mtf-moves=%lu store-skips=%lu store-walks=%lu line-marks=%lu mtf=%d linefilter=%d\n",
            pj_v89_n[0], pj_v89_n[1], pj_v89_n[2], pj_v89_n[3], B86_PJ_V89_MTF, B86_PJ_V89_LINEFILTER);
+#endif
+#if B86_V104_LINKSKIP
+    printf("[bb386-v104] link-passes=%lu skipped=%lu skipcheck-missed=%lu\n", pj_v104_n[0], pj_v104_n[1], pj_v104_n[2]);
+#endif
+#if B86_V103_STATS
+    if (pj_v103s) {
+        unsigned q;
+        const uint32_t *V3 = pj_v103s->n;
+        printf("[bb386-v103] mat-sites");
+        for (q = 1u; q < 13u; ++q) printf("%c%lu", q == 1u ? '=' : ',', (unsigned long)pj_v103s->site[q]);
+        printf(" overlay=%lu mat-kinds", (unsigned long)V3[12]);
+        for (q = 0u; q < (unsigned)LZ_COUNT; ++q) if (pj_v103s->kind[q]) printf(" %u:%lu", q, (unsigned long)pj_v103s->kind[q]);
+        printf("\n[bb386-v103] mem lean-uncounted=%lu slow=%lu walks=%lu cross=%lu bounds=%lu writes=%lu code-writes=%lu from-psram=%lu from-hot=%lu"
+               " str bulk-runs=%lu bulk-el=%lu per-el=%lu desc=%lu desc-fast=%lu\n",
+               (unsigned long)V3[0], (unsigned long)V3[1], (unsigned long)V3[2], (unsigned long)V3[3],
+               (unsigned long)V3[4], (unsigned long)V3[5], (unsigned long)V3[6], (unsigned long)V3[7],
+               (unsigned long)V3[8], (unsigned long)V3[9], (unsigned long)V3[10], (unsigned long)V3[11],
+#if B86_V103_DESC8
+               (unsigned long)(b86_v103_desc[0] + b86_v103_desc[1]), (unsigned long)b86_v103_desc[1]);
+#else
+               0ul, 0ul);
+#endif
+    }
+#endif
+#if B86_V102_KILLFAST || B86_V102_POOL_RESTART
+    printf("[bb386-v102] targeted-kills=%lu killcheck-missed=%lu pool-restarts=%lu restart-unlinks=%lu\n",
+           pj_v102_n[0], pj_v102_n[1], pj_v102_n[2], pj_v102_n[3]);
+#endif
+#if B86_V101_FAST
+    printf("[bb386-v101] veneers-reused=%lu class-bits=%lu masked-pte-compares=%lu crosscheck live-disagree=%lu dead-kept=%lu\n",
+           pj_v101_n[0], pj_v101_n[3], pj_v101_n[4], pj_v101_n[1], pj_v101_n[2]);
+#endif
+#if B86_V100_XTIER || B86_V100_SMC_EXIT
+    printf("[bb386-v100] links: calls=%lu made=%lu cross-tier=%lu pool-full=%lu pool-restarts=%lu veneers ps=%lu/%lu hot=%lu/%lu | smc-exits=%lu\n",
+           pj_v100_n[2], pj_v100_n[3], pj_v100_n[0], pj_v100_n[1], pj_v100_n[4],
+#if B86_V100_XTIER
+           (unsigned long)pj_v100_ps_next, (unsigned long)pj_v100_ps_n, (unsigned long)pj_v100_hot_next, (unsigned long)pj_v100_hot_n,
+#else
+           0ul, 0ul, 0ul, 0ul,
+#endif
+           pj_v100_n[5]);
 #endif
 #if B86_V99_SELECTIVE
     if (!pj_v99) printf("[bb386-v99] unavailable (no metadata memory): every epoch is full\n");
