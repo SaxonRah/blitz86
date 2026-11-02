@@ -3894,7 +3894,9 @@ B86_HOT J *b86_jit_create(B86Cpu *c, void *code, size_t size)
    that translated code reads on every indirect jump and every store: the
    fast lookup table and the SMC line map. Everything else is touched only
    by the dispatcher and may live in slow memory (PSRAM). */
-B86_HOT J *b86_jit_create_ex(B86Cpu *c, void *code, size_t size, void *hot, size_t hot_size)
+/* SRAM_ROOM_V1: runs once at start-up - kept in flash so its 908 bytes of SRAM
+   leave room in .data before the 4 KiB-aligned .bss (heap). */
+J *b86_jit_create_ex(B86Cpu *c, void *code, size_t size, void *hot, size_t hot_size)
 {
     /* the SMC line map is indexed by host address >> 6: guest memory must be
        64-byte aligned or stores near line edges would be checked on the
