@@ -10745,6 +10745,15 @@ static int pj_aud_dup(const uint32_t *rd, uint32_t n, uint32_t i)   /* r73j: ano
     for (k = 0; k < n; ++k) if (k != i && rd[4u * k] == rd[4u * i]) return (int)k + 1;
     return 0;
 }
+/* BB86_NOAUDIT_V1: the r73h link audit after every eviction and hot-tier reset
+ * predates V100's cross-tier veneers and reports each veneer link as "bad"
+ * (false positives: total-bad grows steadily in runs that play correctly).
+ * It is read-only, cost ~1% of play time and printed ~80% of the console
+ * output during play. B86_PJ_AUDIT=1 restores it unchanged. */
+#ifndef B86_PJ_AUDIT
+#define B86_PJ_AUDIT 0
+#endif
+#if B86_PJ_AUDIT
 static B86_PJ_COLD void pj_audit(B86Pj *j, const char *where)
 {
     uint32_t i, k, *lk = pj_links(j);
@@ -10815,6 +10824,7 @@ static B86_PJ_COLD void pj_audit(B86Pj *j, const char *where)
            j->cur_half, (unsigned long)j->used, (unsigned long)j->half_fill[0], (unsigned long)j->half_fill[1],
            (unsigned long)j->hot_start, (unsigned long)j->hot_used);
 }
+#endif
 /* V12: eviction must not write through a stale link-log entry.
  * Validate BOTH Thumb branch shapes and the exact recorded target. This
  * check and its counter run on the cold eviction path, not in native code. */
@@ -11213,7 +11223,9 @@ static B86_PJ_COLD void pj_evict_switch(B86Cpu *c, B86Pj *j)
         v30d_last_sample_declines = j->declines;
     }
 #endif
+#if B86_PJ_AUDIT
     pj_audit(j, "evict");
+#endif
 }
 static B86_PJ_COLD uint32_t b86_pj_translate(B86Cpu *c, uint32_t eip);
 /* V13: cold hot-reset link log cleanup. The V12 eviction guard protects
@@ -11365,7 +11377,9 @@ static B86_PJ_COLD void pj_hot_reset(B86Cpu *c, B86Pj *j)
 #if B86_PJ_V84_HOT_PRECHECK
     printf("[bb386-v84-hot] precheck-skipped=%lu (SRAM copies not built for redirects that would be refused)\n", pj_v84_skipped);
 #endif
+#if B86_PJ_AUDIT
     pj_audit(j, "hotreset");
+#endif
 }
 /* r72: translate eip into the SRAM tier; returns its entry (0 = refused) */
 static B86_PJ_COLD uint32_t pj_hot_translate(B86Cpu *c, B86Pj *j, uint32_t eip)

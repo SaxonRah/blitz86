@@ -185,7 +185,7 @@ static void b86_v48_record(uint32_t key, uint64_t delta) {
     if (delta > s->max_us) s->max_us = (uint32_t)(delta > UINT32_MAX ? UINT32_MAX : delta);
 }
 #endif
-B86_HOT void b86_jit_hot_report(struct B86Jit *j) {
+/* SRAM_ROOM_V2: cold - kept in flash */ void b86_jit_hot_report(struct B86Jit *j) {
 #ifdef B86_NOW
     (void)j;
     if (!b86_v48_samples) return;
@@ -3047,7 +3047,7 @@ void b86_jit_reuse_diag(uint32_t *evicted, uint32_t *retranslated,
 
 /* Reclaim the code of every block that starts in [lo, hi). Returns the end
    of the reclaimed space (a block may run past hi). */
-B86_HOT static uint8_t *evict_range(J *j, uint8_t *lo, uint8_t *hi)
+/* SRAM_ROOM_V2: cold - kept in flash */ static uint8_t *evict_range(J *j, uint8_t *lo, uint8_t *hi)
 {
     uint8_t *top = hi;
 #if B86_DEADSTUB_EAGER_UNCHAIN
@@ -3985,7 +3985,7 @@ J *b86_jit_create_ex(B86Cpu *c, void *code, size_t size, void *hot, size_t hot_s
     return j;
 }
 
-B86_HOT void b86_jit_destroy(J *j)
+/* SRAM_ROOM_V2: cold - kept in flash */ void b86_jit_destroy(J *j)
 {
     if (!j) return;
     if (j->cpu) { j->cpu->jit = NULL; j->cpu->codemap = NULL; j->cpu->smc_hook = NULL; }
