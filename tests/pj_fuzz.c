@@ -220,6 +220,41 @@ static void pm16(B86Cpu *c, uint8_t *M)
     seg16(c, 5, 0x18, 0x30000, 0xFFFF, 0x93);   /* GS */
 }
 static const unsigned sels[4] = { 0x10, 0x18, 0x20, 0x00 };
+/* V113 harness (mode 40): flat 32-bit code that loads FS/GS/SS from a GDT at
+ * 0x500: 08 code flat; 10, 18 data flat; 20 data base 0x24000 limit 0x7FFF;
+ * 28 read-only data flat (valid for FS/GS, not SS); 30 readable code flat
+ * (valid for FS/GS, not SS); 13 = 10 with RPL 3; 40 beyond the GDT limit. */
+static void v113_gdt(B86Cpu *c, uint8_t *M)
+{
+    memset(M + 0x500, 0, 0x40);
+    gdt_put(M, 0x08, 0, 0xFFFFF, 0x9B, 0xC);
+    gdt_put(M, 0x10, 0, 0xFFFFF, 0x93, 0xC);
+    gdt_put(M, 0x18, 0, 0xFFFFF, 0x93, 0xC);
+    gdt_put(M, 0x20, 0x24000, 0x7FFF, 0x93, 0x4);
+    gdt_put(M, 0x28, 0, 0xFFFFF, 0x91, 0xC);
+    gdt_put(M, 0x30, 0, 0xFFFFF, 0x9B, 0xC);
+    c->gdt_base = 0x500; c->gdt_limit = 0x37;
+    c->seg386[0] = c->seg386[1] = 0x10;
+}
+static void gen40(int last)
+{
+    static const unsigned s40[8] = { 0x00, 0x10, 0x18, 0x20, 0x28, 0x30, 0x40, 0x13 };
+    const unsigned sel = s40[rnd() % 8];
+    if (last) { gen_one(1); return; }
+    switch (rnd() % 7) {
+    case 0: b(0x0F); b(rnd() % 2 ? 0xA0 : 0xA8); break;                                   /* PUSH FS/GS */
+    case 1: b(0x6A); b(sel); b(0x0F); b(rnd() % 2 ? 0xA1 : 0xA9); break;                  /* PUSH sel; POP FS/GS */
+    case 2: { static const unsigned op2s[3] = { 0xB2, 0xB4, 0xB5 };                       /* LSS/LFS/LGS r32,[abs32] */
+        const unsigned op2 = op2s[rnd() % 3], at = 0x30000 + (rnd() & 0xFF8u);
+        const unsigned reg = op2 == 0xB2 ? 4u : (unsigned[]){ 0, 1, 2, 3, 5, 6, 7 }[rnd() % 7];
+        const uint32_t off = op2 == 0xB2 ? 0x7400u + (rnd() & 0x7FCu) : rnd();
+        b(0xC7); b(0x05); d32(at); d32(off);                                              /* MOV [at], off */
+        b(0x66); b(0xC7); b(0x05); d32(at + 4); b(sel); b(0);                             /* MOV word [at+4], sel */
+        b(0x0F); b(op2); b(0x05 | (reg << 3)); d32(at); break; }
+    case 3: b(0x66); b(0xB8); b(sel); b(0); b(0x8E); b(rnd() % 2 ? 0xE0 : 0xE8); break;   /* MOV AX,sel; MOV FS/GS,AX */
+    default: gen_one(0); break;
+    }
+}
 static void gen_pm16(int last)
 {
     if (last) {
@@ -646,6 +681,7 @@ int main(int argc, char **argv)
         memset(&C, 0, sizeof C);
         b86_init(&C, M); C.model = B86_CPU_386; C.msw = 1;
         if (gen_mode >= 10 && gen_mode < 17) { pm16(&C, M); g_csbase = 0x10000; } else { flat(&C); g_csbase = 0; }
+        if (gen_mode == 40) v113_gdt(&C, M);
         if (!b86_pj_attach(&C, st, b86_pj_state_bytes(), code, code_bytes)) {   /* V99 */
             printf("b86_pj_attach refused a %lu-byte code buffer (smaller than its tail + 16 KiB)\n", (unsigned long)code_bytes);
             return 2;
@@ -823,6 +859,7 @@ int main(int argc, char **argv)
         unsigned n = 1 + rnd() % 12;
         for (unsigned i = 0; i < n; ++i) { int last = i == n - 1 && rnd() % 2;
             if (gen_mode == 12) gen_pm16(last);
+            else if (gen_mode == 40) gen40(last);
             else if (gen_mode % 10 == 1 || (gen_mode % 10 == 2 && rnd() % 2)) gen_new(last); else gen_one(last); }
         C.ip = 0x1000; C.r[0] = rnd(); C.r[1] = rnd(); C.r[2] = rnd(); C.r[4] = 0x8000;
         C.r[3] = 0x20000 + (rnd() & 0xFFF); C.r[5] = 0x22000 + (rnd() & 0xFFF); C.r[6] = 0x24000 + (rnd() & 0xFFF); C.r[7] = 0x26000 + (rnd() & 0xFFF);
@@ -943,6 +980,9 @@ int main(int argc, char **argv)
         printf("v83 translations: o32-alu=%lu o32-adc-sbb=%lu o32-incdec=%lu o32-grp3=%lu o32-shift=%lu o32-mov=%lu rotate1=%lu xchg=%lu\n",
                pj_v83_n[0], pj_v83_n[1], pj_v83_n[2], pj_v83_n[3], pj_v83_n[4], pj_v83_n[5], pj_v83_n[6], pj_v83_n[7]);
 #endif
+    #if B86_PJ_V113_SEGLOAD
+    if (gen_mode == 40) printf("v113: translated push=%lu pop=%lu lss=%lu lfs=%lu lgs=%lu mov-fs/gs=%lu; lxs ok=%lu refused=%lu\n", pj_v113_n[0], pj_v113_n[1], pj_v113_n[2], pj_v113_n[3], pj_v113_n[4], pj_v113_n[5], pj_v113_n[6], pj_v113_n[7]);
+    #endif
     printf("fuzz: %u sequences, %u native instructions, %u interpreter-refused, %u partial-rep, %u mismatches\n", iters, nat, skipped, partial, bad);
     if (iters != 0 && nat == 0) { fprintf(stderr, "FAIL: zero native PJ coverage for seed=%u mode=%d\n", initial_seed, gen_mode); return 2; }
     return bad != 0;

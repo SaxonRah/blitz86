@@ -2241,6 +2241,34 @@ static B86_PM_HOT uint32_t b86_pj_loadseg(B86Cpu *c, uint32_t seg, uint32_t sel)
     if (!p40_plan(c, seg, (uint16_t)sel, &plan)) return 0u;
     return b86_pm2_commit_segment(c, &plan, 0u) == B86_PM2_OK;
 }
+#ifndef B86_PJ_V113_SEGLOAD
+#define B86_PJ_V113_SEGLOAD 1
+#endif
+#if B86_PJ_V113_SEGLOAD
+/* V113: segment-register family in flat 32-bit code (interrupt stubs and
+ * sound-driver prologues: PUSH/POP FS/GS, LSS/LFS/LGS, MOV FS/GS,r16).
+ * [0..5] translations: push, pop, lss, lfs, lgs, mov-fs/gs; [6] LxS helper
+ * successes, [7] LxS helper refusals (interpreter takes the instruction). */
+static unsigned long pj_v113_n[8];
+/* LSS/LFS/LGS r32, m16:32 exactly as the interpreter (pm40 LFS/LGS): offset
+ * at ea, selector at ea+4, both checked reads; plan, then commit; nothing is
+ * written before the segment load succeeds. The generated code owns the guest
+ * registers, so the offset is RETURNED (r0) with success in r1, never stored
+ * into c->r[]. Flat 32-bit contract: DS-relative, no prefixes. */
+static B86_PM_HOT uint64_t b86_pj_lxs(B86Cpu *c, uint32_t ea, uint32_t seg)
+{
+    B86PM2Plan plan;
+    uint8_t *p, *ps;
+    uint32_t lin, ls, v;
+    if (!(p = p40_ptr(c, B86_DS, ea, 4u, 0, &lin)) ||
+        !(ps = p40_ptr(c, B86_DS, ea + 4u, 2u, 0, &ls)) ||
+        !p40_plan(c, seg, (uint16_t)p40_ld(ps, 2u), &plan)) { ++pj_v113_n[7]; return 0u; }
+    v = p40_ld(p, 4u);
+    if (b86_pm2_commit_segment(c, &plan, 0u) != B86_PM2_OK) { ++pj_v113_n[7]; return 0u; }
+    ++pj_v113_n[6];
+    return (uint64_t)v | ((uint64_t)1u << 32);
+}
+#endif
 /* x86 condition cc from the interpreter state (materializes lazy flags) */
 static B86_PM_HOT uint32_t b86_pj_cond(B86Cpu *c, uint32_t cc)
 {
@@ -4565,7 +4593,14 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
      * stay on the interpreter path until separately validated. */
     case 0x8E:
         if (np != 1u || !pjt_modrm(t, &m) || m.mod != 3u ||
-            (m.reg != B86_DS && m.reg != B86_ES)) PJ_FAIL();
+            (m.reg != B86_DS && m.reg != B86_ES
+#if B86_PJ_V113_SEGLOAD
+             && m.reg != B86_FS && m.reg != B86_GS          /* V113 */
+#endif
+            )) PJ_FAIL();
+#if B86_PJ_V113_SEGLOAD
+        if (m.reg == B86_FS || m.reg == B86_GS) ++pj_v113_n[5];
+#endif
         pjt_getr(t, R2, m.rm, 2u);
         pjt_c(t);
         pj_mov(&t->e, R0, CREG);
@@ -5827,6 +5862,52 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
         PJ_FAIL(); }
     case 0x0F:
         if (!pjt_u8(t, &op2)) PJ_FAIL();
+#if B86_PJ_V113_SEGLOAD
+        /* V113: PUSH/POP FS/GS and LSS/LFS/LGS r32,m16:32, unprefixed flat
+         * 32-bit forms. Segment loads use the interpreter's planner/commit:
+         * a refusal (fault, CPL != 0, bad descriptor, unreadable pointer)
+         * exits BEFORE the instruction so the interpreter raises it with
+         * nothing committed; success exits AFTER it - the segment changed, so
+         * C re-checks flatness (exactly as POP DS/ES and MOV DS/ES do). */
+        if (np == 1u && (op2 == 0xA0u || op2 == 0xA8u)) {           /* PUSH FS/GS, zero-extended */
+            ++pj_v113_n[0];
+            pj_dpi(&t->e, 13u, 0, R1, GR(4), 4u);
+            pjt_mem(t, 4u, 1);
+            pjt_c(t);
+            pj_ldst(&t->e, PJ_LDRH, R1, CREG, (unsigned)offsetof(B86Cpu, seg386) + 2u * (op2 == 0xA0u ? 0u : 1u));
+            pj_ldst(&t->e, PJ_STR, R1, R0, 0u);
+            pj_dpi(&t->e, 13u, 0, GR(4), GR(4), 4u);
+            return 1;
+        }
+        if (np == 1u && (op2 == 0xA1u || op2 == 0xA9u)) {           /* POP FS/GS */
+            ++pj_v113_n[1];
+            pj_mov(&t->e, R1, GR(4));
+            pjt_mem(t, 4u, 0);
+            pj_ldst(&t->e, PJ_LDRH, R2, R0, 0u);
+            pjt_c(t);
+            pj_mov(&t->e, R0, CREG);
+            pj_movw(&t->e, R1, op2 == 0xA1u ? B86_FS : B86_GS);
+            pjt_call(t, (const void *)b86_pj_loadseg);
+            pj_dpi(&t->e, 13u, 1, PC, R0, 0u);
+            pjt_exit_stay(t, 0 /* EQ */, t->ip0, t->ninsn - 1u);
+            pj_dpi(&t->e, 8u, 0, GR(4), GR(4), 4u);
+            pjt_exit(t, PJ_NEXT(), t->ninsn, 2);
+            return 2;
+        }
+        if (np == 1u && (op2 == 0xB2u || op2 == 0xB4u || op2 == 0xB5u)) {   /* LSS/LFS/LGS r32, m16:32 */
+            if (!pjt_modrm(t, &m) || m.mod == 3u) PJ_FAIL();
+            ++pj_v113_n[op2 == 0xB2u ? 2u : op2 == 0xB4u ? 3u : 4u];
+            pjt_c(t);                                    /* r1 = effective address */
+            pj_mov(&t->e, R0, CREG);
+            pj_movw(&t->e, R2, op2 == 0xB2u ? B86_SS : op2 == 0xB4u ? B86_FS : B86_GS);
+            pjt_call(t, (const void *)b86_pj_lxs);       /* r0 = offset, r1 = ok */
+            pj_dpi(&t->e, 13u, 1, PC, R1, 0u);
+            pjt_exit_stay(t, 0 /* EQ */, t->ip0, t->ninsn - 1u);
+            pjt_putr(t, m.reg, 4u, R0);
+            pjt_exit(t, PJ_NEXT(), t->ninsn, 2);
+            return 2;
+        }
+#endif
 #if B86_PJ_V67_NATIVE_BITSCAN
         /* V67: BSF/BSR on r/m16 or r/m32, register or checked-memory
          * source. Only the default flat 32-bit addressing contract and
@@ -12123,6 +12204,24 @@ static void bb5i_capture_hot_opcodes(B86Cpu *c)
 static struct Bb5HHot { uint32_t eip, base, mode, count, misses; } bb5h_hot[BB5H_SLOTS];
 static uint32_t bb5h_try_clock, bb5h_miss_clock;
 static unsigned long bb5h_try_samples, bb5h_miss_samples, bb5h_last_block_report;
+/* BB5H_SEG_V1: CS/DS/SS/ES state per hot entry (selector | access<<16 | flags<<24,
+ * base, limit), refreshed at every sampled entry; 32 x 40 bytes from the PSRAM
+ * pool on first use (only the pointer is in SRAM). Diagnostic only. */
+static uint32_t (*bb5h_seg)[10];
+static void bb5h_seg_capture(const B86Cpu *c, unsigned i)
+{
+    const B86PM1Cache *s = c->pm386.seg;
+    uint32_t *d;
+    if (!bb5h_seg) bb5h_seg = (uint32_t (*)[10])B86_CALLOC(BB5H_SLOTS, sizeof *bb5h_seg);
+    if (!bb5h_seg) return;
+    d = bb5h_seg[i];
+#define BB5H_PACK(x) ((uint32_t)(x).selector | ((uint32_t)(x).access << 16) | ((uint32_t)(x).flags << 24))
+    d[0] = BB5H_PACK(s[B86_CS]); d[1] = s[B86_CS].limit;
+    d[2] = BB5H_PACK(s[B86_DS]); d[3] = s[B86_DS].base; d[4] = s[B86_DS].limit;
+    d[5] = BB5H_PACK(s[B86_SS]); d[6] = s[B86_SS].base; d[7] = s[B86_SS].limit;
+    d[8] = BB5H_PACK(s[B86_ES]); d[9] = s[B86_ES].base;
+#undef BB5H_PACK
+}
 static void bb5h_note(const B86Cpu *c, uint32_t mode, unsigned miss)
 {
     unsigned i, free_slot = BB5H_SLOTS, min_slot = 0u;
@@ -12132,6 +12231,7 @@ static void bb5h_note(const B86Cpu *c, uint32_t mode, unsigned miss)
             bb5h_hot[i].base == base && bb5h_hot[i].mode == mode) {
             ++bb5h_hot[i].count;
             bb5h_hot[i].misses += (uint32_t)!!miss;
+            bb5h_seg_capture(c, i);                      /* BB5H_SEG_V1 */
             return;
         }
         if (!bb5h_hot[i].count && free_slot == BB5H_SLOTS) free_slot = i;
@@ -12145,6 +12245,7 @@ static void bb5h_note(const B86Cpu *c, uint32_t mode, unsigned miss)
       bb5h_hot[i].count = prior + 1u;
       bb5h_hot[i].misses = (uint32_t)!!miss;
     }
+    bb5h_seg_capture(c, i);                              /* BB5H_SEG_V1 */
 }
 static void bb5h_dump(void)
 {
@@ -12166,6 +12267,15 @@ static void bb5h_dump(void)
                (unsigned long)(bb5h_hot[best].base+bb5h_hot[best].eip),
                (unsigned long)bb5h_hot[best].count,
                (unsigned long)bb5h_hot[best].misses);
+        if (bb5h_seg) {                                  /* BB5H_SEG_V1 */
+            const uint32_t *d = bb5h_seg[best];
+            printf("[bb5h-seg] rank=%u cs=%04lX acc=%02lX fl=%lX lim=%08lX | ds=%04lX acc=%02lX fl=%lX base=%08lX lim=%08lX | "
+                   "ss=%04lX acc=%02lX fl=%lX base=%08lX lim=%08lX | es=%04lX base=%08lX\n", r + 1u,
+                   (unsigned long)(d[0] & 0xFFFFu), (unsigned long)((d[0] >> 16) & 0xFFu), (unsigned long)(d[0] >> 24), (unsigned long)d[1],
+                   (unsigned long)(d[2] & 0xFFFFu), (unsigned long)((d[2] >> 16) & 0xFFu), (unsigned long)(d[2] >> 24), (unsigned long)d[3], (unsigned long)d[4],
+                   (unsigned long)(d[5] & 0xFFFFu), (unsigned long)((d[5] >> 16) & 0xFFu), (unsigned long)(d[5] >> 24), (unsigned long)d[6], (unsigned long)d[7],
+                   (unsigned long)(d[8] & 0xFFFFu), (unsigned long)d[9]);
+        }
     }
 }
 /* BB_STAGE5H_DISPATCH_PROFILE_END */
@@ -13332,6 +13442,10 @@ void b86_pj_mem_profile(const B86Cpu *c, unsigned long out[8])
            (unsigned long)bb_pm16_diag.v11_66_push,
            (unsigned long)bb_pm16_diag.v11_66_pop,
            (unsigned long)bb_pm16_diag.v11_66_stack_other);
+#endif
+#if B86_PJ_V113_SEGLOAD
+    printf("[bb386-v113-seg] translated push-fs/gs=%lu pop-fs/gs=%lu lss=%lu lfs=%lu lgs=%lu mov-fs/gs=%lu; lxs helper ok=%lu refused=%lu\n",
+           pj_v113_n[0], pj_v113_n[1], pj_v113_n[2], pj_v113_n[3], pj_v113_n[4], pj_v113_n[5], pj_v113_n[6], pj_v113_n[7]);
 #endif
     /* Translation-stop histogram only.  The existing blitzBUS [bb386-0f]
      * c-executed counter is a DIFFERENT metric and is not mode-separated. */
