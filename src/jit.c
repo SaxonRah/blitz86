@@ -2878,7 +2878,7 @@ B86_HOT void b86_jit_flush(J *j)
 #if B86_DEADSTUB_EAGER_UNCHAIN
 static void bb_deadstub_unlink(J *j, uint8_t *target);
 #endif
-B86_HOT static void kill_block(J *j, uint32_t idx)
+/* SRAM_ROOM_V3: real-mode JIT, cold in protected-mode play - kept in flash */ static void kill_block(J *j, uint32_t idx)
 {
     Block *b = &j->blk[idx];
     if (b->dead) return;
@@ -3628,7 +3628,7 @@ B86_HOT static int rep_paged(B86Cpu *c, uint8_t *dst, uint8_t *src, uint32_t spa
 }
 #endif
 
-B86_HOT uint32_t MPF(b86h_rep)(B86Cpu *c, uint32_t ip_next, uint32_t blk)
+/* SRAM_ROOM_V3: kept in flash */ uint32_t MPF(b86h_rep)(B86Cpu *c, uint32_t ip_next, uint32_t blk)
 {
     J *j = c->jit;
     j->st.rt_rep++;
@@ -4483,7 +4483,7 @@ B86_HOT static int cold_run(J *j, B86Cpu *c, uint32_t key, int force)
 { MpMark k = mp_begin(); int r = cold_run_impl(j, c, key, force); MP_END(j, k, 0); return r; }
 B86_HOT uint32_t b86h_step(B86Cpu *c, uint32_t ip_next, uint32_t blk)
 { MpMark k = mp_begin(); uint32_t r = b86h_step_impl(c, ip_next, blk); MP_END(c->jit, k, 1); return r; }
-B86_HOT uint32_t b86h_rep(B86Cpu *c, uint32_t ip_next, uint32_t blk)
+/* SRAM_ROOM_V3: real-mode JIT, cold in protected-mode play - kept in flash */ uint32_t b86h_rep(B86Cpu *c, uint32_t ip_next, uint32_t blk)
 { MpMark k = mp_begin(); uint32_t r = b86h_rep_impl(c, ip_next, blk); MP_END(c->jit, k, 2); return r; }
 B86_HOT uint32_t b86h_cond(B86Cpu *c, uint32_t cc)
 { MpMark k = mp_begin(); uint32_t r = b86h_cond_impl(c, cc); MP_END(c->jit, k, 3); return r; }

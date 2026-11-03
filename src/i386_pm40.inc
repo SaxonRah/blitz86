@@ -304,7 +304,7 @@ static int p40_plan(const B86Cpu *c, unsigned s, uint16_t sel, B86PM2Plan *plan)
 #endif
 {
     B86PM2Fault fault;
-    if (c->seg[B86_CS] & 3u) return 0;
+    if B86_CPLX(c) return 0;
     return b86_pm2_plan_segment(c, s, sel, 0u, 0u, plan, &fault) == B86_PM2_OK;
 }
 #ifdef B86_PM40_STATS
@@ -561,7 +561,7 @@ static B86_PM40_FLASH int b86_pm40_step(B86Cpu *c)
 #ifdef B86_PM40_VERIFY
         NO();                                    /* port side effects cannot be replayed */
 #endif
-        if ((c->seg[B86_CS] & 3u) > ((c->flags >> 12) & 3u)) NO();
+        if (B86_CPLX(c) > ((c->flags >> 12) & 3u)) NO();
         if (op <= 0xE6u) { if (!p40_u8(&d, &imm)) NO(); port = imm; }
         else port = c->r[B86_DX] & 0xFFFFu;
         if (op == 0xE4u || op == 0xECu) {
@@ -658,7 +658,7 @@ static B86_PM40_FLASH int b86_pm40_step(B86Cpu *c)
         NO(); }
     case 0x06: case 0x0E: case 0x16: case 0x1E: {     /* PUSH Sreg (zero-extended) */
         uint8_t *p;
-        if (c->seg[B86_CS] & 3u) NO();
+        if B86_CPLX(c) NO();
         if (!(p = p40_push_ptr(c, w, &nsp, &lin))) NO();
         p40_st(c, p, lin, p40_sel(c, op == 0x06u ? B86_ES : op == 0x0Eu ? B86_CS : op == 0x16u ? B86_SS : B86_DS), w);
         c->r[B86_SP] = nsp;
@@ -759,7 +759,7 @@ static B86_PM40_FLASH int b86_pm40_step(B86Cpu *c)
         if (take) { if (v > cs->limit) NO(); JUMP(v); }
         DONE(); }
     case 0xFA: case 0xFB:                             /* CLI / STI (CPL <= IOPL) */
-        if ((c->seg[B86_CS] & 3u) > ((c->flags >> 12) & 3u)) NO();
+        if (B86_CPLX(c) > ((c->flags >> 12) & 3u)) NO();
         if (op == 0xFAu) c->flags &= ~(uint32_t)B86_IF; else c->flags |= B86_IF;
         DONE();
     case 0x0F: break;
@@ -801,7 +801,7 @@ static B86_PM40_FLASH int b86_pm40_step(B86Cpu *c)
     switch (op) {
     case 0xA0: case 0xA8: {                            /* PUSH FS/GS */
         uint8_t *p;
-        if (c->seg[B86_CS] & 3u) NO();
+        if B86_CPLX(c) NO();
         if (!(p = p40_push_ptr(c, w, &nsp, &lin))) NO();
         p40_st(c, p, lin, p40_sel(c, op == 0xA0u ? B86_FS : B86_GS), w);
         c->r[B86_SP] = nsp;

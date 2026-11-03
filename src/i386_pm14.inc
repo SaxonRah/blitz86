@@ -24,7 +24,7 @@ B86_PM14_FLASH int b86_pm14_step(B86Cpu *c)
     if(!c || !c->mem || c->model!=B86_CPU_386 || !(c->msw&1u) ||
        c->shutdown386 || c->pm386.seg[B86_CS].reserved==B86_PM3_TRANSITION_MARKER ||
        !c->pm386.seg[B86_CS].valid || !(c->pm386.seg[B86_CS].access&8u) ||
-       (c->seg[B86_CS]&3u) || !(c->pm386.seg[B86_CS].flags&4u) ||
+       B86_CPLX(c) || !(c->pm386.seg[B86_CS].flags&4u) ||
        c->ip>UINT32_MAX-15u || c->lz_kind!=LZ_NONE || c->lz_ikind!=LZ_NONE ||
        (c->flags&0x20000u))
         return b86_pm13_step(c);

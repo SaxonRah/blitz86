@@ -129,7 +129,7 @@ static B86_PM26_FLASH int b86_pm26_step(B86Cpu *c)
     if(!c||!c->mem||c->model!=B86_CPU_386||!(c->msw&1u)||
        c->shutdown386||c->pm386.seg[B86_CS].reserved==B86_PM3_TRANSITION_MARKER||
        !c->pm386.seg[B86_CS].valid||!(c->pm386.seg[B86_CS].access&8u)||
-       (c->seg[B86_CS]&3u)||c->ip>UINT32_MAX-15u||
+       B86_CPLX(c)||c->ip>UINT32_MAX-15u||
        c->lz_kind!=LZ_NONE||c->lz_ikind!=LZ_NONE||
        (c->flags&0x20000u))return -1;
     code32=!!(c->pm386.seg[B86_CS].flags&4u);

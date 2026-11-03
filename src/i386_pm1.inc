@@ -131,13 +131,13 @@ B86_PM1_FLASH int b86_pm1_prepare_segment(B86Cpu *cpu, unsigned seg,
     if (seg == B86_SS) {
         /* Stack selector: writable data, DPL=RPL=CPL. */
         if (d.executable || !d.read_write) return B86_PM1_TYPE;
-        if (d.dpl != cpl || rpl != cpl) return B86_PM1_PRIVILEGE;
+        if (!cpu->priv_relaxed && (d.dpl != cpl || rpl != cpl)) return B86_PM1_PRIVILEGE;
     } else {
         /* Conservative: only data or readable nonconforming code in PM1.
          * Conforming-code selection requires additional privilege rules. */
         if (d.executable && (!d.read_write || d.conforming_expand))
             return B86_PM1_UNSUPPORTED;
-        if ((cpl > d.dpl) || (rpl > d.dpl))
+        if (!cpu->priv_relaxed && ((cpl > d.dpl) || (rpl > d.dpl)))
             return B86_PM1_PRIVILEGE;
     }
     memset(&cache, 0, sizeof(cache));

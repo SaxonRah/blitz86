@@ -66,7 +66,7 @@ B86_PM5_FLASH int b86_pm5_step(B86Cpu *c)
         return b86_pm4_step(c);
     if (!c->pm386.seg[B86_CS].valid ||
         !(c->pm386.seg[B86_CS].access & 8u) ||
-        (c->seg[B86_CS]&3u)!=0u || c->ip>UINT32_MAX-15u)
+        B86_CPLX(c)!=0u || c->ip>UINT32_MAX-15u)
         return B86_UNSUPPORTED;
     code32=!!(c->pm386.seg[B86_CS].flags & 4u);
     if (!code32 && c->ip>0xFFFFu) return B86_UNSUPPORTED;

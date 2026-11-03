@@ -155,7 +155,8 @@ typedef struct B86Cpu {
                                b86_jit_set_count_retired, read deltas)      */
     uint32_t trap_cs;       /* b86_jit_run returns B86_TRAP before running
                                any code whose CS equals this (0xFFFFFFFF: off) */
-    uint32_t pad1;
+    uint32_t priv_relaxed;  /* was pad1. DPMI host: 1 = segment loads skip RPL/DPL rules (ring-3 selectors at CPL 0) */
+#define B86_CPLX(c) ((c)->priv_relaxed ? 0u : ((c)->seg[B86_CS] & 3u))   /* CPL as the PM stages see it */
     uint32_t rep_tmp[2];    /* JIT: scratch for the inline REP MOVS/STOS path */
     uint32_t model;         /* CPU model: B86_CPU_8086 (0, default), _186, _286 */
     uint32_t idt_base, gdt_base;    /* 286: LIDT/LGDT (24-bit bases); real-mode IVT = idt_base */
@@ -236,6 +237,10 @@ typedef struct B86Cpu {
      * pages (0 = none); bit 0 = native stores allowed (no translated code). */
     uintptr_t tlb_host[64];
 #endif
+    /* DPMI host (virtual memory): called before a #PF is delivered, with the
+     * instruction rolled back. Return 1 = resolved (the instruction re-executes),
+     * 0 = deliver the fault. Last field: offsets the JIT uses are unchanged. */
+    int (*pf_hook)(struct B86Cpu *c, uint32_t lin, uint32_t err);
 } B86Cpu;
 
 /* r65: translate through the guest page tables (interp.c). */
@@ -266,6 +271,7 @@ static inline __attribute__((always_inline)) uint8_t *b86_host(const B86Cpu *c, 
 /* ---- core / interpreter --------------------------------------------------- */
 void     b86_init(B86Cpu *c, uint8_t *mem);           /* mem: B86_MEM_BYTES  */
 void     b86_set_seg(B86Cpu *c, int s, uint16_t v);
+void     b86_pg_flush_public(B86Cpu *c);   /* DPMI host: TLB flush after a PTE change */
 uint16_t b86_get_flags(B86Cpu *c);                    /* materializes lazy  */
 void     b86_set_flags(B86Cpu *c, uint16_t f);
 void     b86_flags_materialize(B86Cpu *c);

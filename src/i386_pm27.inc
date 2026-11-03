@@ -38,7 +38,7 @@ static B86_PM27_FLASH int b86_pm27_descriptor(B86Cpu *c,uint16_t sel,
     }
     /* Conforming code is exempt from the ordinary CPL/RPL vs DPL test. */
     if(!(d.code_data && d.executable && d.conforming_expand) &&
-       (d.dpl < (c->seg[B86_CS]&3u) || d.dpl < (sel&3u)))return 0;
+       (d.dpl < B86_CPLX(c) || d.dpl < (sel&3u)))return 0;
     if(ext==2u)
         *result=((uint32_t)d.access<<8u) |
                 ((w==4u)?((uint32_t)(d.flags&15u)<<20u):0u);
@@ -69,7 +69,7 @@ static B86_PM27_FLASH int b86_pm27_step(B86Cpu*c)
     if(!c||!c->mem||c->model!=B86_CPU_386||!(c->msw&1u)||
        c->shutdown386||c->pm386.seg[B86_CS].reserved==B86_PM3_TRANSITION_MARKER||
        !c->pm386.seg[B86_CS].valid||!(c->pm386.seg[B86_CS].access&8u)||
-       (c->seg[B86_CS]&3u)||c->ip>UINT32_MAX-15u||
+       B86_CPLX(c)||c->ip>UINT32_MAX-15u||
        c->lz_kind!=LZ_NONE||c->lz_ikind!=LZ_NONE||
        (c->flags&0x20000u))return -1;
     code32=!!(c->pm386.seg[B86_CS].flags&4u);

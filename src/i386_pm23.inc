@@ -180,7 +180,7 @@ static int b86_x87_pm_rights(B86Cpu *c,uint32_t linear,
     if (!c->pg) return 1;
     memset(&r,0,sizeof r);
     r.cr3=c->cr3;r.ram_bytes=B86_RAM_BYTES;
-    r.cpl=(unsigned)(c->seg[B86_CS]&3u);
+    r.cpl=(unsigned)B86_CPLX(c);
     /* The existing PM/paging backend emulates an 80386 (B86_CPU_386).
      * Supervisor stores ignore the PTE/PDE R/W bit on that CPU, including
      * writes into present read-only pages. The 386 has no CR0.WP bit.
@@ -257,7 +257,7 @@ static int b86_x87_pm_tx_resolve(void *opaque,uint32_t linear,
     if (!ctx || !physical || !(c=ctx->cpu) || !c->pg) return 0;
     memset(&r,0,sizeof r);
     r.cr3=c->cr3; r.ram_bytes=B86_RAM_BYTES;
-    r.cpl=(unsigned)(c->seg[B86_CS]&3u);
+    r.cpl=(unsigned)B86_CPLX(c);
     /* Same 80386 supervisor policy as the operand-range preflight above.
      * This is a SECOND, independent permission check immediately before
      * the all-or-nothing write transaction, not a permissions bypass. */
@@ -508,7 +508,7 @@ B86_PM23_FLASH int b86_pm23_step(B86Cpu *c)
        !(c->pm386.seg[B86_CS].access&8u) ||
        (!(c->pm386.seg[B86_CS].flags&4u) && c->ip>0xFFFFu) ||
        c->pm386.seg[B86_CS].reserved==B86_PM3_TRANSITION_MARKER ||
-       (c->seg[B86_CS]&3u) || c->lz_kind!=LZ_NONE || c->lz_ikind!=LZ_NONE ||
+       B86_CPLX(c) || c->lz_kind!=LZ_NONE || c->lz_ikind!=LZ_NONE ||
        (c->flags&0x20000u) || c->ip>UINT32_MAX-15u)
         return b86_pm21_step(c);
     ip=start=c->ip;op32=!!(c->pm386.seg[B86_CS].flags&4u);

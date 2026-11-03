@@ -61,7 +61,7 @@ B86_PM2_FLASH int b86_pm2_plan_segment(const B86Cpu *cpu, unsigned seg,
     if (seg == B86_SS) {
         if (d.executable || !d.read_write)
             return b86_pm2_fault(fault, B86_PM2_GP, error);
-        if (d.dpl != cpl || rpl != cpl)
+        if (!cpu->priv_relaxed && (d.dpl != cpl || rpl != cpl))
             return b86_pm2_fault(fault, B86_PM2_GP, error);
     } else if (seg == B86_CS) {
         if (!d.executable)
@@ -69,7 +69,7 @@ B86_PM2_FLASH int b86_pm2_plan_segment(const B86Cpu *cpu, unsigned seg,
         if (d.conforming_expand) {
             if (d.dpl > cpl)
                 return b86_pm2_fault(fault, B86_PM2_GP, error);
-        } else if (d.dpl != cpl || rpl > cpl) {
+        } else if (!cpu->priv_relaxed && (d.dpl != cpl || rpl > cpl)) {
             return b86_pm2_fault(fault, B86_PM2_GP, error);
         }
         /* Same-level far transfer only: preserve the current CPL. */
@@ -81,9 +81,9 @@ B86_PM2_FLASH int b86_pm2_plan_segment(const B86Cpu *cpu, unsigned seg,
          * defer it rather than manufacturing #GP. */
         if (d.conforming_expand) return B86_PM2_UNSUPPORTED;
         if (!d.read_write) return b86_pm2_fault(fault, B86_PM2_GP, error);
-        if (cpl > d.dpl || rpl > d.dpl)
+        if (!cpu->priv_relaxed && (cpl > d.dpl || rpl > d.dpl))
             return b86_pm2_fault(fault, B86_PM2_GP, error);
-    } else if (cpl > d.dpl || rpl > d.dpl) {
+    } else if (!cpu->priv_relaxed && (cpl > d.dpl || rpl > d.dpl)) {
         return b86_pm2_fault(fault, B86_PM2_GP, error);
     }
     if (!d.present)

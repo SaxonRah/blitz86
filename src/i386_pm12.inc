@@ -33,7 +33,7 @@ B86_PM12_FLASH int b86_pm12_step(B86Cpu *c)
        c->shutdown386 || c->pm386.seg[B86_CS].reserved==B86_PM3_TRANSITION_MARKER)
         return b86_pm11_step(c);
     if(!c->pm386.seg[B86_CS].valid || !(c->pm386.seg[B86_CS].access&8u) ||
-       (c->seg[B86_CS]&3u) || !(c->pm386.seg[B86_CS].flags&4u) ||
+       B86_CPLX(c) || !(c->pm386.seg[B86_CS].flags&4u) ||
        c->ip>UINT32_MAX-15u)return B86_UNSUPPORTED;
     start=ip=c->ip;
     if(!b86_pm4_byte(c,&ip,start,&op))return B86_UNSUPPORTED;

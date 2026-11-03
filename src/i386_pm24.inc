@@ -92,7 +92,7 @@ B86_PM24_FLASH int b86_pm24_step(B86Cpu *c)
     int pref66 = 0, pref67 = 0, segpref = 0, op32, ad32, code32, has_ea = 1;
     uint8_t op, op2 = 0;
     if (!c->pm386.seg[B86_CS].valid || !(c->pm386.seg[B86_CS].access & 8u) ||
-        (c->seg[B86_CS] & 3u) != 0u || c->ip > UINT32_MAX - 15u ||
+        B86_CPLX(c) != 0u || c->ip > UINT32_MAX - 15u ||
         c->lz_kind != LZ_NONE || c->lz_ikind != LZ_NONE) return -1;
     code32 = !!(c->pm386.seg[B86_CS].flags & 4u);
     if (!code32 && c->ip > 0xFFFFu) return -1;

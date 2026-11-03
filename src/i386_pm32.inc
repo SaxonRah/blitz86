@@ -25,7 +25,7 @@ static B86_PM32_FLASH int b86_pm32_step(B86Cpu *c)
     if (!c || !c->mem || c->model != B86_CPU_386 || !(c->msw & 1u) || c->shutdown386 ||
         c->pm386.seg[B86_CS].reserved == B86_PM3_TRANSITION_MARKER ||
         !c->pm386.seg[B86_CS].valid || !(c->pm386.seg[B86_CS].access & 8u) ||
-        (c->seg[B86_CS] & 3u) || c->ip > UINT32_MAX - 15u)
+        B86_CPLX(c) || c->ip > UINT32_MAX - 15u)
         return -1;
     code32 = !!(c->pm386.seg[B86_CS].flags & 4u);
     if (!code32 && c->ip > 0xFFFFu) return -1;
@@ -122,9 +122,10 @@ static B86_PM32_FLASH int b86_pm32_page_fault(B86Cpu *c)
     uint32_t err = c->pf_err, slot = 0u, newsp, gate;
     unsigned w, ss32, k;
     int rc;
+    ++b86_pg_stat_faults;
+    if (c->pf_hook && c->pf_hook(c, c->pf_lin, c->pf_err)) { c->pf_pending = 0u; return B86_OK; }   /* DPMI host VM */
     c->cr2 = c->pf_lin;
     c->pf_pending = 0u;
-    ++b86_pg_stat_faults;
     if ((uint32_t)14u * 8u + 7u <= c->idt_limit &&
         (*b86_host(c, c->idt_base + 14u * 8u + 5u) & 0x9Fu) == 0x85u) {   /* task gate */
         uint16_t tss = (uint16_t)(*b86_host(c, c->idt_base + 14u * 8u + 2u) |

@@ -236,6 +236,85 @@ static void v113_gdt(B86Cpu *c, uint8_t *M)
     c->gdt_base = 0x500; c->gdt_limit = 0x37;
     c->seg386[0] = c->seg386[1] = 0x10;
 }
+/* V114 harness: 32-bit code in a BASED code segment (base 0x10000, limit 0xFFFF,
+ * D=1), flat DS/SS/ES - like a DOS/4GW-loaded driver. */
+static void b32_cs(B86Cpu *c)
+{
+    B86PM1Cache *d = &c->pm386.seg[B86_CS];
+    d->valid = 1; d->base = 0x10000; d->limit = 0xFFFF; d->access = 0x9B; d->flags = 0x4; d->selector = 0x08;
+    c->seg[B86_CS] = 0x08;
+}
+static void gen41(int last)
+{
+    if (!last && rnd() % 4 == 0) {                         /* V116: ES: access, ES based 0x24000 limit 0x7FFF */
+        static const unsigned edge[4] = { 0x7FFC, 0x7FFE, 0x7FFF, 0x8000 };
+        const uint32_t edi = rnd() % 8 ? (rnd() & 0x7FF0u) : edge[rnd() % 4];
+        b(0xBF); d32(edi);                                  /* MOV EDI, imm32 */
+        switch (rnd() % 5) {
+        case 0: b(0x26); b(0x8A); b(0x07); break;           /* MOV AL, ES:[EDI] */
+        case 1: b(0x26); b(0x88); b(0x07); break;           /* MOV ES:[EDI], AL */
+        case 2: b(0x26); b(0x8B); b(0x47); b(0x04); break;  /* MOV EAX, ES:[EDI+4] */
+        case 3: b(0x26); b(0x01); b(0x07); break;           /* ADD ES:[EDI], EAX */
+        default: b(0x26); b(0xFF); b(0x07); break;          /* INC DWORD ES:[EDI] */
+        }
+        return;
+    }
+    if (!last && rnd() % 5 == 0) {                         /* CS: read - must use the CS base */
+        const unsigned reg = dst[rnd() % 3];
+        b(0x2E); b(0x8B); b(0x05 | (reg << 3)); d32(0x2000 + (rnd() & 0xFFC));
+        return;
+    }
+    gen_one(last);
+}
+static int m42_run(unsigned iters, void *st, void *code, uint8_t *M, uint8_t *M2)
+{
+    static B86Cpu A, R;
+    unsigned bad = 0, flat_seen = 0, b32_seen = 0, ret_ok = 0, ret_lim = 0;
+    for (unsigned it = 0; it < iters; ++it) {
+        memset(&A, 0, sizeof A); memset(M, 0, 0x40000);
+        b86_init(&A, M); A.model = B86_CPU_386; A.msw = 1; flat(&A);
+        if (!b86_pj_attach(&A, st, b86_pj_state_bytes(), code, 1u << 20)) { printf("attach refused\n"); return 2; }
+        const uint32_t tgt = 0x2000 + ((rnd() & 0x3F) << 4);
+        uint8_t *f = M + tgt; f[0] = 0xB8; f[1] = f[2] = f[3] = f[4] = 0xAA; f[5] = 0xEB; f[6] = 0xFE;
+        uint8_t *g = M + 0x10000 + 0x1000; g[0] = 0xBB; g[1] = tgt & 0xFF; g[2] = (tgt >> 8) & 0xFF; g[3] = 0; g[4] = 0; g[5] = 0xFF; g[6] = 0xE3;
+        uint8_t *h = M + 0x10000 + tgt; h[0] = 0xB8; h[1] = h[2] = h[3] = h[4] = 0xBB; h[5] = 0xEB; h[6] = 0xFE;
+        A.r[4] = 0x8000;
+        A.ip = tgt; for (int k = 0; k < 4; ++k) { if (!b86_pj_try(&A) && b86_step(&A) != B86_OK) break; }   /* 1: flat block at tgt */
+        if (A.r[0] == 0xAAAAAAAAu) ++flat_seen;
+        b32_cs(&A); A.r[0] = 0; A.ip = 0x1000;                                  /* 2: based code, same EIP range */
+        unsigned total = 0;                                                     /* like the dispatcher: */
+        for (int k = 0; k < 8; ++k) { const unsigned n = b86_pj_try(&A); total += n; if (!n && b86_step(&A) != B86_OK) break; }
+        memcpy(M2, M, 0x40000); R = A; R.mem = M2; R.pj = NULL; R.r[0] = 0; R.r[3] = 0; R.ip = 0x1000;
+        for (unsigned k = 0; k < 4u && b86_step(&R) == B86_OK; ++k) { }
+        if (A.r[0] != 0xBBBBBBBBu || R.r[0] != 0xBBBBBBBBu || A.r[3] != tgt) {
+            if (++bad <= 8) printf("MISMATCH m42 it=%u tgt=%04X native eax=%08X ebx=%08X ip=%08X (retired %u) reference eax=%08X\n",
+                                   it, tgt, A.r[0], A.r[3], A.ip, total, R.r[0]);
+        } else ++b32_seen;
+        flat(&A); A.r[0] = 0; A.ip = tgt; for (int k = 0; k < 4; ++k) { if (!b86_pj_try(&A) && b86_step(&A) != B86_OK) break; }   /* 3: back to flat */
+        if (A.r[0] != 0xAAAAAAAAu && ++bad <= 8) printf("MISMATCH m42 it=%u back-to-flat eax=%08X\n", it, A.r[0]);
+        /* 4 (V115): based code PUSH tgt ; RET - a NATIVE return must reach the BASED code at tgt */
+        g = M + 0x10000 + 0x1100; g[0] = 0x68; g[1] = tgt & 0xFF; g[2] = (tgt >> 8) & 0xFF; g[3] = 0; g[4] = 0; g[5] = 0xC3;
+        b32_cs(&A); A.r[0] = 0; A.r[4] = 0x8000; A.ip = 0x1100;
+        for (int k = 0; k < 8; ++k) { const unsigned n = b86_pj_try(&A); if (!n && b86_step(&A) != B86_OK) break; }
+        if (A.r[0] != 0xBBBBBBBBu) { if (++bad <= 8) printf("MISMATCH m42 it=%u based RET eax=%08X ip=%08X\n", it, A.r[0], A.ip); }
+        else ++ret_ok;
+        /* 5 (V115): RET to a target BEYOND the CS limit must stop AT the RET:
+         * pushed but not popped (ESP 0x7FFC), EIP on the RET, nothing executed past it */
+        g = M + 0x10000 + 0x1200; g[0] = 0x68; g[1] = 0x00; g[2] = 0x00; g[3] = 0x02; g[4] = 0x00; g[5] = 0xC3;   /* PUSH 0x20000 ; RET */
+        b32_cs(&A); A.r[4] = 0x8000; A.ip = 0x1200;
+        for (int k = 0; k < 4; ++k) { const unsigned n = b86_pj_try(&A); if (!n) break; }
+        if (A.ip != 0x1205u || A.r[4] != 0x7FFCu) { if (++bad <= 8) printf("MISMATCH m42 it=%u RET beyond limit: ip=%08X esp=%08X (want 00001205 / 00007FFC)\n", it, A.ip, A.r[4]); }
+        else ++ret_lim;
+    }
+    printf("m42: %u iterations, flat block ran %u, based indirect jumps correct %u, based RETs correct %u, RETs beyond the limit stopped %u, %u mismatches\n", iters, flat_seen, b32_seen, ret_ok, ret_lim, bad);
+#if B86_PJ_V115_B32LINK
+    printf("v115: links=%lu native-rets=%lu\n", PJ_V115_GET(0), PJ_V115_GET(1));
+#endif
+#if B86_PJ_V114_B32
+    printf("v114: admitted-entries=%lu context-switches=%lu blocks-translated=%lu cs-prefix-declines=%lu control-declines=%lu\n", PJ_V114_GET(0), PJ_V114_GET(1), PJ_V114_GET(2), PJ_V114_GET(3), PJ_V114_GET(4));
+#endif
+    return bad != 0;
+}
 static void gen40(int last)
 {
     static const unsigned s40[8] = { 0x00, 0x10, 0x18, 0x20, 0x28, 0x30, 0x40, 0x13 };
@@ -677,11 +756,20 @@ int main(int argc, char **argv)
 #if B86_V103_DESC8
     if (gen_mode == 27) return m27_run(iters, rs);
 #endif
+    if (gen_mode == 42) return m42_run(iters, st, code, M, M2);
+    int b32_programs = 0;                                    /* V115: mode 43 = mode 17 programs in a based CS */
+    if (gen_mode == 43) { b32_programs = 1; gen_mode = 17; }
     for (unsigned it = 0; it < iters; ++it) {
         memset(&C, 0, sizeof C);
         b86_init(&C, M); C.model = B86_CPU_386; C.msw = 1;
         if (gen_mode >= 10 && gen_mode < 17) { pm16(&C, M); g_csbase = 0x10000; } else { flat(&C); g_csbase = 0; }
         if (gen_mode == 40) v113_gdt(&C, M);
+        if (gen_mode == 41 || b32_programs) { b32_cs(&C); g_csbase = 0x10000; }
+        if (gen_mode == 41) {                               /* V116: a non-flat ES */
+            B86PM1Cache *e = &C.pm386.seg[B86_ES];
+            e->valid = 1; e->base = 0x24000; e->limit = 0x7FFF; e->access = 0x93; e->flags = 0; e->selector = 0x20;
+            C.seg[B86_ES] = 0x20;
+        }
         if (!b86_pj_attach(&C, st, b86_pj_state_bytes(), code, code_bytes)) {   /* V99 */
             printf("b86_pj_attach refused a %lu-byte code buffer (smaller than its tail + 16 KiB)\n", (unsigned long)code_bytes);
             return 2;
@@ -860,6 +948,7 @@ int main(int argc, char **argv)
         for (unsigned i = 0; i < n; ++i) { int last = i == n - 1 && rnd() % 2;
             if (gen_mode == 12) gen_pm16(last);
             else if (gen_mode == 40) gen40(last);
+            else if (gen_mode == 41) gen41(last);
             else if (gen_mode % 10 == 1 || (gen_mode % 10 == 2 && rnd() % 2)) gen_new(last); else gen_one(last); }
         C.ip = 0x1000; C.r[0] = rnd(); C.r[1] = rnd(); C.r[2] = rnd(); C.r[4] = 0x8000;
         C.r[3] = 0x20000 + (rnd() & 0xFFF); C.r[5] = 0x22000 + (rnd() & 0xFFF); C.r[6] = 0x24000 + (rnd() & 0xFFF); C.r[7] = 0x26000 + (rnd() & 0xFFF);
@@ -981,7 +1070,11 @@ int main(int argc, char **argv)
                pj_v83_n[0], pj_v83_n[1], pj_v83_n[2], pj_v83_n[3], pj_v83_n[4], pj_v83_n[5], pj_v83_n[6], pj_v83_n[7]);
 #endif
     #if B86_PJ_V113_SEGLOAD
-    if (gen_mode == 40) printf("v113: translated push=%lu pop=%lu lss=%lu lfs=%lu lgs=%lu mov-fs/gs=%lu; lxs ok=%lu refused=%lu\n", pj_v113_n[0], pj_v113_n[1], pj_v113_n[2], pj_v113_n[3], pj_v113_n[4], pj_v113_n[5], pj_v113_n[6], pj_v113_n[7]);
+    if (gen_mode == 41) printf("v114: admitted-entries=%lu context-switches=%lu blocks-translated=%lu cs-prefix-declines=%lu control-declines=%lu\n", PJ_V114_GET(0), PJ_V114_GET(1), PJ_V114_GET(2), PJ_V114_GET(3), PJ_V114_GET(4));
+    if (gen_mode == 40) printf("v113: translated push=%lu pop=%lu lss=%lu lfs=%lu lgs=%lu mov-fs/gs=%lu; lxs ok=%lu refused=%lu\n", PJ_V113_GET(0), PJ_V113_GET(1), PJ_V113_GET(2), PJ_V113_GET(3), PJ_V113_GET(4), PJ_V113_GET(5), PJ_V113_GET(6), PJ_V113_GET(7));
+    #endif
+    #if B86_PJ_V115_B32LINK
+    if (b32_programs || gen_mode == 41) printf("v115: links=%lu native-rets=%lu; v87 runtime-base accesses=%lu\n", PJ_V115_GET(0), PJ_V115_GET(1), pj_v87_n[0]);
     #endif
     printf("fuzz: %u sequences, %u native instructions, %u interpreter-refused, %u partial-rep, %u mismatches\n", iters, nat, skipped, partial, bad);
     if (iters != 0 && nat == 0) { fprintf(stderr, "FAIL: zero native PJ coverage for seed=%u mode=%d\n", initial_seed, gen_mode); return 2; }

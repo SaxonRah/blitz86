@@ -931,7 +931,9 @@ static uint32_t b86_rm3_segvalue(B86Cpu *c, int which);
 /* BB_386_RM3_V1: FS/GS and 32-bit near flow, XIP flash. */
 #include "i386_rm3.inc"
 /* BB_386_PM0_V1: GDT descriptor helpers in flash, no PE switch. */
-#include "i386_pg.inc"    /* B86_PG_V1 (r65): 386 paging */
+#include "i386_pg.inc"
+/* DPMI host: drop the whole TLB after a PTE change (also starts a JIT mapping epoch). */
+void b86_pg_flush_public(B86Cpu *c) { b86_pg_flush(c); }    /* B86_PG_V1 (r65): 386 paging */
 #if B86_V95_SMC_WALK && defined(B86_PAGED)
 /* V95: same checks smc() does after a TLB hit, for each page of the store. */
 static void b86_v95_smc_part(B86Cpu *c, uint32_t a, uint32_t n)
@@ -1486,6 +1488,7 @@ static __attribute__((noinline, cold, section(".text.bb386_flash"))) int b86_386
 #endif
 {
     uint32_t hi[8];
+    const uint16_t msw0 = c->msw;          /* DPMI host: a hook may switch to protected mode with exact 32-bit registers */
     for (unsigned i = 0; i < 8; ++i) hi[i] = c->r[i] & 0xFFFF0000u;
     uint16_t ip = (uint16_t)c->ip;
     int operand32 = 0, address32 = 0;
@@ -1512,7 +1515,7 @@ static __attribute__((noinline, cold, section(".text.bb386_flash"))) int b86_386
         ((final_op >= 0xA4 && final_op <= 0xA7) ||
          (final_op >= 0xAA && final_op <= 0xAF) ||
          (final_op >= 0x6C && final_op <= 0x6F));
-    if (!operand32 && !implicit_control32) for (unsigned i = 0; i < 8; ++i) {
+    if (!operand32 && !implicit_control32 && ((c->msw ^ msw0) & 1u) == 0u) for (unsigned i = 0; i < 8; ++i) {
         if (wide_index && (i == B86_CX || i == B86_SI || i == B86_DI)) continue;
         c->r[i] = (c->r[i] & 0xFFFFu) | hi[i];
     }

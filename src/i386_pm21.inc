@@ -20,7 +20,7 @@ B86_PM21_FLASH int b86_pm21_irq(B86Cpu *c,unsigned vector)
     if(!c->mem||c->model!=B86_CPU_386||!(c->msw&1u)||vector>255u||
        c->pm386.seg[B86_CS].reserved==B86_PM3_TRANSITION_MARKER||
        !c->pm386.seg[B86_CS].valid||!(c->pm386.seg[B86_CS].access&8u)||
-       !(c->pm386.seg[B86_CS].flags&4u)||(c->seg[B86_CS]&3u)||
+       !(c->pm386.seg[B86_CS].flags&4u)||B86_CPLX(c)||
        !c->pm386.seg[B86_SS].valid||
        !(c->flags&B86_IF)||
        c->pm386.seg[B86_SS].reserved||c->pm386.seg[B86_GS].reserved||
@@ -42,7 +42,7 @@ B86_PM21_FLASH int b86_pm21_step(B86Cpu *c)
     if(!c || !c->mem || c->model!=B86_CPU_386||!(c->msw&1u)||
        c->shutdown386||c->pm386.seg[B86_CS].reserved==B86_PM3_TRANSITION_MARKER||
        !c->pm386.seg[B86_CS].valid||!(c->pm386.seg[B86_CS].access&8u)||
-       (c->seg[B86_CS]&3u)||c->ip>UINT32_MAX-15u||
+       B86_CPLX(c)||c->ip>UINT32_MAX-15u||
        (!(c->pm386.seg[B86_CS].flags&4u)&&c->ip>0xFFFFu)||c->lz_kind!=LZ_NONE||c->lz_ikind!=LZ_NONE||
        (c->flags&0x20000u))return b86_pm20_step(c);
     ip=start=c->ip;

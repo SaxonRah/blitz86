@@ -860,6 +860,11 @@ typedef struct B86Pj {
     /* BB_PJ_REPNE_EFFICIENCY_V1: separate yield vs mapped-memory refusal. */
     unsigned long repne_calls, repne_completed, repne_budget_yields;
     unsigned long repne_refusals, repne_comparisons, repne_spans;
+#if BB_PJ_PM16_REG_TIER
+    uint32_t b32_active;     /* V114: the current context is a BASED 32-bit code segment
+                              * (pm16_active is also set: context tables, base-relative
+                              * linear addresses), translated by the flat translator */
+#endif
 } B86Pj;
 
 unsigned long b86_pj_stat_runs, b86_pj_stat_insns;
@@ -1069,6 +1074,28 @@ static int pj_v100_is_veneer(const B86Pj *j, uint32_t addr, uint32_t to)
 #else
 void *B86_CALLOC(size_t n, size_t size);
 #endif
+/* V114/V115: defined early - every #if B86_PJ_V114_B32 / B86_PJ_V115_B32LINK below
+ * (prefix decoder, RET, ...) must see them. Counters live in the PSRAM pool. */
+#ifndef B86_PJ_V114_B32
+#define B86_PJ_V114_B32 1
+#endif
+#ifndef B86_PJ_V115_B32LINK
+#define B86_PJ_V115_B32LINK 1
+#endif
+#ifndef B86_PJ_V116_B32
+#define B86_PJ_V116_B32 1   /* V116: based-32 chaining without V93; native ES: in based code */
+#endif
+/* V116: the CS-context link path is needed by 16-bit chaining (V93) or by based-32 chaining */
+#define PJ_CTX_LINK (B86_PJ_V93_PM16_LINK || (B86_PJ_V114_B32 && B86_PJ_V115_B32LINK && B86_PJ_V116_B32))
+#define PJ_SEGOV_ES 6u      /* V116: t->segov code for an ES: override (B86_ES is 0 = "none") */
+static unsigned long *pj_v114c;   /* [0] admitted [1] context switches [2] blocks [3] CS: declines [4] control declines */
+#define PJ_V114_INC(i) do { if (!pj_v114c) pj_v114c = (unsigned long *)B86_CALLOC(5u, sizeof(unsigned long)); \
+                            if (pj_v114c) ++pj_v114c[(i)]; } while (0)
+#define PJ_V114_GET(i) (pj_v114c ? pj_v114c[(i)] : 0ul)
+static unsigned long *pj_v115c;   /* [0] based-32 exits linked [1] native RETs compiled in based code */
+#define PJ_V115_INC(i) do { if (!pj_v115c) pj_v115c = (unsigned long *)B86_CALLOC(2u, sizeof(unsigned long)); \
+                            if (pj_v115c) ++pj_v115c[(i)]; } while (0)
+#define PJ_V115_GET(i) (pj_v115c ? pj_v115c[(i)] : 0ul)
 #define PJ_V99_EXT_FRAME (B86_V99_EXT_START >> 12)
 #define PJ_V99_MAXPT 8u
 #define PJ_V99_M(v) ((v) & ~0x60u)              /* compare PDE/PTE without Accessed/Dirty */
@@ -2249,7 +2276,11 @@ static B86_PM_HOT uint32_t b86_pj_loadseg(B86Cpu *c, uint32_t seg, uint32_t sel)
  * sound-driver prologues: PUSH/POP FS/GS, LSS/LFS/LGS, MOV FS/GS,r16).
  * [0..5] translations: push, pop, lss, lfs, lgs, mov-fs/gs; [6] LxS helper
  * successes, [7] LxS helper refusals (interpreter takes the instruction). */
-static unsigned long pj_v113_n[8];
+/* counters live in the PSRAM pool (B86_CALLOC on first use): only the pointer is in SRAM */
+static unsigned long *pj_v113c;
+#define PJ_V113_INC(i) do { if (!pj_v113c) pj_v113c = (unsigned long *)B86_CALLOC(8u, sizeof(unsigned long)); \
+                            if (pj_v113c) ++pj_v113c[(i)]; } while (0)
+#define PJ_V113_GET(i) (pj_v113c ? pj_v113c[(i)] : 0ul)
 /* LSS/LFS/LGS r32, m16:32 exactly as the interpreter (pm40 LFS/LGS): offset
  * at ea, selector at ea+4, both checked reads; plan, then commit; nothing is
  * written before the segment load succeeds. The generated code owns the guest
@@ -2262,10 +2293,10 @@ static B86_PM_HOT uint64_t b86_pj_lxs(B86Cpu *c, uint32_t ea, uint32_t seg)
     uint32_t lin, ls, v;
     if (!(p = p40_ptr(c, B86_DS, ea, 4u, 0, &lin)) ||
         !(ps = p40_ptr(c, B86_DS, ea + 4u, 2u, 0, &ls)) ||
-        !p40_plan(c, seg, (uint16_t)p40_ld(ps, 2u), &plan)) { ++pj_v113_n[7]; return 0u; }
+        !p40_plan(c, seg, (uint16_t)p40_ld(ps, 2u), &plan)) { PJ_V113_INC(7); return 0u; }
     v = p40_ld(p, 4u);
-    if (b86_pm2_commit_segment(c, &plan, 0u) != B86_PM2_OK) { ++pj_v113_n[7]; return 0u; }
-    ++pj_v113_n[6];
+    if (b86_pm2_commit_segment(c, &plan, 0u) != B86_PM2_OK) { PJ_V113_INC(7); return 0u; }
+    PJ_V113_INC(6);
     return (uint64_t)v | ((uint64_t)1u << 32);
 }
 #endif
@@ -2571,6 +2602,7 @@ typedef struct {
     struct { uint8_t *at; int lk; uint8_t ik, cr; } br[16];   /* V81: facts on open forward edges */
     unsigned nbr;
 #endif
+    uint8_t b32;                                 /* V114: translating a based 32-bit code segment */
 } PjT;
 
 #define CREG R12                                  /* B86Cpu pointer, reloaded after calls */
@@ -2873,7 +2905,12 @@ static int pjt_modrm(PjT *t, PjM *m)
     if (t->segov) {
         /* R1 = 32-bit offset. Guard the FS/GS cache, then R1 = base + offset.
          * Any failure leaves before the instruction ran (interpreter faults). */
+#if B86_PJ_V116_B32
+        const unsigned sb = (unsigned)offsetof(B86Cpu, pm386.seg) +
+                            (unsigned)sizeof(B86PM1Cache) * (t->segov == PJ_SEGOV_ES ? (unsigned)B86_ES : (unsigned)t->segov);
+#else
         const unsigned sb = (unsigned)offsetof(B86Cpu, pm386.seg) + (unsigned)sizeof(B86PM1Cache) * t->segov;
+#endif
         uint8_t *f[5], *ok;
         unsigned k;
         pjt_c(t);                                        /* R12 before the push */
@@ -3516,6 +3553,16 @@ static int pjt_unified_head(PjT *t, unsigned policy, PjUnifiedHead *h)
     for (;;) {
         if (!pjt_u8(t, &op) || ++np > 4u) return 0;
         if (op == 0x66u) { o16 = 1u; continue; }
+#if B86_PJ_V114_B32 && BB_PJ_PM16_REG_TIER
+        if (op == 0x2Eu && t->b32) { PJ_V114_INC(3); return 0; }   /* V114: CS: is not flat here */
+#endif
+#if B86_PJ_V116_B32 && B86_PJ_V87_FSGS && BB_PJ_PM16_REG_TIER
+        if (op == 0x26u && t->b32) {             /* V116: ES: through V87's runtime-checked base path */
+            if (t->segov) return 0;
+            t->segov = (uint8_t)PJ_SEGOV_ES;
+            continue;
+        }
+#endif
         if (op == 0x3Eu || op == 0x36u || op == 0x2Eu || op == 0x26u) {
             /* Preserve original flat32 ES-override state across prefixes. */
             if (op == 0x26u) es_override = 1u;
@@ -4599,7 +4646,7 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
 #endif
             )) PJ_FAIL();
 #if B86_PJ_V113_SEGLOAD
-        if (m.reg == B86_FS || m.reg == B86_GS) ++pj_v113_n[5];
+        if (m.reg == B86_FS || m.reg == B86_GS) PJ_V113_INC(5);
 #endif
         pjt_getr(t, R2, m.rm, 2u);
         pjt_c(t);
@@ -5523,6 +5570,21 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
         pj_mov(&t->e, R1, GR(4));
         pjt_mem(t, 4u, 0);
         pj_ldst(&t->e, PJ_LDR, R1, R0, 0u);
+#if B86_PJ_V114_B32 && B86_PJ_V115_B32LINK && BB_PJ_PM16_REG_TIER
+        if (t->b32) {
+            /* V115: a return target beyond the CS limit must #GP AT the RET with
+             * ESP unchanged: compare first and leave BEFORE the instruction. The
+             * limit is fixed per CS context. In-range targets continue through
+             * the context-aware native lookup (dyn16), never the flat one. */
+            PJ_V115_INC(1);
+            pj_imm32(&t->e, R2, t->c->pm386.seg[B86_CS].limit);
+            pj_dpr(&t->e, 13u, 1, PC, R1, R2, 0u, 0u);          /* CMP r1, limit */
+            pjt_exit_stay(t, 8 /* HI */, t->ip0, t->ninsn - 1u);
+            pjt_addimm(t, GR(4), GR(4), 4u + (op == 0xC2u ? imm : 0u));
+            pjt_exit(t, 0u, t->ninsn, 3);          /* dynamic, CS-context lookup: EIP in r1 */
+            return 2;
+        }
+#endif
         pjt_addimm(t, GR(4), GR(4), 4u + (op == 0xC2u ? imm : 0u));
         pjt_exit(t, 0u, t->ninsn, 1);              /* dynamic: EIP in r1 */
         return 2;
@@ -5870,7 +5932,7 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
          * nothing committed; success exits AFTER it - the segment changed, so
          * C re-checks flatness (exactly as POP DS/ES and MOV DS/ES do). */
         if (np == 1u && (op2 == 0xA0u || op2 == 0xA8u)) {           /* PUSH FS/GS, zero-extended */
-            ++pj_v113_n[0];
+            PJ_V113_INC(0);
             pj_dpi(&t->e, 13u, 0, R1, GR(4), 4u);
             pjt_mem(t, 4u, 1);
             pjt_c(t);
@@ -5880,7 +5942,7 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
             return 1;
         }
         if (np == 1u && (op2 == 0xA1u || op2 == 0xA9u)) {           /* POP FS/GS */
-            ++pj_v113_n[1];
+            PJ_V113_INC(1);
             pj_mov(&t->e, R1, GR(4));
             pjt_mem(t, 4u, 0);
             pj_ldst(&t->e, PJ_LDRH, R2, R0, 0u);
@@ -5896,7 +5958,7 @@ static B86_PJ_COLD int pjt_insn(PjT *t)
         }
         if (np == 1u && (op2 == 0xB2u || op2 == 0xB4u || op2 == 0xB5u)) {   /* LSS/LFS/LGS r32, m16:32 */
             if (!pjt_modrm(t, &m) || m.mod == 3u) PJ_FAIL();
-            ++pj_v113_n[op2 == 0xB2u ? 2u : op2 == 0xB4u ? 3u : 4u];
+            PJ_V113_INC(op2 == 0xB2u ? 2u : op2 == 0xB4u ? 3u : 4u);
             pjt_c(t);                                    /* r1 = effective address */
             pj_mov(&t->e, R0, CREG);
             pj_movw(&t->e, R2, op2 == 0xB2u ? B86_SS : op2 == 0xB4u ? B86_FS : B86_GS);
@@ -6485,7 +6547,8 @@ static void pjt_stub(PjT *t, const PjExit *x, const B86Pj *j)
 #endif
     if (x->dyn == 2) pj_imm32(&t->e, R1, x->ip);
     pj_movw(&t->e, R0, x->n);
-    pj_patch_b(pj_b(&t->e, -1), x->dyn == 1 ? j->dyn : tail_z);   /* EIP in r1: look the target up natively */
+    pj_patch_b(pj_b(&t->e, -1), (x->dyn == 1 && !t->b32) ? j->dyn : tail_z);   /* EIP in r1: look the target up natively
+                                                    * (V114: never from based 32-bit code - j->dyn keys by EIP alone) */
 }
 
 /* Shared code: tails and the native lookup for dynamic exits (RET, indirect
@@ -7733,6 +7796,9 @@ full_flush:
     ++j->v27_barriers;
 #if BB_PJ_PM16_REG_TIER
     j->pm16_active = 0u;
+#if B86_PJ_V114_B32 && BB_PJ_PM16_REG_TIER
+    j->b32_active = 0u;                               /* V114 */
+#endif
 #endif
     j->es_mode = 0u;
 }
@@ -8267,6 +8333,46 @@ static B86_PJ_COLD unsigned pj_fetch_pm16(B86Cpu *c, uint32_t eip,
         n = (unsigned)((uint64_t)UINT32_MAX - lin + 1u);
     return pj_fetch(c, (uint32_t)lin, bytes, n);
 }
+
+#ifndef B86_PJ_V114_B32
+#define B86_PJ_V114_B32 1
+#endif
+#if B86_PJ_V114_B32 && BB_PJ_PM16_REG_TIER
+/* V114: 32-bit code in a code segment with a non-zero base (DOS/4GW-loaded
+ * drivers, e.g. HMI's sound drivers), with FLAT DS and SS exactly as pj_flat
+ * requires. It runs in a CS context like PM16 code (own tag/entry tables,
+ * linear = CS base + EIP for code pages and SMC) but is translated by the flat
+ * translator with 32-bit EIP. Safety: CS: overrides are declined (the flat
+ * translator treats segment prefixes as flat); indirect exits never use the
+ * flat lookup stub (it keys by EIP alone); no C linking (each exit returns to C).
+ * [0] admitted entries [1] context switches into B32 [2] blocks translated
+ * [3] CS: instructions declined. */
+/* V114/V115 switches and counters are defined early in this file (before first use). */
+static inline int pj_b32_ok(const B86Cpu *c)
+{
+    const B86PM1Cache *s = c->pm386.seg;
+    return (c->msw & 1u) && s[B86_CS].valid && !s[B86_CS].reserved && (s[B86_CS].flags & 4u) &&
+           (s[B86_CS].access & 0x18u) == 0x18u && c->ip <= s[B86_CS].limit &&
+           (uint64_t)s[B86_CS].base + c->ip <= UINT32_MAX &&
+           s[B86_DS].valid && s[B86_DS].base == 0u && s[B86_DS].limit == 0xFFFFFFFFu && (s[B86_DS].access & 0x1Au) == 0x12u &&
+           s[B86_SS].valid && s[B86_SS].base == 0u && s[B86_SS].limit == 0xFFFFFFFFu && (s[B86_SS].flags & 4u) &&
+           !s[B86_SS].reserved && (s[B86_SS].access & 0x1Au) == 0x12u && !(c->flags & 0x20000u);
+}
+static B86_PJ_COLD unsigned pj_fetch_b32(B86Cpu *c, uint32_t eip, uint8_t *bytes, unsigned max)
+{
+    const B86PM1Cache *cs = &c->pm386.seg[B86_CS];
+    const uint64_t lin = (uint64_t)cs->base + eip;
+    uint32_t n = max;
+    if (eip > cs->limit || lin > UINT32_MAX) return 0u;
+    if (cs->limit - eip < n - 1u) n = cs->limit - eip + 1u;
+    if ((uint64_t)n > (uint64_t)UINT32_MAX - lin + 1u) n = (unsigned)((uint64_t)UINT32_MAX - lin + 1u);
+    return pj_fetch(c, (uint32_t)lin, bytes, n);
+}
+#define PJ_PM16SEM(j) ((j)->pm16_active && !(j)->b32_active)
+
+#else
+#define PJ_PM16SEM(j) ((j)->pm16_active)
+#endif
 
 /* Only simple 16-bit register operations and relative control transfers.
  * No 66/67, segment override, LOCK/REP, stack or memory form is accepted.
@@ -11638,8 +11744,16 @@ static B86_PJ_COLD uint32_t b86_pj_translate(B86Cpu *c, uint32_t eip)
     memset(&t, 0, sizeof t);
     t.c = c;
 #if BB_PJ_PM16_REG_TIER
+#if B86_PJ_V114_B32
+    t.b32 = (uint8_t)!!j->b32_active;
+    if (t.b32) PJ_V114_INC(2);
+    t.n = !j->pm16_active ? pj_fetch(c, eip, bytes, sizeof bytes)
+        : t.b32 ? pj_fetch_b32(c, eip, bytes, sizeof bytes)
+                : pj_fetch_pm16(c, eip, bytes, sizeof bytes);
+#else
     t.n = j->pm16_active ? pj_fetch_pm16(c, eip, bytes, sizeof bytes)
                           : pj_fetch(c, eip, bytes, sizeof bytes);
+#endif
 #else
     t.n = pj_fetch(c, eip, bytes, sizeof bytes);
 #endif
@@ -11651,10 +11765,52 @@ static B86_PJ_COLD uint32_t b86_pj_translate(B86Cpu *c, uint32_t eip)
                         : j->code + j->shared_end + j->half * (j->cur_half + 1u);       /* r71: stay inside the half */
     while (t.ninsn < B86_PJ_MAXI && t.pos + 16u <= t.n) {
 #if BB_PJ_PM16_REG_TIER
-        t.ip0 = j->pm16_active ? ((eip + t.pos) & 0xFFFFu) : eip + t.pos;
+        t.ip0 = PJ_PM16SEM(j) ? ((eip + t.pos) & 0xFFFFu) : eip + t.pos;
+#if B86_PJ_V114_B32
+        if (t.b32) {                              /* V114 safety net: no CS: prefix in based code */
+            unsigned k = t.pos, cs_pfx = 0u;
+            while (k < t.n && k < t.pos + 15u && (t.b[k] == 0x66u || t.b[k] == 0x67u || t.b[k] == 0xF0u ||
+                   t.b[k] == 0xF2u || t.b[k] == 0xF3u || t.b[k] == 0x26u || t.b[k] == 0x2Eu ||
+                   t.b[k] == 0x36u || t.b[k] == 0x3Eu || t.b[k] == 0x64u || t.b[k] == 0x65u)) { if (t.b[k] == 0x2Eu) cs_pfx = 1u; ++k; }
+            if (cs_pfx) { PJ_V114_INC(3); r = 0; break; }
+            /* V114: a control transfer beyond the CS limit must #GP AT the transfer
+             * (nothing pushed, EIP unchanged); flat code never checks the limit.
+             * Indirect transfers are declined (the interpreter checks them); a
+             * direct one is compiled only if its target is provably inside. */
+            if (k < t.n) {
+                const uint8_t op = t.b[k];
+                const unsigned plen = k - t.pos;
+                const uint32_t lim = c->pm386.seg[B86_CS].limit;
+                int ctl = 0;                      /* 0 none, 1 direct (tgt known), 2 decline */
+                uint32_t tgt = 0u;
+                if (op == 0xE8u || op == 0xE9u) {
+                    if (plen || k + 5u > t.n) ctl = 2;
+                    else { tgt = t.ip0 + 5u + ((uint32_t)t.b[k + 1u] | ((uint32_t)t.b[k + 2u] << 8) |
+                                               ((uint32_t)t.b[k + 3u] << 16) | ((uint32_t)t.b[k + 4u] << 24)); ctl = 1; }
+                } else if (op == 0xEBu || (op >= 0x70u && op <= 0x7Fu) || (op >= 0xE0u && op <= 0xE3u)) {
+                    if (plen || k + 2u > t.n) ctl = 2;
+                    else { tgt = t.ip0 + 2u + (uint32_t)(int32_t)(int8_t)t.b[k + 1u]; ctl = 1; }
+                } else if (op == 0x0Fu && k + 1u < t.n && t.b[k + 1u] >= 0x80u && t.b[k + 1u] <= 0x8Fu) {
+                    if (plen || k + 6u > t.n) ctl = 2;
+                    else { tgt = t.ip0 + 6u + ((uint32_t)t.b[k + 2u] | ((uint32_t)t.b[k + 3u] << 8) |
+                                               ((uint32_t)t.b[k + 4u] << 16) | ((uint32_t)t.b[k + 5u] << 24)); ctl = 1; }
+                } else if (op == 0xCAu || op == 0xCBu || op == 0xCFu
+#if !B86_PJ_V115_B32LINK
+                           || op == 0xC2u || op == 0xC3u
+#endif
+                          ) {
+                    ctl = 2;                      /* V115: near RET is compiled with a native limit check */
+                } else if (op == 0xFFu && k + 1u < t.n) {
+                    const unsigned reg = (t.b[k + 1u] >> 3) & 7u;
+                    if (reg >= 2u && reg <= 5u) ctl = 2;   /* CALL/JMP near and far, indirect */
+                }
+                if (ctl == 2 || (ctl == 1 && tgt > lim)) { PJ_V114_INC(4); r = 0; break; }
+            }
+        }
+#endif
 #ifdef B86_PJ_CPROF
         {   uint8_t *p0 = t.e.p; const unsigned pos0 = t.pos; unsigned k = pos0, op;
-            r = j->pm16_active ? pjt_insn_pm16(&t) : pjt_insn(&t);
+            r = PJ_PM16SEM(j) ? pjt_insn_pm16(&t) : pjt_insn(&t);
             while (k < t.n && (t.b[k] == 0x66u || t.b[k] == 0x67u || t.b[k] == 0xF2u || t.b[k] == 0xF3u || t.b[k] == 0x26u ||
                    t.b[k] == 0x2Eu || t.b[k] == 0x36u || t.b[k] == 0x3Eu || t.b[k] == 0x64u || t.b[k] == 0x65u)) ++k;
             op = k < t.n ? (t.b[k] == 0x0Fu && k + 1u < t.n ? 0x100u + t.b[k + 1u] : t.b[k]) : 0u;
@@ -11662,7 +11818,7 @@ static B86_PJ_COLD uint32_t b86_pj_translate(B86Cpu *c, uint32_t eip)
                 b86_pj_op_bytes[op] += (unsigned long)(t.e.p - p0); ++b86_pj_op_count[op]; }
         }
 #else
-        r = j->pm16_active ? pjt_insn_pm16(&t) : pjt_insn(&t);
+        r = PJ_PM16SEM(j) ? pjt_insn_pm16(&t) : pjt_insn(&t);
 #endif
 #else
         t.ip0 = eip + t.pos;
@@ -11705,10 +11861,14 @@ static B86_PJ_COLD uint32_t b86_pj_translate(B86Cpu *c, uint32_t eip)
         }
 #if BB_PJ_PM16_REG_TIER
 #if B86_PJ_V93_PM16_LINK
-        pjt_exit(&t, j->pm16_active ? ((eip + t.pos) & 0xFFFFu) : eip + t.pos, t.ninsn, 0);   /* V93 */
+        pjt_exit(&t, PJ_PM16SEM(j) ? ((eip + t.pos) & 0xFFFFu) : eip + t.pos, t.ninsn, 0);   /* V93 */
 #else
-        pjt_exit(&t, j->pm16_active ? ((eip + t.pos) & 0xFFFFu) : eip + t.pos,
-                 t.ninsn, j->pm16_active ? 2 : 0);
+        pjt_exit(&t, PJ_PM16SEM(j) ? ((eip + t.pos) & 0xFFFFu) : eip + t.pos,
+#if B86_PJ_V115_B32LINK
+                 t.ninsn, PJ_PM16SEM(j) ? 2 : 0);    /* V115: based 32-bit fallthrough is linkable, as flat */
+#else
+                 t.ninsn, j->pm16_active ? 2 : 0);   /* V114: based 32-bit keeps the unlinked exit */
+#endif
 #endif
 #else
         pjt_exit(&t, eip + t.pos, t.ninsn, 0);
@@ -12047,7 +12207,7 @@ static B86_PJ_COLD void b86_pj_link(B86Cpu *c)
     int v100_xt;
     ++pj_v100_n[2];
 #endif
-#if B86_PJ_V93_PM16_LINK && BB_PJ_PM16_REG_TIER
+#if PJ_CTX_LINK && BB_PJ_PM16_REG_TIER
     /* V93: flat blocks use the flat tables; a 16-bit block (the caller checked
      * that CS is still its context) uses that context's tables and CS base + IP. */
     const uint32_t pm16 = j->pm16_active ? 1u : 0u;
@@ -12222,8 +12382,50 @@ static void bb5h_seg_capture(const B86Cpu *c, unsigned i)
     d[8] = BB5H_PACK(s[B86_ES]); d[9] = s[B86_ES].base;
 #undef BB5H_PACK
 }
+/* BB5H_CODE_V1: 192 code bytes around each sampled hot entry (from 64 bytes before
+ * it), read through the guest's own translation like code fetch; 32 x 192 bytes
+ * from the PSRAM pool on first use. Diagnostic only. */
+#define BB5H_CODE_BYTES 192u
+typedef struct { uint32_t from, n; uint8_t b[BB5H_CODE_BYTES]; } Bb5hCode;
+static Bb5hCode *bb5h_code;                               /* PSRAM; only this pointer is in SRAM */
+static void bb5h_code_capture(const B86Cpu *c, unsigned i)
+{
+    const uint32_t base = c->pm386.seg[B86_CS].base, ip = c->ip;
+    const uint32_t from = ip >= 64u ? ip - 64u : 0u;
+    if (!bb5h_code) bb5h_code = (Bb5hCode *)B86_CALLOC(BB5H_SLOTS, sizeof(Bb5hCode));
+    if (!bb5h_code) return;
+    bb5h_code[i].from = from;
+    bb5h_code[i].n = pj_fetch((B86Cpu *)c, base + from, bb5h_code[i].b, BB5H_CODE_BYTES);
+}
+/* BB5H_WATCH_V1: one-time capture of fixed code windows (selector, start, 256 bytes)
+ * found hot by the guest-PC profile but absent from the saturated entry table:
+ * 0018:2900, 3E58:4600, 3E58:4C80 (the JIT-lookup-heavy 16-bit code). Captured the
+ * first time a sampled entry falls inside a window; CS cache state recorded with it.
+ * PSRAM buffer, pointer in SRAM. Diagnostic only. */
+#define BB5H_WATCH_N 3u
+#define BB5H_WATCH_BYTES 256u
+static const uint16_t bb5h_watch_sel[BB5H_WATCH_N] = { 0x0018u, 0x3E58u, 0x3E58u };
+static const uint16_t bb5h_watch_lo[BB5H_WATCH_N]  = { 0x2900u, 0x4600u, 0x4C80u };
+typedef struct { uint32_t done, base, limit, acc_fl, n; uint8_t b[BB5H_WATCH_BYTES]; } Bb5hWatch;
+static Bb5hWatch *bb5h_watch;
+static void bb5h_watch_check(const B86Cpu *c)
+{
+    const B86PM1Cache *cs = &c->pm386.seg[B86_CS];
+    unsigned k;
+    for (k = 0u; k < BB5H_WATCH_N; ++k) {
+        if (cs->selector != bb5h_watch_sel[k] || c->ip < bb5h_watch_lo[k] || c->ip >= bb5h_watch_lo[k] + BB5H_WATCH_BYTES) continue;
+        if (!bb5h_watch) bb5h_watch = (Bb5hWatch *)B86_CALLOC(BB5H_WATCH_N, sizeof(Bb5hWatch));
+        if (!bb5h_watch || bb5h_watch[k].done) return;
+        bb5h_watch[k].base = cs->base; bb5h_watch[k].limit = cs->limit;
+        bb5h_watch[k].acc_fl = (uint32_t)cs->access | ((uint32_t)cs->flags << 8);
+        bb5h_watch[k].n = pj_fetch((B86Cpu *)c, cs->base + bb5h_watch_lo[k], bb5h_watch[k].b, BB5H_WATCH_BYTES);
+        bb5h_watch[k].done = 1u;
+        return;
+    }
+}
 static void bb5h_note(const B86Cpu *c, uint32_t mode, unsigned miss)
 {
+    bb5h_watch_check(c);                                 /* BB5H_WATCH_V1 */
     unsigned i, free_slot = BB5H_SLOTS, min_slot = 0u;
     const uint32_t ip = c->ip, base = c->pm386.seg[B86_CS].base;
     for (i = 0u; i < BB5H_SLOTS; ++i) {
@@ -12232,6 +12434,7 @@ static void bb5h_note(const B86Cpu *c, uint32_t mode, unsigned miss)
             ++bb5h_hot[i].count;
             bb5h_hot[i].misses += (uint32_t)!!miss;
             bb5h_seg_capture(c, i);                      /* BB5H_SEG_V1 */
+            bb5h_code_capture(c, i);                     /* BB5H_CODE_V1 */
             return;
         }
         if (!bb5h_hot[i].count && free_slot == BB5H_SLOTS) free_slot = i;
@@ -12246,6 +12449,7 @@ static void bb5h_note(const B86Cpu *c, uint32_t mode, unsigned miss)
       bb5h_hot[i].misses = (uint32_t)!!miss;
     }
     bb5h_seg_capture(c, i);                              /* BB5H_SEG_V1 */
+    bb5h_code_capture(c, i);                             /* BB5H_CODE_V1 */
 }
 static void bb5h_dump(void)
 {
@@ -12253,7 +12457,21 @@ static void bb5h_dump(void)
     uint32_t seen = 0u;
     printf("[bb5h-summary] entry-samples=%lu miss-samples=%lu one-entry-in=2048 one-miss-in=128\n",
            bb5h_try_samples, bb5h_miss_samples);
-    for (r=0u; r<6u; ++r) {
+    if (bb5h_watch) {                                    /* BB5H_WATCH_V1 */
+        unsigned k, o, q;
+        for (k = 0u; k < BB5H_WATCH_N; ++k) {
+            const Bb5hWatch *w = &bb5h_watch[k];
+            if (!w->done) { printf("[bb5h-watch] %04X:%04X not seen yet\n", bb5h_watch_sel[k], bb5h_watch_lo[k]); continue; }
+            printf("[bb5h-watch] %04X:%04X base=%08lX limit=%08lX acc=%02lX fl=%lX bytes=%lu\n", bb5h_watch_sel[k], bb5h_watch_lo[k],
+                   (unsigned long)w->base, (unsigned long)w->limit, (unsigned long)(w->acc_fl & 0xFFu), (unsigned long)(w->acc_fl >> 8), (unsigned long)w->n);
+            for (o = 0u; o < w->n; o += 32u) {
+                printf("[bb5h-wcode] %04X:%04X +%02X:", bb5h_watch_sel[k], bb5h_watch_lo[k], o);
+                for (q = o; q < o + 32u && q < w->n; ++q) printf(" %02X", w->b[q]);
+                printf("\n");
+            }
+        }
+    }
+    for (r=0u; r<12u; ++r) {                             /* BB5H_CODE_V1: top 12 (was 6) */
         unsigned best = BB5H_SLOTS;
         for (i=0u; i<BB5H_SLOTS; ++i) {
             if ((seen & (1u << i)) || !bb5h_hot[i].count) continue;
@@ -12275,6 +12493,16 @@ static void bb5h_dump(void)
                    (unsigned long)(d[2] & 0xFFFFu), (unsigned long)((d[2] >> 16) & 0xFFu), (unsigned long)(d[2] >> 24), (unsigned long)d[3], (unsigned long)d[4],
                    (unsigned long)(d[5] & 0xFFFFu), (unsigned long)((d[5] >> 16) & 0xFFu), (unsigned long)(d[5] >> 24), (unsigned long)d[6], (unsigned long)d[7],
                    (unsigned long)(d[8] & 0xFFFFu), (unsigned long)d[9]);
+        }
+        if (bb5h_code && bb5h_code[best].n) {            /* BB5H_CODE_V1: 32 bytes per line */
+            const Bb5hCode *k = &bb5h_code[best];
+            unsigned o;
+            for (o = 0u; o < k->n; o += 32u) {
+                unsigned q;
+                printf("[bb5h-code] rank=%u from=%08lX +%02X:", r + 1u, (unsigned long)k->from, o);
+                for (q = o; q < o + 32u && q < k->n; ++q) printf(" %02X", k->b[q]);
+                printf("\n");
+            }
         }
     }
 }
@@ -12398,6 +12626,11 @@ static B86_PM_HOT unsigned b86_pj_try(B86Cpu *c)
     {
         const unsigned flat = j && pj_flat(c);
         const unsigned reg16 = BB_PJ_PM16_PERF_GATE && j && !flat && pj_pm16_reg_ok(c);
+#if B86_PJ_V114_B32
+        const unsigned b32 = j && !flat && !reg16 && pj_b32_ok(c);   /* V114 */
+#else
+        const unsigned b32 = 0u;
+#endif
         const B86PM1Cache *cs = &c->pm386.seg[B86_CS];
         const uint32_t kind = (uint32_t)cs->selector | ((uint32_t)cs->flags << 16) |
                               ((uint32_t)cs->access << 24);
@@ -12405,13 +12638,13 @@ static B86_PM_HOT unsigned b86_pj_try(B86Cpu *c)
          * can be identified without affecting their execution. */
         if (((++bb5h_try_clock) & 2047u) == 0u) {
             ++bb5h_try_samples;
-            bb5h_note(c, reg16 ? 16u : (flat ? 32u : 0u), 0u);
+            bb5h_note(c, reg16 ? 16u : (flat ? 32u : (b32 ? 33u : 0u)), 0u);
             if (flat) bb5i_capture_hot_opcodes(c);
         }
 #if B86_PJ_V91_PM16
-        if (!flat && !reg16) { PJ_V91_COUNT(PJ_V91_INELIGIBLE); return 0u; }
+        if (!flat && !reg16 && !b32) { PJ_V91_COUNT(PJ_V91_INELIGIBLE); return 0u; }
 #else
-        if (!flat && !reg16) return 0u;
+        if (!flat && !reg16 && !b32) return 0u;
 #endif
 #if BB_PJ_PM16_ADAPTIVE
         /* Skip BEFORE the PM16 cache/mode transition, translation and
@@ -12427,7 +12660,10 @@ static B86_PM_HOT unsigned b86_pj_try(B86Cpu *c)
             return 0u;
         }
 #endif
-        if (reg16) {
+        if (reg16 || b32) {                           /* V114: based 32-bit code also runs in a CS context */
+#if B86_PJ_V114_B32
+            if (b32) { PJ_V114_INC(0); if (!j->b32_active || j->pm16_base != cs->base) PJ_V114_INC(1); }
+#endif
             if (!j->pm16_active || j->pm16_base != cs->base ||
                 j->pm16_limit != cs->limit || j->pm16_kind != kind) {
                 /* r71: switch to (or create) this segment's block table */
@@ -12450,9 +12686,15 @@ static B86_PM_HOT unsigned b86_pj_try(B86Cpu *c)
             j->pm16_active = 1u;
             j->pm16_base = cs->base;
             j->pm16_limit = cs->limit;
-            j->pm16_kind = kind;
+            j->pm16_kind = kind;              /* includes the D bit: B32 and PM16 contexts never mix */
+#if B86_PJ_V114_B32
+            j->b32_active = b32;
+#endif
         } else if (j->pm16_active) {                    /* r71: flat blocks stay valid */
             j->pm16_active = 0u;
+#if B86_PJ_V114_B32
+            j->b32_active = 0u;
+#endif
             j->es_mode = 0u;
         }
     }
@@ -12463,7 +12705,7 @@ static B86_PM_HOT unsigned b86_pj_try(B86Cpu *c)
      * now emits a runtime check; linked blocks use the same guards. */
     {
 #if BB_PJ_PM16_REG_TIER
-        const unsigned mode = j->pm16_active ? 0u : (pj_es_flat(c) ? 1u : 2u);
+        const unsigned mode = PJ_PM16SEM(j) ? 0u : (pj_es_flat(c) ? 1u : 2u);   /* V114: B32 = flat ES rules */
 #else
         const unsigned mode = pj_es_flat(c) ? 1u : 2u;
 #endif
@@ -12791,7 +13033,7 @@ static B86_PM_HOT unsigned b86_pj_try(B86Cpu *c)
      * A 64-entry window below 4 guest instructions/entry indicates that
      * the short register-only tier is not amortizing its dispatcher costs.
      * Probe again after 4096 interpreter entry opportunities. */
-    if (j->pm16_active) {
+    if (PJ_PM16SEM(j)) {                              /* V114: B32 runs are not PM16 admission samples */
         j->pm16_adapt_insns += n;
         if (++j->pm16_adapt_calls >= 64u) {
             if (j->pm16_adapt_insns < 256u) {
@@ -12804,18 +13046,35 @@ static B86_PM_HOT unsigned b86_pj_try(B86Cpu *c)
     }
 #endif
     ++j->runs; j->insns += n;
-#if B86_PJ_V93_PM16_LINK && BB_PJ_PM16_REG_TIER
-    if (c->pj_exit && n && j->pm16_active) {               /* V93: chain 16-bit blocks */
+#if PJ_CTX_LINK && BB_PJ_PM16_REG_TIER
+    if (c->pj_exit && n && j->pm16_active) {               /* V93: chain 16-bit blocks; V116: and based-32 */
         const B86PM1Cache *cs93 = &c->pm386.seg[B86_CS];
         const uint32_t kind93 = (uint32_t)cs93->selector | ((uint32_t)cs93->flags << 16) |
                                 ((uint32_t)cs93->access << 24);
+#if B86_PJ_V93_PM16_LINK
         ++pj_v93_n[0];
-        if (pj_pm16_reg_ok(c) && cs93->base == j->pm16_base && cs93->limit == j->pm16_limit &&
+#endif
+        if ((
+#if B86_PJ_V93_PM16_LINK
+             pj_pm16_reg_ok(c) ||
+#endif
+#if B86_PJ_V114_B32 && B86_PJ_V115_B32LINK
+             (j->b32_active && pj_b32_ok(c)) ||   /* same based-32 context, DS/SS still flat */
+#endif
+             0) && cs93->base == j->pm16_base && cs93->limit == j->pm16_limit &&
             kind93 == j->pm16_kind) {
             const unsigned long links93 = j->links;
             b86_pj_link(c);
+#if B86_PJ_V93_PM16_LINK
             if (j->links != links93) ++pj_v93_n[2];
-        } else ++pj_v93_n[1];
+#endif
+#if B86_PJ_V114_B32 && B86_PJ_V115_B32LINK
+            if (j->links != links93 && j->b32_active) PJ_V115_INC(0);
+#endif
+        }
+#if B86_PJ_V93_PM16_LINK
+        else ++pj_v93_n[1];
+#endif
     } else
 #endif
     if (c->pj_exit && n && pj_flat(c)) b86_pj_link(c);
@@ -13443,9 +13702,16 @@ void b86_pj_mem_profile(const B86Cpu *c, unsigned long out[8])
            (unsigned long)bb_pm16_diag.v11_66_pop,
            (unsigned long)bb_pm16_diag.v11_66_stack_other);
 #endif
+#if B86_PJ_V114_B32 && BB_PJ_PM16_REG_TIER
+#if B86_PJ_V115_B32LINK
+    printf("[bb386-v115-b32] links=%lu native-rets=%lu\n", PJ_V115_GET(0), PJ_V115_GET(1));
+#endif
+    printf("[bb386-v114-b32] admitted-entries=%lu context-switches=%lu blocks-translated=%lu cs-prefix-declines=%lu control-declines=%lu\n",
+           PJ_V114_GET(0), PJ_V114_GET(1), PJ_V114_GET(2), PJ_V114_GET(3), PJ_V114_GET(4));
+#endif
 #if B86_PJ_V113_SEGLOAD
     printf("[bb386-v113-seg] translated push-fs/gs=%lu pop-fs/gs=%lu lss=%lu lfs=%lu lgs=%lu mov-fs/gs=%lu; lxs helper ok=%lu refused=%lu\n",
-           pj_v113_n[0], pj_v113_n[1], pj_v113_n[2], pj_v113_n[3], pj_v113_n[4], pj_v113_n[5], pj_v113_n[6], pj_v113_n[7]);
+           PJ_V113_GET(0), PJ_V113_GET(1), PJ_V113_GET(2), PJ_V113_GET(3), PJ_V113_GET(4), PJ_V113_GET(5), PJ_V113_GET(6), PJ_V113_GET(7));
 #endif
     /* Translation-stop histogram only.  The existing blitzBUS [bb386-0f]
      * c-executed counter is a DIFFERENT metric and is not mode-separated. */
