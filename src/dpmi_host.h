@@ -41,6 +41,11 @@ typedef struct DpmiEnv {
      * swap callbacks, the region is limited to the frames (no eviction). */
     uint32_t vm_size;           /* bytes of virtual region (0 = 16 MB) */
     int pg_off_in_rm;           /* 1: paging off during host real-mode calls (0: identity-mapped, stays on) */
+    int irq_direct_off;         /* 1: never deliver hardware interrupts straight to the application */
+    unsigned (*pic_isr)(void);  /* in-service IRQs (bit n = IRQ n, slave in bits 8-15); direct delivery only for those */
+    int irq_direct_flat_only;   /* 1: deliver directly only to handlers in flat segments (base 0) */
+    int bios_fast_off;          /* 1: always reflect IRQs to real mode, even a BIOS "EOI only" tick */
+    uint32_t bios_irq0_hint;    /* seg<<16|off of the embedder's own BIOS IRQ0 handler (0 = none) */
     int (*swap_read)(uint32_t slot, uint8_t *page4k);
     int (*swap_write)(uint32_t slot, const uint8_t *page4k);
 } DpmiEnv;

@@ -8,6 +8,14 @@
 /* uint32_t is unsigned long on newlib/ARM, unsigned int elsewhere; both 32 bits, so %X prints
  * the same value. Keep the log formats portable instead of casting every argument. */
 #pragma GCC diagnostic ignored "-Wformat"
+/* phase markers for the embedder's crash recorder (blitzBUS: watchdog scratch[2]) */
+#ifndef DPMI_PHASE
+#define DPMI_PHASE(p) ((void)0)
+#endif
+#define PH_TRAP  0x02000000u     /* | host-stub offset */
+#define PH_PF    0x03000000u     /* | page number */
+#define PH_INT31 0x06000000u     /* | function */
+#define PH_RMINT 0x07000000u     /* | real-mode vector */
 #ifndef DPMI_LOG
 #define DPMI_LOG(...) fprintf(stderr, __VA_ARGS__)   /* blitzBUS defines it as printf */
 #endif
@@ -24,6 +32,7 @@
 #define HC_SAVE    0x400u
 #define HC_RAWRM   0x404u
 #define HC_CBRET   0x408u            /* IRET target of a real-mode callback procedure */
+#define HC_WATCH   0x600u            /* IDT stubs of watched vectors: 600h + 4*slot (slot 0 = INT 21h, 1-16 = IRQs) */
 #define HB_CBSTUB  0x3540u           /* 16 real-mode callback stubs, 4 bytes each: CD E3 <slot> 90 (after the TSS at 3480h+68h) */
 #define CB_N       16u
 #define HB_PARAS   ((HB_SIZE + 15u) / 16u)
@@ -76,6 +85,14 @@ typedef struct DpmiS {
     unsigned long faults, zero_fills, swap_ins, swap_outs, evict_fail;
     B86Cpu *cpu;                         /* the CPU of the current host call (for TLB flushes) */
     unsigned long declined;              /* page faults passed on to the client */
+    /* direct IRQ delivery: the application's own handler per IRQ vector, learned from
+     * INT 21h AH=25h on its way to the client's INT 21h handler */
+    uint16_t app_sel[16]; uint32_t app_off[16];
+    unsigned long irq_direct, irq_wrapper, irq_learned, bios_fast;
+    uint8_t bios_why_logged;
+    uint16_t rm_entry_off[8], rm_entry_seg[8];   /* real-mode vectors 08h-0Fh when the client entered */
+    uint8_t rm_set_mask;                          /* vectors 08h-0Fh the client set through 0201h */
+    int direct_off;                      /* env switch: 1 = never deliver directly */
 } DpmiS;
 static DpmiS *S;
 #define E (S->env)
@@ -295,23 +312,36 @@ static int slot_alloc(void)
 }
 static void slot_free(uint32_t i) { if (i < S->nslots) S->slot_used[i >> 3] &= (uint8_t)~(1u << (i & 7u)); }
 /* a frame for a new page: free one, else evict by clock (second chance on the A bit) */
-static int frame_get(B86Cpu *c, uint32_t *phys)
+#define EVICT_BATCH 8u
+/* evict one page by clock (second chance on the A bit); 1 = a frame was freed */
+static int evict_one(void)
 {
-    for (uint32_t k = 0; k < S->nframes; ++k) if (!S->frame_vpn[k]) { *phys = S->frame0 + (k << 12); return (int)k; }
-    if (!E.swap_write) { ++S->evict_fail; return -1; }
     for (uint32_t pass = 0; pass < 2u * S->nframes; ++pass) {
         uint32_t k = S->hand; S->hand = (S->hand + 1u) % S->nframes;
-        if (!S->frame_vpn[k]) { *phys = S->frame0 + (k << 12); return (int)k; }
+        if (!S->frame_vpn[k]) continue;
         uint32_t lin = (S->frame_vpn[k] - 1u) << 12, pa = pte_addr(lin), pte = prd32(pa);
         if (pte & 0x20u) { pwr32(pa, pte & ~0x20u); continue; }          /* accessed: second chance */
-        int slot = slot_alloc(); if (slot < 0) { ++S->evict_fail; return -1; }
+        int slot = slot_alloc(); if (slot < 0) return 0;
         uint32_t fr = S->frame0 + (k << 12);
         memcpy(S->page, E.mem + fr, 4096u);
-        if (!E.swap_write((uint32_t)slot, S->page)) { slot_free((uint32_t)slot); ++S->evict_fail; return -1; }
+        if (!E.swap_write((uint32_t)slot, S->page)) { slot_free((uint32_t)slot); return 0; }
         pwr32(pa, ((uint32_t)(slot + 1) << 12) | VM_SWAPPED);
         S->frame_vpn[k] = 0; ++S->swap_outs;
-        tlb_drop(c);
-        *phys = fr; return (int)k;
+        return 1;
+    }
+    return 0;
+}
+/* a frame for a new page: a free one, else evict a batch (up to EVICT_BATCH pages,
+ * one TLB flush - one JIT mapping epoch - for the whole batch) */
+static int frame_get(B86Cpu *c, uint32_t *phys)
+{
+    for (int round = 0; round < 2; ++round) {
+        for (uint32_t k = 0; k < S->nframes; ++k) if (!S->frame_vpn[k]) { *phys = S->frame0 + (k << 12); return (int)k; }
+        if (round || !E.swap_write) break;
+        unsigned n = 0;
+        while (n < EVICT_BATCH && evict_one()) ++n;
+        if (n) tlb_drop(c);
+        if (!n) break;
     }
     ++S->evict_fail; return -1;
 }
@@ -340,7 +370,9 @@ static int vm_fault(B86Cpu *c, uint32_t lin, uint32_t err)
 }
 static int vm_pf_hook(B86Cpu *c, uint32_t lin, uint32_t err)
 {
+    DPMI_PHASE(PH_PF | ((lin >> 12) & 0xFFFFFu));
     int ok = vm_fault(c, lin, err);
+    DPMI_PHASE(0x01000000u);
     if (!ok && S && ++S->declined <= 16u)                  /* the client gets the #PF: say why */
         DPMI_LOG("[dpmi] page fault at %08lX err=%lX NOT resolved (%s) -> client #PF\n", (unsigned long)lin, (unsigned long)err,
                  !S->pd ? "no paging" : (lin < S->vbase || lin >= S->vend) ? "outside the virtual region" :
@@ -403,6 +435,67 @@ static void vm_start(B86Cpu *c)
     if (E.trace) DPMI_LOG("[dpmi] VM: %lu frames at %08lX, virtual %08lX-%08lX, %lu swap slots\n", (unsigned long)S->nframes, (unsigned long)S->frame0, (unsigned long)S->vbase, (unsigned long)S->vend, (unsigned long)S->nslots);
 }
 
+/* ---- direct hardware-interrupt delivery -------------------------------------------------- */
+static int irq_index(unsigned v) { return (v >= 0x08u && v <= 0x0Fu) ? (int)(v - 0x08u) : (v >= 0x70u && v <= 0x77u) ? (int)(v - 0x70u + 8u) : -1; }
+/* vectors the host watches: INT 21h (to learn handlers) and every IRQ vector.
+ * Their IDT entries use separate stubs (HC_WATCH): the default handler a client
+ * gets from 0204h stays 4*v, so a client chaining to it is not mistaken for a
+ * new interrupt. */
+static int watched(unsigned v) { return v == 0x21u || irq_index(v) >= 0; }
+static unsigned watch_slot(unsigned v) { return v == 0x21u ? 0u : 1u + (unsigned)irq_index(v); }
+static int watch_vector(uint32_t ip)
+{
+    if (ip < HC_WATCH || ip >= HC_WATCH + 4u * 17u || (ip & 3u)) return -1;
+    unsigned slot = (ip - HC_WATCH) / 4u;
+    return slot == 0u ? 0x21 : (slot <= 8u ? (int)(0x08u + slot - 1u) : (int)(0x70u + slot - 9u));
+}
+static int is_code32(uint16_t sel)
+{
+    if (!(sel & 4u) || !sel_ok(sel)) return 0;
+    uint32_t a = ldt_addr(sel); uint8_t acc = rd8(a + 5), fl = rd8(a + 6);
+    return (acc & 0x98u) == 0x98u && (fl & 0x40u);            /* present code, D = 1 */
+}
+/* point the IDT at the client's handler, or at the host stub for watched vectors */
+static void gate_for(unsigned v)
+{
+    if (g_pm_vec_sel[v] == SEL_HOST_CS) gate_write(v, SEL_HOST_CS, 4u * v);                     /* default: reflect */
+    else if (watched(v) && !S->direct_off) gate_write(v, SEL_HOST_CS, HC_WATCH + 4u * watch_slot(v));
+    else gate_write(v, (uint16_t)g_pm_vec_sel[v], g_pm_vec_off[v]);
+}
+/* continue an interrupt in the client's own handler: the frame on the stack is
+ * exactly the one the gate pushed, so the handler sees a normal entry */
+static void enter_client(B86Cpu *c, uint16_t sel, uint32_t off) { c->ip = off; load_cs(c, sel); }
+
+/* ---- BIOS timer tick without a mode switch ------------------------------------------------ */
+/* The real-mode handler of an IRQ vector is exactly "push ax; mov al,20h; out 20h,al;
+ * pop ax; int 1Ch; iret" and INT 1Ch points at a bare IRET: running it changes no
+ * register or flag, its only effect is the EOI. Do that EOI here instead of a real-mode
+ * round trip (which costs a mode switch and a JIT epoch). Any other handler bytes -
+ * a TSR or DOS hooking INT 08h/1Ch - take the normal reflection. */
+/* The handler a chained tick ultimately reaches is the one that was there before the
+ * client hooked anything: DOS/4G writes its own real-mode pass-up stubs into the IVT
+ * (not through 0201h), and they pass a chained tick down to that original handler.
+ * A vector the client set through 0201h is a deliberate hook: checked as it is now. */
+static int bios_eoi_only(B86Cpu *c, unsigned v)
+{
+    static const uint8_t stub[9] = { 0x50u, 0xB0u, 0x20u, 0xE6u, 0x20u, 0x58u, 0xCDu, 0x1Cu, 0xCFu };
+    if (E.bios_fast_off || !c->out8 || irq_index(v) < 0 || v > 0x0Fu) return 0;   /* master PIC IRQs only */
+    const unsigned k = v - 8u;
+    const int use_entry = !(S->rm_set_mask & (1u << k)) && (S->rm_entry_seg[k] | S->rm_entry_off[k]);
+    uint32_t h = use_entry ? ((uint32_t)S->rm_entry_seg[k] << 4) + S->rm_entry_off[k]
+                           : ((uint32_t)rd16(4u * v + 2u) << 4) + rd16(4u * v);
+    /* the client may have put its own real-mode pass-up stub in front of the BIOS handler
+     * before it ever asked for DPMI (DOS/4G does): use the embedder's BIOS handler then */
+    if (v == 0x08u && E.bios_irq0_hint && !(S->rm_set_mask & 1u)) {
+        uint32_t hh = ((E.bios_irq0_hint >> 16) << 4) + (E.bios_irq0_hint & 0xFFFFu);
+        unsigned i; for (i = 0; i < sizeof stub && rd8(h + i) == stub[i]; ++i) ;
+        if (i < sizeof stub) h = hh;
+    }
+    for (unsigned i = 0; i < sizeof stub; ++i) if (rd8(h + i) != stub[i]) return 0;
+    uint32_t h1c = ((uint32_t)rd16(4u * 0x1Cu + 2u) << 4) + rd16(4u * 0x1Cu);
+    return rd8(h1c) == 0xCFu;
+}
+
 /* ---- INT 31h ------------------------------------------------------------------------- */
 #define AX  (c->r[0] & 0xFFFFu)
 #define SETAX(v) (c->r[0] = (c->r[0] & 0xFFFF0000u) | ((v) & 0xFFFFu))
@@ -446,6 +539,7 @@ static void start_rm_struct(B86Cpu *c, unsigned fn, uint32_t frame)
 static int int31(B86Cpu *c, uint32_t frame, int *async)
 {
     unsigned fn = AX;
+    DPMI_PHASE(PH_INT31 | fn);
     ++g_calls[FNI(fn)];
     if (E.trace) DPMI_LOG("[dpmi] 31h %04X bx=%08X cx=%08X dx=%08X si=%08X di=%08X\n", fn, c->r[3], c->r[1], c->r[2], c->r[6], c->r[7]);
     switch (fn) {
@@ -481,12 +575,14 @@ static int int31(B86Cpu *c, uint32_t frame, int *async)
                regs[0] = fn == 0x101u ? 0x4900u : 0x4A00u; regs[3] = c->r[3] & 0xFFFFu; }
         rm_call(c, s, rd16(4u * 0x21u + 2u), rd16(4u * 0x21u), 1, regs, segs, c->flags, 0, 0); *async = 1; return 0; }
     case 0x0200: { unsigned v = c->r[3] & 0xFFu; SETCX(rd16(4u * v + 2u)); SETDX(rd16(4u * v)); return 0; }
-    case 0x0201: { unsigned v = c->r[3] & 0xFFu; wr16(4u * v, (uint16_t)c->r[2]); wr16(4u * v + 2u, (uint16_t)c->r[1]); return 0; }
+    case 0x0201: { unsigned v = c->r[3] & 0xFFu; wr16(4u * v, (uint16_t)c->r[2]); wr16(4u * v + 2u, (uint16_t)c->r[1]);
+        if (v >= 0x08u && v <= 0x0Fu) { S->rm_set_mask |= (uint8_t)(1u << (v - 8u)); }
+        return 0; }
     case 0x0202: { unsigned v = c->r[3] & 0xFFu; if (v >= 32u) return fail(c, E_INVALID_VALUE); SETCX(g_exc_sel[v]); c->r[2] = g_exc_off[v]; return 0; }
     case 0x0203: { unsigned v = c->r[3] & 0xFFu; if (v >= 32u) return fail(c, E_INVALID_VALUE); g_exc_sel[v] = c->r[1] & 0xFFFFu; g_exc_off[v] = c->r[2]; return 0; }
     case 0x0204: { unsigned v = c->r[3] & 0xFFu; SETCX(g_pm_vec_sel[v]); c->r[2] = g_pm_vec_off[v]; return 0; }
     case 0x0205: { unsigned v = c->r[3] & 0xFFu; g_pm_vec_sel[v] = c->r[1] & 0xFFFFu; g_pm_vec_off[v] = c->r[2];
-        if (g_pm_vec_sel[v] == SEL_HOST_CS) gate_write(v, SEL_HOST_CS, 4u * v); else gate_write(v, (uint16_t)g_pm_vec_sel[v], g_pm_vec_off[v]); return 0; }
+        gate_for(v); return 0; }
     case 0x0300: case 0x0301: case 0x0302: start_rm_struct(c, fn, frame); *async = 1; return 0;
     case 0x0303: { /* allocate real-mode callback: DS:ESI = PM procedure, ES:EDI = call structure */
         unsigned i; for (i = 0; i < CB_N && g_cb[i].used; ++i) ;
@@ -540,6 +636,8 @@ static void entry(B86Cpu *c, uint16_t psp)
     uint32_t sp = ((uint32_t)c->seg[B86_SS] << 4) + (c->r[B86_SP] & 0xFFFFu);
     uint16_t ret_ip = rd16(sp), ret_cs = rd16(sp + 2);
     int client32 = (c->r[0] & 1u) != 0; g_client32 = client32;
+    for (unsigned k = 0; k < 8u; ++k) { S->rm_entry_off[k] = rd16(4u * (8u + k)); S->rm_entry_seg[k] = rd16(4u * (8u + k) + 2u); }
+    S->rm_set_mask = 0;
     g_hbseg = c->seg[B86_ES]; g_hb = (uint32_t)g_hbseg << 4;
     memset(E.mem + g_hb, 0, HB_SIZE);
     memset(E.mem + g_hb + HB_CODE, 0xF4, 0x800);                                   /* HLT: never executed */
@@ -622,6 +720,7 @@ DPMI_COLD void dpmi_init(DpmiEnv *env)
     if (!S) return;
     memset(S, 0, sizeof *S);
     E = *env; g_active = 0; g_depth = 0;
+    S->direct_off = env->irq_direct_off;
     uint32_t st = ((uint32_t)E.stub_seg << 4) + E.stub_off;
     /* +0 INT E0; RETF (entry)  +3 INT E1 (return from real mode)  +6 INT E2 (raw switch to PM)  +8 RETF (save/restore) */
     /* +9 INT E4 (entry continues with the PSP in BX) */
@@ -635,6 +734,7 @@ DPMI_COLD int dpmi_ready(void) { return S != 0; }
 DPMI_COLD int dpmi_rm_int(B86Cpu *c, uint8_t vector)
 {
     if (!S) return 0;
+    DPMI_PHASE(PH_RMINT | vector);
     g_cpu = c;
     if (vector == 0x2Fu) {
         unsigned ax = c->r[0] & 0xFFFFu;
@@ -710,6 +810,7 @@ DPMI_COLD void dpmi_pm_trap(B86Cpu *c)
 {
     if (!S) return;
     g_cpu = c;
+    DPMI_PHASE(PH_TRAP | (c->ip & 0xFFFFu));
     if (c->ip == HC_SAVE) {                           /* state save/restore procedure: far return (16- or 32-bit call) */
         uint32_t sp = stack_lin(c);
         if (sel_ok(rd16(sp + 2u)) || rd16(sp + 2u) == SEL_HOST_CS) { c->ip = rd16(sp); load_cs(c, rd16(sp + 2u)); sp_add(c, 4); }
@@ -738,8 +839,50 @@ DPMI_COLD void dpmi_pm_trap(B86Cpu *c)
         if (E.trace) DPMI_LOG("[dpmi] raw switch -> real %04X:%04X\n", cs, (unsigned)ip);
         return;
     }
-    unsigned v = (c->ip / 4u) & 0xFFu;
+    int wv = watch_vector(c->ip);
+    unsigned v = wv >= 0 ? (unsigned)wv : (c->ip / 4u) & 0xFFu;
     uint32_t frame = stack_lin(c);
+    if (wv >= 0) {
+        int k = irq_index(v);
+        if (v == 0x21u) {
+            /* the application sets an IRQ vector through the client: remember its handler */
+            uint8_t ah = (uint8_t)(c->r[0] >> 8), al = (uint8_t)c->r[0];
+            int ki = irq_index(al);
+            if (ah == 0x25u && ki >= 0) {
+                uint16_t sel = get_sel(c, B86_DS); uint32_t off = c->r[2];
+                if (is_code32(sel) && is_code32((uint16_t)rd32(frame + 4u)) &&
+                    (!E.irq_direct_flat_only || desc_base(ldt_addr(sel)) == 0u)) { S->app_sel[ki] = sel; S->app_off[ki] = off; ++S->irq_learned; }
+                else S->app_sel[ki] = 0;                       /* anything else: leave it to the client */
+                if (E.trace) DPMI_LOG("[dpmi] INT 21h 25h vector %02X := %04X:%08lX (%s)\n", al, sel, (unsigned long)off, S->app_sel[ki] ? "direct" : "client");
+            }
+            if (ah == 0x35u && ki >= 0 && !S->direct_off && is_code32((uint16_t)rd32(frame + 4u))) {
+                /* "current handler" of an IRQ vector: the host's default (reflect to the
+                 * real-mode BIOS). An application chaining to it then never enters the
+                 * client's internal chain code without the client's wrapper around it. */
+                set_sel(c, B86_ES, SEL_HOST_CS); c->pm386.seg[B86_ES] = c->pm386.seg[B86_CS];
+                load_seg(c, B86_ES, SEL_HOST_CS);
+                c->r[3] = 4u * al; ++S->irq_learned;
+                if (E.trace) DPMI_LOG("[dpmi] INT 21h 35h vector %02X -> host default %04X:%04X\n", al, SEL_HOST_CS, 4u * al);
+                host_iret(c, frame, 0, 0);
+                return;
+            }
+            enter_client(c, (uint16_t)g_pm_vec_sel[v], g_pm_vec_off[v]);
+            return;
+        }
+        if (k >= 0) {
+            /* hardware interrupt: straight to the application's handler when the
+             * interrupted code is 32-bit on a 32-bit stack, else the client's wrapper */
+            uint16_t icsel = (uint16_t)rd32(frame + 4u);
+            if (E.trace && S->irq_direct + S->irq_wrapper < 12u) DPMI_LOG("[dpmi] irq-vector %02X from %04X:%08lX ss32=%u app=%04X\n", v, icsel, (unsigned long)rd32(frame), (unsigned)!!(c->pm386.seg[B86_SS].flags & 4u), S->app_sel[k]);
+            /* only a real hardware interrupt: vectors 08h-0Fh are also CPU exceptions
+             * (0Dh = #GP, 0Eh = #PF); those and software INTs stay with the client */
+            const int hw = E.pic_isr && (E.pic_isr() & (1u << (unsigned)k));
+            if (hw && S->app_sel[k] && !S->direct_off && is_code32(icsel) && (c->pm386.seg[B86_SS].flags & 4u)) {
+                ++S->irq_direct; enter_client(c, S->app_sel[k], S->app_off[k]);
+            } else { ++S->irq_wrapper; enter_client(c, (uint16_t)g_pm_vec_sel[v], g_pm_vec_off[v]); }
+            return;
+        }
+    }
     if (v == 0x31u) {
         int async = 0;
         int cf = int31(c, frame, &async);
@@ -755,6 +898,23 @@ DPMI_COLD void dpmi_pm_trap(B86Cpu *c)
     uint16_t segs[6] = {0};
     for (unsigned i = 0; i < 4u; ++i) { static const unsigned m[4] = { B86_DS, B86_ES, B86_FS, B86_GS }; uint32_t b = c->pm386.seg[m[i]].valid ? c->pm386.seg[m[i]].base : 0u; segs[i] = b < 0x100000u ? (uint16_t)(b >> 4) : 0u; }
     uint32_t fl = rd32(frame + 8);
+    if (v == 0x08u && !S->bios_fast && !S->bios_why_logged) {   /* one line: why the BIOS tick is not handled in C */
+        uint16_t so = rd16(0x20u), sg = rd16(0x22u), co = rd16(0x70u), cg = rd16(0x72u);
+        uint32_t h = ((uint32_t)sg << 4) + so, h1 = ((uint32_t)cg << 4) + co;
+        S->bios_why_logged = 1u;
+        uint32_t he = ((uint32_t)S->rm_entry_seg[0] << 4) + S->rm_entry_off[0];
+        DPMI_LOG("[dpmi] tick reflect: INT 08h -> %04X:%04X bytes %02X %02X %02X %02X %02X %02X %02X %02X %02X; at client entry %04X:%04X bytes %02X %02X %02X %02X %02X %02X %02X %02X %02X%s; INT 1Ch -> %04X:%04X byte %02X; out8 %s%s\n",
+                 sg, so, rd8(h), rd8(h + 1), rd8(h + 2), rd8(h + 3), rd8(h + 4), rd8(h + 5), rd8(h + 6), rd8(h + 7), rd8(h + 8),
+                 S->rm_entry_seg[0], S->rm_entry_off[0], rd8(he), rd8(he + 1), rd8(he + 2), rd8(he + 3), rd8(he + 4), rd8(he + 5), rd8(he + 6), rd8(he + 7), rd8(he + 8),
+                 (S->rm_set_mask & 1u) ? " (client set it via 0201h)" : "",
+                 cg, co, rd8(h1), c->out8 ? "set" : "NULL", E.bios_fast_off ? " (fast path switched off)" : "");
+    }
+    if (bios_eoi_only(c, v)) {                    /* BIOS tick: EOI only, no round trip */
+        --g_depth; ++S->bios_fast;
+        c->out8(c, 0x20u, 0x20u);
+        host_iret(c, frame, 0, 0);
+        return;
+    }
     rm_call(c, s, rd16(4u * v + 2u), rd16(4u * v), 1, regs, segs, fl, 0, 0);
 }
 
@@ -763,5 +923,6 @@ DPMI_COLD void dpmi_report(void)
     if (!S) return;
     DPMI_LOG("[dpmi] active=%d real-mode calls=%lu reflected=%lu\n", g_active, g_rmcalls, g_reflect);
     DPMI_LOG("[dpmi] vm: faults=%lu zero-fills=%lu swap-ins=%lu swap-outs=%lu evict-fail=%lu frames=%lu\n", S->faults, S->zero_fills, S->swap_ins, S->swap_outs, S->evict_fail, (unsigned long)S->nframes);
+    DPMI_LOG("[dpmi] irq: direct=%lu via-client=%lu handlers-learned=%lu bios-ticks-in-C=%lu%s\n", S->irq_direct, S->irq_wrapper, S->irq_learned, S->bios_fast, S->direct_off ? " (direct delivery off)" : "");
     for (unsigned i = 0; i < 256u; ++i) if (g_calls[i]) DPMI_LOG("[dpmi]   fn %04X: %lu calls%s\n", ((i >> 4) << 8) | (i & 15u), g_calls[i], g_unsupported[i] ? " (UNSUPPORTED)" : "");
 }
