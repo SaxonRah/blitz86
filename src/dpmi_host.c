@@ -91,6 +91,9 @@ typedef struct DpmiS {
     unsigned long irq_direct, irq_wrapper, irq_learned, bios_fast;
     uint8_t bios_why_logged;
     uint16_t rm_entry_off[8], rm_entry_seg[8];   /* real-mode vectors 08h-0Fh when the client entered */
+    unsigned long int_n[10], int_n32[10];        /* diagnostic: [0..8] stat_vec, [9] INT 21h; *32: from 32-bit code */
+    unsigned long ah21[256];                     /* diagnostic: INT 21h from 32-bit code, by AH */
+    unsigned long time_fast;                     /* INT 21h AH=2Ch answered here */
     uint8_t rm_set_mask;                          /* vectors 08h-0Fh the client set through 0201h */
     int direct_off;                      /* env switch: 1 = never deliver directly */
 } DpmiS;
@@ -441,12 +444,16 @@ static int irq_index(unsigned v) { return (v >= 0x08u && v <= 0x0Fu) ? (int)(v -
  * Their IDT entries use separate stubs (HC_WATCH): the default handler a client
  * gets from 0204h stays 4*v, so a client chaining to it is not mistaken for a
  * new interrupt. */
-static int watched(unsigned v) { return v == 0x21u || irq_index(v) >= 0; }
-static unsigned watch_slot(unsigned v) { return v == 0x21u ? 0u : 1u + (unsigned)irq_index(v); }
+/* diagnostic (int_stats): software vectors counted on their way to the client */
+static const uint8_t stat_vec[9] = { 0x10, 0x11, 0x12, 0x15, 0x16, 0x1A, 0x2F, 0x31, 0x33 };
+static int stat_index(unsigned v) { if (!E.int_stats) return -1; for (unsigned i = 0; i < 9u; ++i) if (stat_vec[i] == v) return (int)i; return -1; }
+static int watched(unsigned v) { return v == 0x21u || irq_index(v) >= 0 || stat_index(v) >= 0; }
+static unsigned watch_slot(unsigned v) { return v == 0x21u ? 0u : irq_index(v) >= 0 ? 1u + (unsigned)irq_index(v) : 17u + (unsigned)stat_index(v); }
 static int watch_vector(uint32_t ip)
 {
-    if (ip < HC_WATCH || ip >= HC_WATCH + 4u * 17u || (ip & 3u)) return -1;
+    if (ip < HC_WATCH || ip >= HC_WATCH + 4u * 26u || (ip & 3u)) return -1;
     unsigned slot = (ip - HC_WATCH) / 4u;
+    if (slot >= 17u) return stat_vec[slot - 17u];
     return slot == 0u ? 0x21 : (slot <= 8u ? (int)(0x08u + slot - 1u) : (int)(0x70u + slot - 9u));
 }
 static int is_code32(uint16_t sel)
@@ -494,6 +501,25 @@ static int bios_eoi_only(B86Cpu *c, unsigned v)
     for (unsigned i = 0; i < sizeof stub; ++i) if (rd8(h + i) != stub[i]) return 0;
     uint32_t h1c = ((uint32_t)rd16(4u * 0x1Cu + 2u) << 4) + rd16(4u * 0x1Cu);
     return rd8(h1c) == 0xCFu;
+}
+
+/* ---- INT 21h AH=2Ch without the client's 16-bit dispatcher --------------------------------- */
+/* DOS/4G answers "get time" itself from the BIOS tick count, in 16-bit code reached through
+ * its INT 21h filter and dispatcher (~540 instructions per call; Descent polls it in loops).
+ * This is DOS/4G's own conversion (004C:14AF-14EE, the MS-DOS clock arithmetic), checked
+ * against a literal model of that code for every tick of a day and against DOS/4G's answers:
+ * CH=hours CL=minutes DH=seconds DL=hundredths; nothing else changes (flags included). */
+static void dos_time_from_ticks(uint32_t ticks, uint16_t *cxo, uint16_t *dxo)
+{
+    const uint16_t hi = (uint16_t)(ticks >> 16), lo = (uint16_t)ticks;
+    const uint16_t q3 = (uint16_t)(((uint32_t)0x16u * hi) / 3u);
+    const uint16_t cx = (uint16_t)((lo >> 13) + q3);
+    const uint16_t a = (uint16_t)(lo - cx);
+    const uint8_t bl = (uint8_t)((uint8_t)hi - (lo < cx ? 1u : 0u));
+    const uint32_t prod = (uint32_t)a * 0x0CFBu;
+    const uint16_t q = (uint16_t)(prod / 0xEC54u), r = (uint16_t)(prod % 0xEC54u);
+    *cxo = (uint16_t)(((uint16_t)bl << 8) | (uint8_t)(q / 60u));
+    *dxo = (uint16_t)(((uint16_t)(uint8_t)(q % 60u) << 8) | (uint8_t)(r / 605u));
 }
 
 /* ---- INT 31h ------------------------------------------------------------------------- */
@@ -844,7 +870,15 @@ DPMI_COLD void dpmi_pm_trap(B86Cpu *c)
     uint32_t frame = stack_lin(c);
     if (wv >= 0) {
         int k = irq_index(v);
+        if (stat_index(v) >= 0) {                      /* diagnostic: count, then the client's handler */
+            const int si = stat_index(v);
+            ++S->int_n[si]; if (is_code32((uint16_t)rd32(frame + 4u))) ++S->int_n32[si];
+            enter_client(c, (uint16_t)g_pm_vec_sel[v], g_pm_vec_off[v]);
+            return;
+        }
         if (v == 0x21u) {
+            ++S->int_n[9]; if (is_code32((uint16_t)rd32(frame + 4u))) { ++S->int_n32[9]; if (E.int_stats) { ++S->ah21[(c->r[0] >> 8) & 0xFFu];
+                if (E.trace && ((c->r[0] >> 8) & 0xFFu) == 0x2Cu && S->ah21[0x2C] <= 3u) DPMI_LOG("[dpmi] INT 21h AH=2C #%lu at insn %llu from %04X:%08lX\n", S->ah21[0x2C], (unsigned long long)c->icount, (unsigned)(uint16_t)rd32(frame + 4u), (unsigned long)rd32(frame)); } }
             /* the application sets an IRQ vector through the client: remember its handler */
             uint8_t ah = (uint8_t)(c->r[0] >> 8), al = (uint8_t)c->r[0];
             int ki = irq_index(al);
@@ -854,6 +888,17 @@ DPMI_COLD void dpmi_pm_trap(B86Cpu *c)
                     (!E.irq_direct_flat_only || desc_base(ldt_addr(sel)) == 0u)) { S->app_sel[ki] = sel; S->app_off[ki] = off; ++S->irq_learned; }
                 else S->app_sel[ki] = 0;                       /* anything else: leave it to the client */
                 if (E.trace) DPMI_LOG("[dpmi] INT 21h 25h vector %02X := %04X:%08lX (%s)\n", al, sel, (unsigned long)off, S->app_sel[ki] ? "direct" : "client");
+            }
+            if (ah == 0x2Cu && E.dos_time_fast && is_code32((uint16_t)rd32(frame + 4u))) {
+                const uint32_t ticks = rd32(0x46Cu);             /* BDA: ticks since midnight */
+                if (ticks < 0x1800B0u) {
+                    uint16_t tcx, tdx;
+                    dos_time_from_ticks(ticks, &tcx, &tdx);
+                    c->r[1] = (c->r[1] & 0xFFFF0000u) | tcx; c->r[2] = (c->r[2] & 0xFFFF0000u) | tdx;
+                    ++S->time_fast;
+                    host_iret(c, frame, 0, 0);
+                    return;
+                }
             }
             if (ah == 0x35u && ki >= 0 && !S->direct_off && is_code32((uint16_t)rd32(frame + 4u))) {
                 /* "current handler" of an IRQ vector: the host's default (reflect to the
@@ -923,6 +968,19 @@ DPMI_COLD void dpmi_report(void)
     if (!S) return;
     DPMI_LOG("[dpmi] active=%d real-mode calls=%lu reflected=%lu\n", g_active, g_rmcalls, g_reflect);
     DPMI_LOG("[dpmi] vm: faults=%lu zero-fills=%lu swap-ins=%lu swap-outs=%lu evict-fail=%lu frames=%lu\n", S->faults, S->zero_fills, S->swap_ins, S->swap_outs, S->evict_fail, (unsigned long)S->nframes);
-    DPMI_LOG("[dpmi] irq: direct=%lu via-client=%lu handlers-learned=%lu bios-ticks-in-C=%lu%s\n", S->irq_direct, S->irq_wrapper, S->irq_learned, S->bios_fast, S->direct_off ? " (direct delivery off)" : "");
+    DPMI_LOG("[dpmi] irq: direct=%lu via-client=%lu handlers-learned=%lu bios-ticks-in-C=%lu get-time-in-C=%lu%s\n", S->irq_direct, S->irq_wrapper, S->irq_learned, S->bios_fast, S->time_fast, S->direct_off ? " (direct delivery off)" : "");
+    if (E.int_stats) {
+        DPMI_LOG("[dpmi] software INTs through the client (total/from 32-bit code):");
+        for (unsigned i = 0; i < 9u; ++i) DPMI_LOG(" %02X:%lu/%lu", stat_vec[i], S->int_n[i], S->int_n32[i]);
+        DPMI_LOG(" 21:%lu/%lu\n", S->int_n[9], S->int_n32[9]);
+        DPMI_LOG("[dpmi] INT 21h from 32-bit code by AH:");
+        for (unsigned k = 0; k < 8u; ++k) {                 /* the 8 most frequent */
+            unsigned best = 256u; unsigned long bv = 0;
+            for (unsigned a = 0; a < 256u; ++a) if (S->ah21[a] > bv) { bv = S->ah21[a]; best = a; }
+            if (best == 256u) break;
+            DPMI_LOG(" %02X:%lu", best, bv); S->ah21[best] = 0;   /* report is destructive: once per run is enough */
+        }
+        DPMI_LOG("\n");
+    }
     for (unsigned i = 0; i < 256u; ++i) if (g_calls[i]) DPMI_LOG("[dpmi]   fn %04X: %lu calls%s\n", ((i >> 4) << 8) | (i & 15u), g_calls[i], g_unsupported[i] ? " (UNSUPPORTED)" : "");
 }

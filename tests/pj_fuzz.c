@@ -244,8 +244,30 @@ static void b32_cs(B86Cpu *c)
     d->valid = 1; d->base = 0x10000; d->limit = 0xFFFF; d->access = 0x9B; d->flags = 0x4; d->selector = 0x08;
     c->seg[B86_CS] = 0x08;
 }
+static int g_ds_based;   /* V117: mode 44 = mode 41 with a based DS */
 static void gen41(int last)
 {
+    if (g_ds_based && !last && rnd() % 3 == 0) {          /* V117: DS-relative accesses, DS base 0x28000 limit 0x7FFF */
+        static const unsigned edge[4] = { 0x7FFC, 0x7FFE, 0x7FFF, 0x8000 };
+        const uint32_t off = rnd() % 8 ? (rnd() & 0x7FF0u) : edge[rnd() % 4];
+        b(0xBB); d32(off);                                  /* MOV EBX, imm32 */
+        switch (rnd() % 13) {
+        case 10: b(0xA3); d32(off); break;                  /* MOV [moffs], EAX (V117b) */
+        case 11: b(0x66); b(0x8E); b(0x03); break;          /* MOV ES, [EBX] (V117b: Sreg from memory) */
+        case 12: b(0x8C); b(0xC0); b(0x89); b(0x03); b(0x66); b(0x8E); b(0x03); break;   /* MOV EAX,ES; MOV [EBX],EAX; MOV ES,[EBX] */
+        case 0: b(0x8B); b(0x03); break;                    /* MOV EAX, [EBX] */
+        case 1: b(0x89); b(0x43); b(0x04); break;           /* MOV [EBX+4], EAX */
+        case 2: b(0x01); b(0x03); break;                    /* ADD [EBX], EAX */
+        case 3: b(0xFF); b(0x03); break;                    /* INC DWORD [EBX] */
+        case 4: b(0x8A); b(0x04); b(0x1B); break;           /* MOV AL, [EBX+EBX] (SIB, DS) */
+        case 5: b(0x8B); b(0x04); b(0x24); break;           /* MOV EAX, [ESP] (SS: flat) */
+        case 6: b(0x8B); b(0x45); b(0x00); break;           /* MOV EAX, [EBP+0] (SS: flat) */
+        case 7: b(0xA1); d32(off); break;                   /* MOV EAX, [moffs] (declined) */
+        case 8: b(0x89); b(0xDE); b(0xA4); break;           /* MOV ESI,EBX ; MOVSB (declined) */
+        default: b(0x0F); b(0xB6); b(0x43); b(0x02); break; /* MOVZX EAX, BYTE [EBX+2] */
+        }
+        return;
+    }
     if (!last && rnd() % 4 == 0) {                         /* V116: ES: access, ES based 0x24000 limit 0x7FFF */
         static const unsigned edge[4] = { 0x7FFC, 0x7FFE, 0x7FFF, 0x8000 };
         const uint32_t edi = rnd() % 8 ? (rnd() & 0x7FF0u) : edge[rnd() % 4];
@@ -269,7 +291,7 @@ static void gen41(int last)
 static int m42_run(unsigned iters, void *st, void *code, uint8_t *M, uint8_t *M2)
 {
     static B86Cpu A, R;
-    unsigned bad = 0, flat_seen = 0, b32_seen = 0, ret_ok = 0, ret_lim = 0;
+    unsigned bad = 0, flat_seen = 0, b32_seen = 0, ret_ok = 0, ret_lim = 0, ds_ok = 0;
     for (unsigned it = 0; it < iters; ++it) {
         memset(&A, 0, sizeof A); memset(M, 0, 0x40000);
         b86_init(&A, M); A.model = B86_CPU_386; A.msw = 1; flat(&A);
@@ -305,8 +327,23 @@ static int m42_run(unsigned iters, void *st, void *code, uint8_t *M, uint8_t *M2
         for (int k = 0; k < 4; ++k) { const unsigned n = b86_pj_try(&A); if (!n) break; }
         if (A.ip != 0x1205u || A.r[4] != 0x7FFCu) { if (++bad <= 8) printf("MISMATCH m42 it=%u RET beyond limit: ip=%08X esp=%08X (want 00001205 / 00007FFC)\n", it, A.ip, A.r[4]); }
         else ++ret_lim;
+        /* 6 (V117): the same based-CS code, MOV EAX,[EBX] ; RET-free stop (HLT), first with a flat DS, then
+         * with DS based at 0x28000: the second run must read DS.base+EBX, not reuse the flat translation */
+        g = M + 0x10000 + 0x1300; g[0] = 0x8B; g[1] = 0x03; g[2] = 0xF4;   /* MOV EAX,[EBX] ; HLT */
+        M[0x100] = 0x11; M[0x101] = 0x11; M[0x102] = 0x11; M[0x103] = 0x11;
+        M[0x28100] = 0x22; M[0x28101] = 0x22; M[0x28102] = 0x22; M[0x28103] = 0x22;
+        for (int pass = 0; pass < 2; ++pass) {
+            b32_cs(&A); A.r[0] = 0; A.r[3] = 0x100; A.ip = 0x1300;
+            if (pass) { B86PM1Cache *d = &A.pm386.seg[B86_DS]; d->valid = 1; d->base = 0x28000; d->limit = 0x7FFF; d->access = 0x93; d->flags = 0; d->selector = 0x28; A.seg[B86_DS] = 0x28; }
+            for (int k = 0; k < 4; ++k) { const unsigned long e0 = PJ_V117_GET(0), o0 = PJ_V117_GET(1); const unsigned n = b86_pj_try(&A);
+                if (it == 0 && getenv("DBG6")) printf("  pass %d step %d: native=%u eip=%08X eax=%08X v117 entries +%lu operands +%lu b32=%u dsb=%u\n", pass, k, n, A.ip, A.r[0], PJ_V117_GET(0) - e0, PJ_V117_GET(1) - o0, ((B86Pj *)A.pj)->b32_active, ((B86Pj *)A.pj)->b32_dsbased);
+                if (!n && b86_step(&A) != B86_OK) break; if (A.r[0]) break; }
+            const uint32_t want = pass ? 0x22222222u : 0x11111111u;
+            if (A.r[0] != want) { if (++bad <= 8) printf("MISMATCH m42 it=%u DS %s: eax=%08X want %08X\n", it, pass ? "based" : "flat", A.r[0], want); }
+            else ++ds_ok;
+        }
     }
-    printf("m42: %u iterations, flat block ran %u, based indirect jumps correct %u, based RETs correct %u, RETs beyond the limit stopped %u, %u mismatches\n", iters, flat_seen, b32_seen, ret_ok, ret_lim, bad);
+    printf("m42: %u iterations, flat block ran %u, based indirect jumps correct %u, based RETs correct %u, RETs beyond the limit stopped %u, flat/based DS reads correct %u, %u mismatches\n", iters, flat_seen, b32_seen, ret_ok, ret_lim, ds_ok, bad);
 #if B86_PJ_V115_B32LINK
     printf("v115: links=%lu native-rets=%lu\n", PJ_V115_GET(0), PJ_V115_GET(1));
 #endif
@@ -660,14 +697,15 @@ static void m26_hook(B86Cpu *c, uint32_t a, uint32_t n)
 {
     if (m26_armed && m26_poison - a < n) { m26_armed = 0u; ++b86_pj_state(c)->smc_kills; }
 }
+static int m26_remap;                        /* V118 test: A0000-AFFFF remapped through c->pt (VGA window) */
 static void m26_ref(B86Cpu *c, unsigned op, unsigned w)
 {
     const unsigned kind = op <= 0xA5u ? 0u : 1u;
     const uint32_t step = (c->flags & B86_DF) ? (uint32_t)0u - w : w;
     while (c->r[B86_CX]) {
         uint32_t v = c->r[0], k;
-        if (kind == 0u) { v = 0u; for (k = 0; k < w; ++k) v |= (uint32_t)c->mem[c->r[B86_SI] + k] << (8u * k); }
-        for (k = 0; k < w; ++k) c->mem[c->r[B86_DI] + k] = (uint8_t)(v >> (8u * k));
+        if (kind == 0u) { v = 0u; for (k = 0; k < w; ++k) v |= (uint32_t)*b86_host_phys(c, c->r[B86_SI] + k) << (8u * k); }
+        for (k = 0; k < w; ++k) *b86_host_phys(c, c->r[B86_DI] + k) = (uint8_t)(v >> (8u * k));
         if (kind == 0u) c->r[B86_SI] += step;
         c->r[B86_DI] += step; --c->r[B86_CX];
     }
@@ -675,8 +713,10 @@ static void m26_ref(B86Cpu *c, unsigned op, unsigned w)
 static int m26_run(unsigned iters, uint32_t seed, void *st, void *code)
 {
     static B86Cpu A, B, R;
-    uint8_t *MA = calloc(1, B86_RAM_BYTES + 64), *MB = calloc(1, B86_RAM_BYTES + 64), *MR = calloc(1, B86_RAM_BYTES + 64);
+    /* page-aligned guest memory, as on the Pico: c->pt is indexed by the HOST page of mem+linear */
+    uint8_t *MA = aligned_alloc(4096u, B86_RAM_BYTES + 4096u), *MB = aligned_alloc(4096u, B86_RAM_BYTES + 4096u), *MR = aligned_alloc(4096u, B86_RAM_BYTES + 4096u);
     uint8_t *cm = calloc(1, (B86_MEM_BYTES >> B86_LINE_SHIFT) + 2u);
+    memset(MA, 0, B86_RAM_BYTES + 4096u); memset(MB, 0, B86_RAM_BYTES + 4096u); memset(MR, 0, B86_RAM_BYTES + 4096u);
     unsigned it, bad = 0u, refused = 0u, injected = 0u;
 #if B86_V103_STATS
 #define M26_BULK() (pj_v103s ? pj_v103s->n[9] : 0u)
@@ -684,6 +724,9 @@ static int m26_run(unsigned iters, uint32_t seed, void *st, void *code)
 #define M26_BULK() 0u                        /* statistics off: bulk runs not counted */
 #endif
     const uint32_t bulk0 = M26_BULK();
+    static int32_t ptab[3][512];
+    static uint8_t vbuf[3][0x10000] __attribute__((aligned(4096)));
+    m26_remap = getenv("M26REMAP") != NULL;
     rs = seed;
     for (it = 0; it < iters; ++it) {
         const unsigned op = (unsigned[]){0xA4,0xA5,0xAA,0xAB}[rnd() % 4], w = (op & 1u) ? (rnd() % 2 ? 4u : 2u) : 1u;
@@ -697,6 +740,14 @@ static int m26_run(unsigned iters, uint32_t seed, void *st, void *code)
         case 1: di = si + (rnd() % 4096u); break;
         default: di = 0x20000u + (rnd() % 0x80000u); break;
         }
+        if (m26_remap) {                          /* V118: into, out of, and within the VGA window */
+            switch (rnd() % 4) {
+            case 0: di = 0xA0000u + (rnd() % 0xF000u); break;
+            case 1: si = 0xA0000u + (rnd() % 0xF000u); break;
+            case 2: di = 0xA0000u + (rnd() % 0x8000u); si = 0xA8000u + (rnd() % 0x7000u); break;
+            default: break;
+            }
+        }
         if (rnd() % 3u) { si &= ~(w - 1u); di &= ~(w - 1u); }
         cx = rnd() % 2u ? rnd() % 3000u : rnd() % 40u;
         fl = 2u | (rnd() % 8u == 0u ? (uint32_t)B86_DF : 0u);
@@ -705,15 +756,32 @@ static int m26_run(unsigned iters, uint32_t seed, void *st, void *code)
         injected += inject;
         for (k = 0x1F000u; k < 0xB0000u; ++k) MA[k] = (uint8_t)rnd();
         memcpy(MB, MA, B86_RAM_BYTES); memcpy(MR, MA, B86_RAM_BYTES);
+        if (m26_remap) { for (k = 0; k < 0x10000u; ++k) vbuf[0][k] = (uint8_t)rnd(); memcpy(vbuf[1], vbuf[0], 0x10000u); memcpy(vbuf[2], vbuf[0], 0x10000u); }
+        uint8_t orig_fff8 = vbuf[0][0xFFF8u];
         memset(cm, 0, (B86_MEM_BYTES >> B86_LINE_SHIFT) + 2u);
         cm[poison >> B86_LINE_SHIFT] = 1u;
         for (run = 0; run < 3; ++run) {
             B86Cpu *c = cs[run];
             memset(c, 0, sizeof *c);
             b86_init(c, ms[run]); c->model = B86_CPU_386; c->msw = 1; flat(c);
+            if (m26_remap) {                       /* pages A0-AF -> vbuf[run], as bb_vram on the Pico */
+                unsigned pg;
+                memset(ptab[run], 0, sizeof ptab[run]);
+                for (pg = 0xA0u; pg <= 0xAFu; ++pg) {
+                    const uintptr_t h = (uintptr_t)(ms[run] + (pg << 12));
+                    ptab[run][(h >> 12) & 511u] = (int32_t)((intptr_t)(vbuf[run] + ((pg - 0xA0u) << 12)) - (intptr_t)h);
+                }
+                c->pt = ptab[run];
+            }
             c->r[0] = eax; c->r[B86_SI] = si; c->r[B86_DI] = di; c->r[B86_CX] = cx; c->flags = fl;
             if (run < 2) {                         /* 0: bulk on, 1: bulk off (original loop) */
-                if (!b86_pj_attach(c, st, b86_pj_state_bytes(), code, 1u << 20)) return 2;
+                {   uint8_t before[16]; static int shown;
+                    if (m26_remap) memcpy(before, vbuf[run] + 0xFFF0u, 16u);
+                    if (!b86_pj_attach(c, st, b86_pj_state_bytes(), code, 1u << 20)) return 2;
+                    if (m26_remap && memcmp(before, vbuf[run] + 0xFFF0u, 16u) && shown++ < 2) {
+                        unsigned q; printf("   attach changed VGA AFFF0..AFFFF (run %u):", run);
+                        for (q = 0; q < 16u; ++q) printf(" %02X>%02X", before[q], vbuf[run][0xFFF0u + q]); printf("\n"); }
+                }
                 c->codemap = cm; c->smc_hook = m26_hook;
                 m26_poison = poison; m26_armed = inject;
                 pj_v103_bulk_on = run == 0;
@@ -723,16 +791,28 @@ static int m26_run(unsigned iters, uint32_t seed, void *st, void *code)
         }
         pj_v103_bulk_on = 1u;
         for (run = 1; run < 3; ++run) {
-            if (memcmp(MA + 0x1F000u, ms[run] + 0x1F000u, 0x91000u) ||
+            if (memcmp(MA + 0x1F000u, ms[run] + 0x1F000u, 0x91000u) || (m26_remap && memcmp(vbuf[0], vbuf[run], 0x10000u)) ||
                 A.r[0] != cs[run]->r[0] || A.r[B86_SI] != cs[run]->r[B86_SI] || A.r[B86_DI] != cs[run]->r[B86_DI] || A.r[B86_CX] != cs[run]->r[B86_CX]) {
                 if (bad < 10u) printf("MISMATCH mode26 it=%u vs-run=%u op=%02X w=%u si=%05X di=%05X cx=%u df=%u inject=%u\n",
                                       it, run, op, w, si, di, cx, (fl & B86_DF) != 0u, inject);
+                if (bad < 4u) {                    /* where: first differing byte, RAM or VGA window */
+                    uint32_t q; const char *where = "regs";
+                    for (q = 0x1F000u; q < 0xB0000u; ++q) if (MA[q] != ms[run][q]) { where = "RAM"; break; }
+                    if (*where == 'R') printf("   first diff RAM %05X: run0 %02X run%u %02X\n", q, MA[q], run, ms[run][q]);
+                    if (m26_remap) printf("   AFFF8: original %02X | run0 %02X run1 %02X run2 %02X\n", orig_fff8, vbuf[0][0xFFF8u], vbuf[1][0xFFF8u], vbuf[2][0xFFF8u]);
+                    else if (m26_remap) { for (q = 0; q < 0x10000u; ++q) if (vbuf[0][q] != vbuf[run][q]) break;
+                        if (q < 0x10000u) printf("   first diff VGA %05X: run0 %02X run%u %02X\n", 0xA0000u + q, vbuf[0][q], run, vbuf[run][q]);
+                        else printf("   registers: run0 esi %08X edi %08X ecx %u | run%u esi %08X edi %08X ecx %u\n", A.r[B86_SI], A.r[B86_DI], A.r[B86_CX], run, cs[run]->r[B86_SI], cs[run]->r[B86_DI], cs[run]->r[B86_CX]); }
+                }
                 ++bad;
             }
         }
     }
     printf("mode26: %u cases, %u mismatches, %u injected kills, %u refusals replayed, %u bulk runs\n",
            iters, bad, injected, refused, M26_BULK() - bulk0);
+#if B86_PJ_V118_REMAP_BULK
+    printf("v118: bulk chunks into/from remapped pages %lu\n", PJ_V117_GET(3));
+#endif
     return bad ? 1 : 0;
 }
 #endif
@@ -759,12 +839,18 @@ int main(int argc, char **argv)
     if (gen_mode == 42) return m42_run(iters, st, code, M, M2);
     int b32_programs = 0;                                    /* V115: mode 43 = mode 17 programs in a based CS */
     if (gen_mode == 43) { b32_programs = 1; gen_mode = 17; }
+    if (gen_mode == 44) { g_ds_based = 1; gen_mode = 41; }   /* V117 */
     for (unsigned it = 0; it < iters; ++it) {
         memset(&C, 0, sizeof C);
         b86_init(&C, M); C.model = B86_CPU_386; C.msw = 1;
         if (gen_mode >= 10 && gen_mode < 17) { pm16(&C, M); g_csbase = 0x10000; } else { flat(&C); g_csbase = 0; }
         if (gen_mode == 40) v113_gdt(&C, M);
         if (gen_mode == 41 || b32_programs) { b32_cs(&C); g_csbase = 0x10000; }
+        if (gen_mode == 41 && g_ds_based) {                 /* V117: a based DS (selector 0x28) */
+            B86PM1Cache *d = &C.pm386.seg[B86_DS];
+            d->valid = 1; d->base = 0x28000; d->limit = 0x7FFF; d->access = 0x93; d->flags = 0; d->selector = 0x28;
+            C.seg[B86_DS] = 0x28;
+        }
         if (gen_mode == 41) {                               /* V116: a non-flat ES */
             B86PM1Cache *e = &C.pm386.seg[B86_ES];
             e->valid = 1; e->base = 0x24000; e->limit = 0x7FFF; e->access = 0x93; e->flags = 0; e->selector = 0x20;
@@ -790,6 +876,7 @@ int main(int argc, char **argv)
             printf("b86_pj_attach_hot refused %lu bytes\n", (unsigned long)hot_bytes);
             return 2;
         }
+        if (hot_bytes && getenv("HOT1")) b86_pj_state(&C)->hot_after = 1u;   /* test: promote at the first dispatch */
 #if BB_PJ_PM16_REG_TIER && BB_PJ_PM16_ADAPTIVE
         b86_pj_state(&C)->pm16_adapt_cooldown = 0u;   /* test every case natively */
 #endif
@@ -914,6 +1001,8 @@ int main(int argc, char **argv)
                         }
                         if (gen_mode == 24 && hot_bytes) {                      /* V100: forced hot reset, freed space reused */
                             B86Pj *jh = b86_pj_state(&C);
+                            if (getenv("HRSTAT")) { static unsigned long seen, nz; ++seen; if (jh->nredir) ++nz; if (seen % 200u == 0u) printf("hrstat: resets %lu with redirects %lu (nredir now %lu)\n", seen, nz, (unsigned long)jh->nredir); }
+                            if (getenv("HRCORRUPT") && jh->nredir) pj_redir(jh)[0] = 0x7FFFFFF0u;   /* test: a garbage redirect record */
                             pj_hot_reset(&C, jh);
                             memset(jh->code + jh->hot_start, 0xDE, jh->hot_base + jh->hot_cap - jh->hot_start);   /* UDF traps */
                             __builtin___clear_cache((char *)(jh->code + jh->hot_start), (char *)(jh->code + jh->hot_base + jh->hot_cap));
@@ -1075,6 +1164,9 @@ int main(int argc, char **argv)
     #endif
     #if B86_PJ_V115_B32LINK
     if (b32_programs || gen_mode == 41) printf("v115: links=%lu native-rets=%lu; v87 runtime-base accesses=%lu\n", PJ_V115_GET(0), PJ_V115_GET(1), pj_v87_n[0]);
+#if B86_PJ_V117_B32DS
+    if (gen_mode == 41) printf("v117: based-DS entries=%lu ds-operands=%lu declined=%lu\n", PJ_V117_GET(0), PJ_V117_GET(1), PJ_V117_GET(2));
+#endif
     #endif
     printf("fuzz: %u sequences, %u native instructions, %u interpreter-refused, %u partial-rep, %u mismatches\n", iters, nat, skipped, partial, bad);
     if (iters != 0 && nat == 0) { fprintf(stderr, "FAIL: zero native PJ coverage for seed=%u mode=%d\n", initial_seed, gen_mode); return 2; }

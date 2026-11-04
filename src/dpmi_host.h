@@ -46,6 +46,8 @@ typedef struct DpmiEnv {
     int irq_direct_flat_only;   /* 1: deliver directly only to handlers in flat segments (base 0) */
     int bios_fast_off;          /* 1: always reflect IRQs to real mode, even a BIOS "EOI only" tick */
     uint32_t bios_irq0_hint;    /* seg<<16|off of the embedder's own BIOS IRQ0 handler (0 = none) */
+    int int_stats;              /* diagnostic: count software INTs 10h-33h through the client, by vector */
+    int dos_time_fast;          /* 1: answer INT 21h AH=2Ch (get time) from 32-bit code here, like the client does */
     int (*swap_read)(uint32_t slot, uint8_t *page4k);
     int (*swap_write)(uint32_t slot, const uint8_t *page4k);
 } DpmiEnv;
