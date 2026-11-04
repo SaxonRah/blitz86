@@ -3532,6 +3532,10 @@ static inline __attribute__((always_inline)) void r386_split(B86Cpu *c)
     for (int i = 0; i < 8; ++i) c->rhi[i] = c->r[i] & 0xFFFF0000u;
 }
 
+#ifndef B86_JIT_INT_FAST
+#define B86_JIT_INT_FAST 1
+#endif
+unsigned long j_int_fast;                   /* B86_JIT_INT_FAST_V1: INT n answered by the host hook directly */
 #ifdef B86_HELPER_HISTO
 uint64_t b86_helper_histo[256];
 uint64_t b86_helper_histo2[32];   /* [F6/F7 ? 16 : 0] + w*8 + reg */
@@ -3559,7 +3563,27 @@ B86_HOT uint32_t MPF(b86h_step)(B86Cpu *c, uint32_t ip_next, uint32_t blk)
 #else
     if (m386) { r386_merge(c); }
 #endif
-    int r = b86_step(c);
+    int r;
+#if B86_JIT_INT_FAST
+    /* B86_JIT_INT_FAST_V1, helper path (INT n reached from translated code):
+     * same contract as the cold-run path above. */
+    if (!(c->msw & 1u) && c->int_hook && fb(c, cs0, (uint16_t)c->ip) == 0xCDu && !(c->flags & B86_TF)) {
+        const uint16_t ip0 = (uint16_t)c->ip;
+        const uint8_t vec = fb(c, cs0, (uint16_t)(ip0 + 1u));
+        b86_flags_materialize(c);
+        c->ip = (uint16_t)(ip0 + 2u);
+        if (c->int_hook(c, vec)) {
+            c->step_op = 0xCDu; c->step_oip = ip0;
+            c->icount++;
+            ++j_int_fast;
+            r = B86_OK;
+        } else {
+            c->ip = ip0;
+            r = b86_step(c);
+        }
+    } else
+#endif
+    r = b86_step(c);
     if (m386) {
         r386_split(c);
         if (c->msw & 1u) return 1;         /* entered protected mode: leave native code */
@@ -4139,6 +4163,7 @@ B86_HOT void b86_jit_set_single_step(J *j, int on)
    flushing the whole cache every frame. */
 /* cold-run control classes: 1 ends the run, 2 short conditional branch
    (continue when not taken), 4 prefix; FF and 8E are decided by ModRM.reg */
+
 static const uint8_t cold_ctl[256] = {
     [0x0F] = 1, [0x26] = 4, [0x2E] = 4, [0x36] = 4, [0x3E] = 4,
     [0x60 ... 0x7F] = 2, [0x9A] = 1,
@@ -4192,7 +4217,31 @@ B86_HOT static int MPF(cold_run)(J *j, B86Cpu *c, uint32_t key, int force)
 #else
         if (c->model >= B86_CPU_386) { r386_merge(c); }
 #endif
-        int r = b86_step(c);
+        int r;
+#if B86_JIT_INT_FAST
+        /* B86_JIT_INT_FAST_V1: a plain real-mode INT n goes straight to the host's
+         * int_hook, exactly as both interpreter INT paths call it (flags
+         * materialized, IP = next instruction, before anything is pushed).
+         * Skips the interpreter's decode and 386 dispatch. Programs that poll
+         * INT 16h AH=01h in their inner loop (3DBench: every ~27 instructions)
+         * spend most of their time here. If the hook declines, the instruction
+         * is stepped normally from its first byte. */
+        if (!(c->msw & 1u) && c->int_hook && fb(c, cs, ip0) == 0xCDu && !(c->flags & B86_TF)) {   /* CD first: no prefix */
+            const uint8_t vec = fb(c, cs, (uint16_t)(ip0 + 1u));
+            b86_flags_materialize(c);
+            c->ip = (uint16_t)(ip0 + 2u);
+            if (c->int_hook(c, vec)) {
+                c->step_op = 0xCDu; c->step_oip = ip0;    /* as b86_step records them */
+                c->icount++;
+                ++j_int_fast;
+                r = B86_OK;
+            } else {
+                c->ip = ip0;
+                r = b86_step(c);
+            }
+        } else
+#endif
+        r = b86_step(c);
         if (c->model >= B86_CPU_386) {
             r386_split(c);
             if (c->msw & 1u) { steps++; break; }  /* protected mode: back to the dispatcher */
