@@ -825,6 +825,21 @@ unsupported:
  * No software INT hook is called for a CPU-originated fault.
  * If the exception itself cannot be delivered with the current limited
  * machine state, return UNSUPPORTED without partial stack modification. */
+/* BB_386_UD_V1: two-byte opcodes that exist on the 80386. Every other 0F xx
+ * (CPUID, RDTSC, RDMSR, BSWAP, CMPXCHG, XADD, CMOVcc, MMX, ...) raises #UD, as
+ * the 386 does; CPU-detection code installs an INT 6 handler and relies on it.
+ * Bit set = valid on the 386 (blitz86 implements no 486+ two-byte opcode). */
+static const uint32_t b86_386_0f_ok[8] = {
+    0x0000004Fu,   /* 00-1F: 00 01 02 03 06 */
+    0x0000005Fu,   /* 20-3F: 20 21 22 23 24 26 */
+    0x00000000u,   /* 40-5F */
+    0x00000000u,   /* 60-7F */
+    0xFFFFFFFFu,   /* 80-9F: Jcc, SETcc */
+    0xFCFCBB3Bu,   /* A0-BF: A0 A1 A3 A4 A5 A8 A9 AB AC AD AF B2-B7 BA-BF */
+    0x00000000u,   /* C0-DF */
+    0x00000000u    /* E0-FF */
+};
+static inline int b86_386_0f_valid(uint8_t op2) { return (b86_386_0f_ok[op2 >> 5] >> (op2 & 31u)) & 1u; }
 static BB386RM3_FLASH int b86_rm5c_ud(St *s)
 {
     /* One real-mode frame path, including IDTR-vector8 and shutdown. */
@@ -955,7 +970,7 @@ static BB386RM3_FLASH int b86_rm3_dispatch(St *s, uint8_t op,
      * 66h does NOT widen a real-mode INT frame, but DOES widen IRET. */
     if (op == 0x9C || op == 0x9D)
         return b86_rm5c_flags(s, op, operand32);
-    if (op == 0x0F && rd8(c, B86_CS, s->ip) == 0x0Bu)
+    if (op == 0x0F && !b86_386_0f_valid(rd8(c, B86_CS, s->ip)))   /* BB_386_UD_V1 (incl. UD2 0F 0B) */
         return b86_rm5c_ud(s);
     if (op == 0xCC || op == 0xCD || op == 0xCE)
         return b86_rm5b_int(s, op);

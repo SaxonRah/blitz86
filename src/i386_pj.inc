@@ -1099,7 +1099,8 @@ void *B86_CALLOC(size_t n, size_t size);
 #ifndef B86_PJ_V118_REMAP_BULK
 #define B86_PJ_V118_REMAP_BULK 1  /* V118: REP MOVS/STOS bulk copy also into/from remapped pages (VGA window) */
 #endif
-#define PJ_V118_INC() PJ_V117_INC(3)   /* bulk chunks touching a remapped page (PSRAM counter, no .bss) */
+#define PJ_V118_INC() PJ_V117_INC(3)
+#define PJ_V122_INC() ((void)0)   /* translation-time count not needed: harness counters measure */   /* bulk chunks touching a remapped page (PSRAM counter, no .bss) */
 static unsigned long *pj_v117c;   /* [0] based-DS entries [1] DS-relative operands compiled [2] instructions declined */
 #define PJ_V117_INC(i) do { if (!pj_v117c) pj_v117c = (unsigned long *)B86_CALLOC(4u, sizeof(unsigned long)); \
                             if (pj_v117c) ++pj_v117c[(i)]; } while (0)
@@ -1442,8 +1443,13 @@ static void pj_call(PjE *e, const void *fn)
 /* B.W / Bcc.W with a 32-bit placeholder, patched by pj_patch_b */
 static uint8_t *pj_b(PjE *e, int cond)
 {
+    /* V122b: a branch that did not fit returns a scratch word, so a later
+     * pj_patch_b() cannot write past the end of the buffer (the SRAM tier's
+     * redirect table follows it). The translation is bad and discarded anyway. */
+    static uint8_t pj_b_scratch[4];
     uint8_t *at = e->p;
     if (cond < 0) pje32(e, 0xF000u, 0x9000u); else pje32(e, 0xF000u | ((unsigned)cond << 6), 0x8000u);
+    if (e->p != at + 4) { pj_b_scratch[0] = 0x00u; pj_b_scratch[1] = 0xF0u; pj_b_scratch[2] = 0x00u; pj_b_scratch[3] = 0x90u; return pj_b_scratch; }
     return at;
 }
 static void pj_patch_b(uint8_t *at, uint8_t *to)
@@ -3026,9 +3032,52 @@ static int pjt_modrm(PjT *t, PjM *m)
 /* host pointer for linear R1 -> R0 through the shared trampoline:
  *   MOVW r2,size|write<<8; BL memtramp; .word eip, retired
  * A refusal leaves the block at this instruction (it has not run). */
+#ifndef B86_PJ_V122_INLINE_READ
+#define B86_PJ_V122_INLINE_READ 1   /* V122: TLB-hit reads inline; misses call the unchanged trampoline */
+#endif
 static void pjt_mem(PjT *t, unsigned size, int write)
 {
     const B86Pj *j = (const B86Pj *)t->c->pj;
+#if B86_PJ_V122_INLINE_READ && B86_V95_HOSTTLB
+    /* V122: the trampoline's host-TLB hit path, inline. R1 = linear (kept), result in R0.
+     * Scratch R0, R2, R3, R12 like the trampoline (every memt stub sets R2 anyway).
+     * No paging check: every PG change flushes the TLB (MOV CR0, the DPMI host,
+     * snapshot restore), so with paging off every tag misses. Any miss - tag,
+     * page crossing, no host entry - takes the original call below. */
+    if (!write && (size == 1u || size == 2u || size == 4u) && j->tr_hot) {   /* V122c: only in SRAM-tier translations:
+                                                     * +19% code in the main buffer made Descent's working set thrash */
+        uint8_t *slow[3], *done; unsigned ns = 0u, k;
+        pj_ldst(&t->e, PJ_LDR, CREG, SP, 0u);                            /* r12 = c (always: the miss path clobbers it) */
+        pj_ubfx(&t->e, R3, R1, 12u, 6u);                                 /* TLB slot */
+        pj_shift(&t->e, R2, R1, 1u, 12u);
+        pj_shift(&t->e, R2, R2, 0u, 12u);
+        pj_dpi(&t->e, 2u, 0, R2, R2, 1u);                                /* tag = page | 1 */
+        pjt_addimm(t, R0, CREG, (uint32_t)offsetof(B86Cpu, tlb_tag));
+        pje32(&t->e, 0xF850u | R0, (R0 << 12) | (2u << 4) | R3);         /* ldr r0, [r0, r3, lsl #2] */
+        pj_dpr(&t->e, 13u, 1, PC, R0, R2, 0u, 0u);                       /* cmp */
+        slow[ns++] = pj_b(&t->e, 1 /* NE: TLB miss */);
+        if (size > 1u) {
+            pj_ubfx(&t->e, R2, R1, 0u, 12u);
+            pj_dpi(&t->e, 8u, 0, R2, R2, size);
+            pj_dpi(&t->e, 13u, 1, PC, R2, 4096u);
+            slow[ns++] = pj_b(&t->e, 8 /* HI: crosses the page */);
+        }
+        pjt_addimm(t, R0, CREG, (uint32_t)offsetof(B86Cpu, tlb_host));
+        pje32(&t->e, 0xF850u | R0, (R0 << 12) | (2u << 4) | R3);         /* ldr r0, [r0, r3, lsl #2] */
+        pj_dpi(&t->e, 1u, 1, R0, R0, 1u);                                /* bics r0, r0, #1 */
+        slow[ns++] = pj_b(&t->e, 0 /* EQ: no host entry */);
+        pj_dpr(&t->e, 8u, 0, R0, R0, R1, 0u, 0u);                        /* host pointer */
+        done = pj_b(&t->e, -1);
+        for (k = 0u; k < ns; ++k) pj_patch_b(slow[k], t->e.p);
+        pjt_call(t, (const void *)j->memt[size == 4u ? 2u : size - 1u]);
+        pje16(&t->e, t->ip0 & 0xFFFFu); pje16(&t->e, t->ip0 >> 16);
+        pje16(&t->e, (t->ninsn - 1u) & 0xFFFFu);
+        pj_patch_b(done, t->e.p);
+        t->creg_ok = 0;                                                  /* the paths join with r12 unknown */
+        PJ_V122_INC();
+        return;
+    }
+#endif
     /* r71: BB_PJ_MEMCALL_SHORT_V1: per size/write entry (no MOVW at the
      * call site) and a 6-byte literal {eip, retired16}: 10 bytes, was 16 */
     pjt_call(t, (const void *)j->memt[(size == 4u ? 2u : size - 1u) + (write ? 3u : 0u)]);

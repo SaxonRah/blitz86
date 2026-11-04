@@ -76,7 +76,7 @@ B86_PM13_FLASH int b86_pm13_step(B86Cpu *c)
     if(!b86_pm4_byte(c,&ip,start,&op))return B86_UNSUPPORTED;
     if(op!=0x0Fu && op!=0x8Eu)return b86_pm12_step(c);
     if(op==0x0Fu){
-        if(!b86_pm4_byte(c,&ip,start,&second) || second!=0x0Bu)
+        if(!b86_pm4_byte(c,&ip,start,&second) || b86_386_0f_valid((uint8_t)second))   /* BB_386_UD_V1: #UD for non-386 0F xx */
             return b86_pm12_step(c);
         if(c->lz_kind!=LZ_NONE || c->lz_ikind!=LZ_NONE ||
            (c->flags&0x20000u))return B86_UNSUPPORTED;
